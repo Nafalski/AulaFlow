@@ -13,6 +13,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "db:verify": "node scripts/verify-schema.mjs",
+    "db:verify:remote": "node scripts/verify-remote-supabase.mjs",
     "icons": "node scripts/generate-icons.mjs",
     "check": "npm run lint && npm run typecheck && npm run test && npm run db:verify && npm run build",
     "db:types": "npx --yes supabase gen types typescript --linked > src/types/database.ts",

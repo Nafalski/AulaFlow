@@ -6,7 +6,7 @@
 
 **Documento vivo.** Atualizado no fim de cada fase com o que foi realmente construído.
 
-- **Estado atual:** Fases 1, 1.5, 2 e 3 concluídas. A Fase 4 está parcialmente concluída com a **Etapa 1A — modelos reutilizáveis de pacotes**, a **Etapa 1B — atribuição de pacotes aos alunos**, a **Etapa 1C — consulta de pacotes e saldos** e a **Etapa 1D — ajustes administrativos e histórico de pacotes**.
+- **Estado atual:** Fases 1, 1.5, 2 e 3 concluídas. A Fase 4 está parcialmente concluída com a **Etapa 1A — modelos reutilizáveis de pacotes**, a **Etapa 1B — atribuição de pacotes aos alunos**, a **Etapa 1C — consulta de pacotes e saldos**, a **Etapa 1D — ajustes administrativos e histórico de pacotes** e a **Etapa 1E — revisão integrada**, já com migrações sincronizadas no Supabase remoto e verificação estrutural remota automatizada. O cenário real com Auth/PostgREST, contas de teste e browser ainda está pendente, portanto a Fase 4 ainda não deve ser marcada como concluída.
 - **Timezone do sistema:** `Europe/Lisbon`
 - **Idioma da interface:** Português (pt-PT)
 
@@ -462,7 +462,7 @@ A ordem segue as prioridades pedidas: primeiro a área do professor ao computado
 - 7 colunas de cobrança em `lesson_participants`, `credit_cost` em `lessons`
 - `lib/domain/packages.ts` — usabilidade, seleção, alertas, decisão de cobrança
 - 57 testes de domínio de pacotes; mantidos na suite atual de 231 testes
-- Garantias de créditos mantidas nas 292 verificações atuais; 26 migrações aplicadas do zero e reaplicadas
+- Garantias de créditos mantidas nas 294 verificações atuais; 27 migrações aplicadas do zero e reaplicadas
 - Larguras por função, navegação responsiva, rotas marcadoras de pacotes, manifesto e ícones PWA
 
 ### Concluído na Etapa 1A — Modelos de pacotes
@@ -511,7 +511,27 @@ A ordem segue as prioridades pedidas: primeiro a área do professor ao computado
 - Migração incremental `20260802001800_phase4_package_admin.sql`: `student_package_audit_events`, idempotência em movimentações administrativas, views `teacher_package_audit_records` e `teacher_package_history_records`, novas RPCs administrativas e correção de datas civis `Europe/Lisbon`
 - `/professor/pacotes/historico`: histórico global com filtros por aluno/pacote, origem, tipo, responsável e período
 - A área do aluno continua somente leitura: não recebe motivos administrativos, autoria privada, saldos antes/depois nem eventos internos
-- 20 testes Vitest novos de validação e 24 verificações PostgreSQL novas; suite atual com 231 testes e 292 verificações
+- 20 testes Vitest novos de validação e 24 verificações PostgreSQL novas; suite atual com 231 testes e 294 verificações
+
+### Etapa 1E — Revisão integrada e validação real da gestão de pacotes
+
+Estado atual: **parcialmente concluída**.
+
+Concluído:
+
+- Projeto local ligado ao Supabase de desenvolvimento `fzkwacnpydoqhxipcvro`.
+- 27 migrações locais aplicadas no remoto; `npx supabase db push --dry-run` indica que o banco remoto está atualizado.
+- Dependências Supabase auditadas: `@supabase/server` não é usado nem mantido; sessão/cookies continuam concentrados em `@supabase/ssr`, e `@supabase/supabase-js` fica para cliente admin server-only e tipos.
+- Variáveis de ambiente auditadas: o código lê `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `NEXT_PUBLIC_SITE_URL` e `SUPABASE_SERVICE_ROLE_KEY`; o exemplo não inclui chaves reais nem variáveis duplicadas de `SUPABASE_PUBLISHABLE_KEY`, `SUPABASE_SECRET_KEY` ou `SUPABASE_JWKS_URL`.
+- `scripts/verify-remote-supabase.mjs` valida o catálogo remoto sem escrever dados: migrações, tabelas, views, enums, índices, constraints, RLS, grants, assinaturas únicas de RPCs, `search_path` seguro, `EXECUTE` restrito e privacidade das views do aluno.
+
+Ainda pendente para encerrar a Fase 4:
+
+- Configuração manual do Auth no painel Supabase: Site URL, Redirect URL de callback, provider de email, confirmação de email e recuperação de palavra-passe.
+- Criação de contas reais de teste: professor, segundo professor, aluno, segundo aluno, admin e conta bloqueada.
+- Cenário ponta a ponta via aplicação/browser: professor cria modelo, atribui pacote, ajusta créditos, suspende/reativa/altera validade; aluno vê somente a projeção permitida.
+- Validação real por GoTrue/PostgREST com JWTs: isolamento entre professor/aluno/outra organização/anónimo/conta bloqueada, idempotência por repetição real, imutabilidade por papéis da aplicação e payloads de rede.
+- Revisão visual em desktop e mobile com sessão real.
 
 **Não concluído na Fase 4:** transferência/fusão/divisão entre pacotes, expiração automática e integração do ciclo de aulas com reserva/consumo pela interface.
 
@@ -529,7 +549,7 @@ A ordem segue as prioridades pedidas: primeiro a área do professor ao computado
 | Preferências de notificação | **Concluído** | Persistência de canais/eventos; entrega automática continua planeada para a Fase 8 |
 | Diretório administrativo | **Concluído** | Pesquisa, filtros, professores, detalhe, estados vazios/erro/loading e resposta mobile/desktop |
 | Bloqueio e reativação | **Concluído** | RPC exclusiva de admin, sem auto-bloqueio, motivo, auditoria e revogação efetiva por RLS |
-| Validação num Supabase remoto | **Bloqueado (Fase 9)** | Requer credenciais/projeto real; PGlite não reproduz GoTrue, JWT/PostgREST nem concorrência entre várias ligações |
+| Validação num Supabase remoto | **Parcial** | Migrações e catálogo remoto validados; GoTrue, JWT/PostgREST, contas reais e browser continuam pendentes |
 
 ### Concluído na Fase 2
 
@@ -560,7 +580,7 @@ A ordem segue as prioridades pedidas: primeiro a área do professor ao computado
 - **A interface de pacotes ainda é parcial.** `/professor/pacotes` gere modelos, atribuição, consulta, ajustes administrativos e histórico; `/aluno/pacotes` mostra os próprios pacotes. Transferências/fusões/divisões e integração com aulas reais continuam pendentes.
 - **A expiração de pacotes não é automática.** `refresh_package_status()` marca `expired` quando é chamada, mas nada corre à meia-noite. Precisa de uma tarefa agendada — Fase 8, com os lembretes.
 - **`credit_expired` e `credit_transferred_*` existem no enum mas não têm função.** Ficam para quando a expiração automática e a transferência entre pacotes forem implementadas (Fase 4).
-- **Não há teste com Supabase real.** O RLS é exercido diretamente como `authenticated`/`anon` no PGlite, mas GoTrue, JWT e PostgREST não existem nesse ambiente.
+- **A validação remota ainda não cobre o fluxo inteiro.** O catálogo do Supabase remoto é verificado por `npm run db:verify:remote -- --confirm-development`, mas GoTrue, JWT, PostgREST e cenário com contas reais continuam a exigir teste manual ou um runner específico com credenciais de desenvolvimento.
 - **A concorrência real não é reproduzida.** O teste sequencial confirma o resultado e as funções usam `FOR UPDATE`; duas ligações simultâneas ainda têm de ser testadas na Fase 9.
 - **Não existem Server Actions do ciclo de créditos.** As RPCs e decisões de domínio estão prontas, mas criar/cancelar/concluir/reagendar pela interface pertence às Fases 5–6.
 
@@ -664,6 +684,7 @@ Pagamentos, subscrições, marketplace, reservas automáticas de campos, WhatsAp
 npm run db:verify                              # valida localmente, sem nuvem
 npx supabase link --project-ref SEU_REF
 npm run db:push
+npm run db:verify:remote -- --confirm-development
 npm run db:types
 ```
 

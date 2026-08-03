@@ -5,7 +5,7 @@ Professores marcam aulas, escolhem os alunos e registam presenças; os alunos ve
 
 A começar pelo **beach tennis**, com arquitetura preparada para outras modalidades.
 
-> **Estado:** Fases 1, 1.5, 2 e 3 concluídas; Fase 4 parcialmente concluída pelas **Etapas 1A, 1B, 1C e 1D**.
+> **Estado:** Fases 1, 1.5, 2 e 3 concluídas; Fase 4 parcialmente concluída pelas **Etapas 1A, 1B, 1C e 1D**. A Etapa 1E já tem validação estrutural remota automatizada; o cenário real com Auth/PostgREST e contas de teste ainda precisa ser executado no Supabase de desenvolvimento.
 > Transferência/fusão de pacotes, aulas e calendário continuam nas etapas seguintes.
 
 ---
@@ -50,7 +50,7 @@ Instruções completas — incluindo a configuração do Supabase — em [`AGENT
 - Pacotes, saldos disponíveis/reservados/utilizados e livro-razão append-only
 - RPCs PostgreSQL para atribuir, reservar, consumir, libertar, reagendar, ajustar e corrigir créditos
 - Regras e validação com 231 testes de unidade/regressão
-- 292 verificações PostgreSQL sobre migrações, permissões, RLS, gestão, claim, modelos, atribuição, consulta, ajustes administrativos e saldos
+- 294 verificações PostgreSQL sobre migrações, permissões, RLS, gestão, claim, modelos, atribuição, consulta, ajustes administrativos, grants de views e saldos
 - Estrutura responsiva das áreas de professor, aluno e administração, com manifesto e ícones PWA
 
 `/professor/pacotes` gere modelos reutilizáveis, atribuição, consulta e ajustes administrativos dos pacotes atribuídos. `/professor/pacotes/historico` mostra a auditoria global. `/aluno/pacotes` mostra apenas os próprios pacotes e movimentos básicos.
@@ -68,6 +68,7 @@ npm run dev        # desenvolvimento
 npm run check      # lint + typecheck + testes + db:verify + build
 npm run test       # testes
 npm run db:verify  # migrações limpas + integração PostgreSQL/RLS
+npm run db:verify:remote -- --confirm-development
 npm run icons      # regenerar ícones PWA
 npm run db:push    # aplicar migrações
 ```

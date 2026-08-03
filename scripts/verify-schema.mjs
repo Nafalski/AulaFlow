@@ -181,6 +181,43 @@ check(
   `escrita direta concedida: ${packageWrites.map((p) => `${p.table_name}.${p.privilege_type}`).join(", ")}`,
 );
 
+const PACKAGE_VIEWS = [
+  "teacher_package_records",
+  "student_package_records",
+  "student_package_transaction_records",
+  "teacher_package_audit_records",
+  "teacher_package_history_records",
+];
+
+const unsafePackageViewPrivileges = await rows(
+  `select table_name, grantee, privilege_type
+   from information_schema.table_privileges
+   where table_schema='public'
+     and table_name = any($1)
+     and grantee in ('PUBLIC', 'anon', 'authenticated')
+     and not (grantee = 'authenticated' and privilege_type = 'SELECT')`,
+  [PACKAGE_VIEWS],
+);
+check(
+  unsafePackageViewPrivileges.length === 0,
+  "views de pacotes só expõem SELECT a authenticated",
+  `grants indevidos em views: ${unsafePackageViewPrivileges
+    .map((p) => `${p.table_name}.${p.grantee}.${p.privilege_type}`)
+    .join(", ")}`,
+);
+
+const missingPackageViewSelect = await rows(
+  `select expected.name
+   from unnest($1::text[]) expected(name)
+   where not has_table_privilege('authenticated', 'public.' || expected.name, 'SELECT')`,
+  [PACKAGE_VIEWS],
+);
+check(
+  missingPackageViewSelect.length === 0,
+  "authenticated lê as views de pacotes previstas",
+  `views sem SELECT autenticado: ${missingPackageViewSelect.map((p) => p.name).join(", ")}`,
+);
+
 const publiclyExecutableCreditFunctions = await rows(
   `select p.proname
    from pg_proc p

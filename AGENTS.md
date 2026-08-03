@@ -46,6 +46,7 @@ Sem `.env.local`, a aplicação arranca na mesma e mostra um ecrã a explicar o 
 | `npm run test` | Vitest, uma passagem |
 | `npm run test:watch` | Vitest em modo contínuo |
 | `npm run db:verify` | Executa as migrações num PostgreSQL local (WASM) e exercita RLS, gestão e créditos |
+| `npm run db:verify:remote -- --confirm-development` | Verifica catálogo, migrações, RLS, grants, views e RPCs no Supabase remoto ligado |
 | `npm run icons` | Regenera os ícones PNG provisórios da PWA |
 | `npm run check` | **lint → typecheck → test → db:verify → build**, por esta ordem |
 | `npm run db:link` | Liga o projeto local ao projeto Supabase remoto |
@@ -303,11 +304,23 @@ npm run typecheck
 
 ### `npm run db:verify`
 
-Executa **todas** as migrações, a partir de uma base vazia, contra PostgreSQL compilado para WebAssembly (PGlite), e volta a aplicá-las para confirmar idempotência. Depois exerce 292 garantias: RLS com papéis `authenticated`/`anon`, isolamento entre organizações e professores, privilégios das RPCs, perfis/claim/bloqueio, convites sem segredo, alunos, turmas, locais, modelos, atribuição, consulta e ajustes administrativos de pacotes, políticas, reserva, consumo, libertação, reagendamento, exceções, correções, imutabilidade do livro-razão e constraints herdadas das aulas.
+Executa **todas** as migrações, a partir de uma base vazia, contra PostgreSQL compilado para WebAssembly (PGlite), e volta a aplicá-las para confirmar idempotência. Depois exerce 294 garantias: RLS com papéis `authenticated`/`anon`, isolamento entre organizações e professores, privilégios das RPCs, perfis/claim/bloqueio, convites sem segredo, alunos, turmas, locais, modelos, atribuição, consulta e ajustes administrativos de pacotes, grants estritos das views, políticas, reserva, consumo, libertação, reagendamento, exceções, correções, imutabilidade do livro-razão e constraints herdadas das aulas.
 
 Corre em segundos, sem Docker e sem projeto na nuvem — serve para o CI.
 
 **O que não substitui:** um `db:push` a sério. O PGlite tem uma só ligação e não tem GoTrue nem PostgREST. As policies são exercidas diretamente no PostgreSQL, mas a API real, os JWTs e duas transações concorrentes sobre o último crédito continuam a precisar de um projeto Supabase/PostgreSQL real.
+
+### `npm run db:verify:remote`
+
+Executa uma verificação estrutural no Supabase remoto atualmente ligado pela CLI. O comando recusa correr sem confirmação explícita de desenvolvimento:
+
+```bash
+npm run db:verify:remote -- --confirm-development
+```
+
+Ele não cria utilizadores, não escreve dados de teste e não imprime credenciais. Verifica se as migrações locais estão aplicadas no remoto, se as tabelas/views/enums/índices/constraints de pacotes existem, se RLS e grants protegem escrita direta, se as RPCs têm assinatura única, `search_path` seguro e `EXECUTE` restrito, e se as views do aluno não expõem campos administrativos.
+
+**O que não substitui:** login real por GoTrue, payloads PostgREST com JWTs reais, confirmação de email, teste visual no browser, concorrência entre ligações e o cenário ponta a ponta professor → aluno. Estes continuam a exigir contas de teste no projeto de desenvolvimento.
 
 ### Pacotes e créditos
 
@@ -446,7 +459,7 @@ Não existe um comando de formatação separado. Use `npm run lint:fix` apenas p
 | 1.5 | Fundação técnica de pacotes/créditos e PWA, sem interfaces de gestão | **Concluído** |
 | 2 | Perfis, definições e gestão administrativa básica de contas | **Concluído** |
 | 3 | Alunos, turmas, locais, política de cancelamento | **Concluído** |
-| 4 | Interfaces de modelos, atribuição, ajustes e saldos | **Parcialmente concluído** — Etapas 1A, 1B, 1C e 1D |
+| 4 | Interfaces de modelos, atribuição, ajustes e saldos | **Parcialmente concluído** — Etapas 1A, 1B, 1C e 1D; Etapa 1E com validação estrutural remota automatizada e cenário Auth/PostgREST real pendente |
 | 5 | Calendário e criação de aulas com reserva | **Planeado** |
 | 6 | Cancelamento, reagendamento, presenças e histórico | **Planeado** |
 | 7 | Área do aluno: aulas, créditos e confirmação | **Planeado** |
