@@ -1,0 +1,3847 @@
+/**
+ * Verificação do esquema e das regras de créditos, sem Supabase e sem Docker.
+ *
+ * Executa todas as migrações de `supabase/migrations/` contra um PostgreSQL
+ * real compilado para WebAssembly (PGlite) e depois exercita as funções de
+ * créditos — atribuição, reserva, libertação, consumo, transferência, ajuste e
+ * correção — contra esse PostgreSQL.
+ *
+ * Porque existe: as regras de créditos vivem em funções SQL, porque são as
+ * únicas que conseguem ser atómicas. Testá-las exige uma base de dados a
+ * sério; sem isto, o único sítio onde um erro apareceria seria em produção,
+ * sobre o saldo de um aluno.
+ *
+ * LIMITES desta verificação:
+ *   • O PGlite tem uma só ligação, pelo que a CONCORRÊNCIA real (duas
+ *     transações em paralelo a disputar o último crédito) não é reproduzível
+ *     aqui. O que se testa é o resultado: o saldo nunca fica negativo e só
+ *     uma das reservas passa. O comportamento do `FOR UPDATE` sob paralelismo
+ *     verdadeiro precisa de um servidor real — está previsto para a Fase 9.
+ *   • O RLS é exercido com os papéis `authenticated` e `anon` do PostgreSQL,
+ *     incluindo isolamento entre aluno/professor/organização. O PGlite não tem
+ *     GoTrue nem PostgREST; o comportamento através da API continua a precisar
+ *     de uma verificação contra um projeto Supabase real.
+ *
+ *     npm run db:verify
+ */
+
+import { PGlite } from "@electric-sql/pglite";
+import { randomUUID } from "node:crypto";
+import { readFileSync, readdirSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const MIGRATIONS = join(dirname(fileURLToPath(import.meta.url)), "..", "supabase", "migrations");
+
+let failures = 0;
+let assertions = 0;
+
+const ok = (message) => console.log(`  ✓ ${message}`);
+
+function fail(message) {
+  failures++;
+  console.log(`  ✗ ${message}`);
+}
+
+/** Afirma uma condição, registando a mensagem certa em qualquer dos casos. */
+function check(condition, okMessage, failMessage) {
+  assertions++;
+  if (condition) ok(okMessage);
+  else fail(failMessage ?? okMessage);
+}
+
+const section = (name) => console.log(`\n${name}`);
+
+const db = await new PGlite();
+const rows = async (sql, params) => (await db.query(sql, params)).rows;
+const one = async (sql, params) => (await rows(sql, params))[0];
+
+/** Executa algo que TEM de falhar. */
+async function mustReject(label, run, expectedMessage = null) {
+  assertions++;
+  try {
+    await run();
+    fail(`${label} — foi aceite, e não devia`);
+  } catch (error) {
+    if (
+      expectedMessage !== null &&
+      !String(error?.message ?? error).toLowerCase().includes(expectedMessage.toLowerCase())
+    ) {
+      fail(`${label} — falhou pela razão errada: ${error?.message ?? error}`);
+      return;
+    }
+    ok(`${label} — rejeitado`);
+  }
+}
+
+// Stubs do que o Supabase fornece e o PGlite não tem. Só o mínimo para as
+// migrações correrem: tudo o que é do AulaFlow é executado de verdade.
+await db.exec(`
+  create schema if not exists auth;
+
+  create table if not exists auth.users (
+    id uuid primary key default gen_random_uuid(),
+    email text,
+    email_confirmed_at timestamptz,
+    raw_user_meta_data jsonb default '{}'::jsonb
+  );
+
+  create or replace function auth.uid() returns uuid language sql stable as
+    $fn$ select nullif(current_setting('request.jwt.claim.sub', true), '')::uuid $fn$;
+
+  do $r$ begin create role anon;          exception when duplicate_object then null; end $r$;
+  do $r$ begin create role authenticated; exception when duplicate_object then null; end $r$;
+  do $r$ begin create role service_role;  exception when duplicate_object then null; end $r$;
+`);
+
+// ── 1. As migrações correm? ──────────────────────────────────────────────────
+
+section("Migrações");
+
+for (const file of readdirSync(MIGRATIONS).filter((f) => f.endsWith(".sql")).sort()) {
+  try {
+    await db.exec(readFileSync(join(MIGRATIONS, file), "utf8"));
+    ok(file);
+  } catch (error) {
+    fail(`${file} — ${error.message}`);
+  }
+}
+
+if (failures > 0) {
+  console.log(`\n${failures} migração(ões) falharam. As verificações seguintes foram ignoradas.`);
+  process.exit(1);
+}
+
+section("Reaplicação idempotente");
+
+for (const file of readdirSync(MIGRATIONS).filter((f) => f.endsWith(".sql")).sort()) {
+  try {
+    await db.exec(readFileSync(join(MIGRATIONS, file), "utf8"));
+    ok(file);
+  } catch (error) {
+    fail(`${file} — ${error.message}`);
+  }
+}
+
+if (failures > 0) {
+  console.log(`\n${failures} migração(ões) não são idempotentes. As verificações seguintes foram ignoradas.`);
+  process.exit(1);
+}
+
+// ── 2. Segurança ─────────────────────────────────────────────────────────────
+
+section("Segurança");
+
+const unprotected = await rows(
+  `select tablename from pg_tables where schemaname='public' and not rowsecurity`,
+);
+const [{ n: tableCount }] = await rows(
+  `select count(*)::int as n from pg_tables where schemaname='public'`,
+);
+
+check(
+  unprotected.length === 0,
+  `row level security ativo nas ${tableCount} tabelas`,
+  `tabelas sem RLS: ${unprotected.map((t) => t.tablename).join(", ")}`,
+);
+
+// `lessons` pode ser editada pelo professor, mas nunca apagada.
+// O livro-razão não aceita nem uma coisa nem outra: corrige-se acrescentando.
+const IMMUTABILITY = [
+  { table: "lessons", forbidden: ["DELETE"] },
+  { table: "package_credit_transactions", forbidden: ["UPDATE", "DELETE"] },
+  { table: "lesson_change_history", forbidden: ["UPDATE", "DELETE"] },
+];
+
+for (const { table, forbidden } of IMMUTABILITY) {
+  const policies = await rows(
+    `select policyname, cmd from pg_policies
+     where schemaname='public' and tablename=$1 and cmd = any($2)`,
+    [table, forbidden],
+  );
+  check(
+    policies.length === 0,
+    `${table} não tem policy de ${forbidden.join(" nem de ")}`,
+    `${table} tem policies proibidas: ${policies.map((p) => `${p.policyname} (${p.cmd})`).join(", ")}`,
+  );
+}
+
+// Nenhum cliente cria participações cobradas ou pacotes por INSERT, nem escreve
+// saldos por PATCH: todos esses caminhos têm de passar pelas RPCs atómicas.
+const packageWrites = await rows(
+  `select table_name, privilege_type from information_schema.table_privileges
+   where table_schema='public'
+     and table_name in ('student_packages', 'lesson_participants')
+     and grantee='authenticated'
+     and privilege_type in ('INSERT','UPDATE','DELETE')`,
+);
+check(
+  packageWrites.length === 0,
+  "pacotes e cobranças não são criados nem alterados diretamente pelo cliente",
+  `escrita direta concedida: ${packageWrites.map((p) => `${p.table_name}.${p.privilege_type}`).join(", ")}`,
+);
+
+const publiclyExecutableCreditFunctions = await rows(
+  `select p.proname
+   from pg_proc p
+   join pg_namespace n on n.oid = p.pronamespace
+   where n.nspname = 'public'
+     and p.proname = any($1)
+     and (
+       has_function_privilege('public', p.oid, 'EXECUTE')
+       or has_function_privilege('anon', p.oid, 'EXECUTE')
+     )`,
+  [[
+    "assign_student_package",
+    "select_package_for_student",
+    "reserve_participation_credits",
+    "release_participation_credits",
+    "consume_participation_credits",
+    "transfer_participation_reservation",
+    "adjust_package_credits",
+    "correct_package_credit_transaction",
+    "resolve_cancellation_policy",
+  ]],
+);
+check(
+  publiclyExecutableCreditFunctions.length === 0,
+  "RPCs de créditos não podem ser executadas por PUBLIC nem anon",
+  `RPCs expostas sem autenticação: ${publiclyExecutableCreditFunctions.map((p) => p.proname).join(", ")}`,
+);
+
+const escalation = (
+  await rows(
+    `select column_name from information_schema.column_privileges
+     where table_schema='public' and table_name='profiles'
+       and grantee='authenticated' and privilege_type='UPDATE'`,
+  )
+)
+  .map((c) => c.column_name)
+  .filter((c) => ["role", "status", "organization_id", "id"].includes(c));
+
+check(
+  escalation.length === 0,
+  "profiles.role e profiles.status não são escrevíveis pelo cliente",
+  `colunas sensíveis escrevíveis por 'authenticated': ${escalation.join(", ")}`,
+);
+
+// ── 3. Fixture: um professor, dois alunos, um campo ──────────────────────────
+
+const exposedPrivateColumns = await rows(
+  `select table_name, column_name
+   from information_schema.column_privileges
+   where table_schema = 'public'
+     and grantee = 'authenticated'
+     and privilege_type = 'SELECT'
+     and (
+       (table_name = 'student_profiles' and column_name in ('notes', 'invite_code'))
+       or (table_name = 'lessons' and column_name = 'private_notes')
+     )`,
+);
+check(
+  exposedPrivateColumns.length === 0,
+  "observações privadas e convites não fazem parte do SELECT autenticado",
+  `colunas privadas expostas: ${exposedPrivateColumns
+    .map((column) => `${column.table_name}.${column.column_name}`)
+    .join(", ")}`,
+);
+
+const writableStudentOwnership = await rows(
+  `select column_name
+   from information_schema.column_privileges
+   where table_schema = 'public'
+     and table_name = 'student_profiles'
+     and grantee = 'authenticated'
+     and privilege_type in ('INSERT', 'UPDATE')
+     and column_name in ('profile_id', 'claimed_at')`,
+);
+check(
+  writableStudentOwnership.length === 0,
+  "a ligação da ficha ao utilizador só pode ser feita pela RPC de claim",
+  `colunas de ligação escrevíveis: ${writableStudentOwnership.map((c) => c.column_name).join(", ")}`,
+);
+
+const publiclyExecutableProfileFunctions = await rows(
+  `select p.proname
+   from pg_proc p
+   join pg_namespace n on n.oid = p.pronamespace
+   where n.nspname = 'public'
+     and p.proname = any($1)
+     and (
+       has_function_privilege('public', p.oid, 'EXECUTE')
+       or has_function_privilege('anon', p.oid, 'EXECUTE')
+     )`,
+  [[
+    "claim_student_profile",
+    "admin_set_account_status",
+    "update_teacher_public_profile",
+    "prepare_student_invitation",
+    "revoke_student_invitation",
+    "add_group_member",
+    "remove_group_member",
+    "save_teacher_cancellation_policy",
+  ]],
+);
+check(
+  publiclyExecutableProfileFunctions.length === 0,
+  "RPCs de perfis e gestão não podem ser executadas por PUBLIC nem anon",
+  `RPCs de perfis ou gestão expostas: ${publiclyExecutableProfileFunctions
+    .map((p) => p.proname)
+    .join(", ")}`,
+);
+
+const TEACHER_UID = "11111111-1111-1111-1111-111111111111";
+
+// Passa pelo trigger handle_new_user(), que cria organização, perfil,
+// teacher_profile, preferências e política de cancelamento.
+await db.exec(`
+  insert into auth.users (id, email, email_confirmed_at, raw_user_meta_data)
+  values ('${TEACHER_UID}', 'prof@exemplo.pt', now(),
+          '{"role":"teacher","full_name":"Marta Sousa"}'::jsonb)
+`);
+
+// A partir daqui, as funções veem este utilizador como quem chama.
+await db.exec(`select set_config('request.jwt.claim.sub', '${TEACHER_UID}', false)`);
+
+section("Registo de professor");
+
+const teacher = await one(
+  `select t.id, t.organization_id, p.role, p.full_name
+   from public.teacher_profiles t join public.profiles p on p.id = t.profile_id
+   where t.profile_id = $1`,
+  [TEACHER_UID],
+);
+
+check(teacher?.role === "teacher", "trigger criou perfil de professor e organização");
+
+const policy = await one(`select * from public.resolve_cancellation_policy($1)`, [teacher.id]);
+check(
+  policy?.min_hours_before_cancel === 24 && policy?.late_cancellation === "charge",
+  "política de cancelamento por omissão criada (24h, cobra em atraso)",
+);
+
+const org = teacher.organization_id;
+const sport = (await one(`select id from public.sports where slug='beach-tennis'`)).id;
+const padel = (await one(`select id from public.sports where slug='padel'`)).id;
+
+const [ana, bruno] = await Promise.all([
+  one(
+    `insert into public.student_profiles (organization_id, created_by_teacher_id, full_name, email)
+     values ($1,$2,'Ana Marques','ana@exemplo.pt') returning id`,
+    [org, teacher.id],
+  ),
+  one(
+    `insert into public.student_profiles (organization_id, created_by_teacher_id, full_name, email)
+     values ($1,$2,'Bruno Dias','bruno@exemplo.pt') returning id`,
+    [org, teacher.id],
+  ),
+]);
+
+async function createLesson({ title = "Aula", start = "2026-09-10 17:00+00", cost = 1 } = {}) {
+  return one(
+    `insert into public.lessons
+       (organization_id, teacher_id, sport_id, title, starts_at, ends_at, credit_cost)
+     values ($1,$2,$3,$4,$5::timestamptz, $5::timestamptz + interval '1 hour', $6)
+     returning id`,
+    [org, teacher.id, sport, title, start, cost],
+  );
+}
+
+async function completeLesson(id) {
+  await db.query(`update public.lessons set status='completed', completed_at=now() where id=$1`, [id]);
+}
+
+async function cancelLesson(id, status = "cancelled_by_teacher", reason = "Cancelamento de teste") {
+  await db.query(
+    `update public.lessons
+        set status=$2::public.lesson_status, cancellation_reason=$3,
+            cancelled_at=now(), cancelled_by=$4
+      where id=$1`,
+    [id, status, reason, TEACHER_UID],
+  );
+}
+
+async function linkReschedule(originalId, replacementId) {
+  await db.query(`update public.lessons set rescheduled_from_id=$1 where id=$2`, [
+    originalId,
+    replacementId,
+  ]);
+  await db.query(
+    `update public.lessons
+        set status='rescheduled', rescheduled_to_id=$2,
+            reschedule_reason='Alteração de horário'
+      where id=$1`,
+    [originalId, replacementId],
+  );
+}
+
+async function asDatabaseRole(role, uid, run) {
+  await db.exec(`select set_config('request.jwt.claim.sub', '${uid ?? ""}', false)`);
+  await db.exec(`set role ${role}`);
+  try {
+    return await run();
+  } finally {
+    await db.exec(`reset role`);
+    await db.exec(`select set_config('request.jwt.claim.sub', '${TEACHER_UID}', false)`);
+  }
+}
+
+async function pkg(id) {
+  return one(
+    `select name, credits_total, credits_available, credits_reserved, credits_used, status
+     from public.student_packages where id=$1`,
+    [id],
+  );
+}
+
+async function assignPackage({
+  student,
+  name = null,
+  credits = null,
+  expires = null,
+  sportId = null,
+  starts = null,
+  templateId = null,
+  paidAmount = null,
+  notes = null,
+  origin = "manual",
+  idempotencyKey = randomUUID(),
+}) {
+  return one(
+    `select public.assign_student_package(
+       p_student_id => $1::uuid,
+       p_template_id => $2::uuid,
+       p_credits => $3::int,
+       p_name => $4::text,
+       p_sport_id => $5::uuid,
+       p_starts_on => $6::date,
+       p_expires_on => $7::date,
+       p_paid_amount_cents => $8::int,
+       p_notes => $9::text,
+       p_origin => $10::public.package_assignment_origin,
+       p_assignment_idempotency_key => $11::uuid
+     ) as id`,
+    [student, templateId, credits, name, sportId, starts, expires, paidAmount, notes, origin, idempotencyKey],
+  );
+}
+
+// ── 4. Pacotes e créditos ────────────────────────────────────────────────────
+
+section("Privilégios em runtime");
+
+const privilegeLesson = await createLesson({ title: "Privilégios", start: "2026-09-08 17:00+00" });
+
+await mustReject("authenticated não insere participações diretamente", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(
+      `insert into public.lesson_participants (lesson_id, student_id, added_by)
+       values ($1,$2,$3)`,
+      [privilegeLesson.id, ana.id, TEACHER_UID],
+    ),
+  ),
+);
+
+await mustReject("authenticated não insere pacotes diretamente", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(
+      `insert into public.student_packages
+         (organization_id, student_id, teacher_id, name,
+          initial_credits, credits_total, credits_available, created_by)
+       values ($1,$2,$3,'Direto',2,2,2,$4)`,
+      [org, ana.id, teacher.id, TEACHER_UID],
+    ),
+  ),
+);
+
+await mustReject("anon não executa uma RPC de créditos", () =>
+  asDatabaseRole("anon", null, () =>
+    db.query(`select public.select_package_for_student($1,1,null,current_date)`, [ana.id]),
+  ),
+);
+
+section("Pacotes");
+
+// Quantidade livre: o requisito é explícito em não limitar a opções fixas.
+const anaPack = await assignPackage({ student: ana.id, name: "Pacote de 7", credits: 7 });
+const created = await pkg(anaPack.id);
+
+check(
+  created.credits_total === 7 && created.credits_available === 7,
+  "pacote com quantidade personalizada (7 créditos) criado",
+);
+
+const creationLedger = await one(
+  `select type, quantity, available_after from public.package_credit_transactions
+   where student_package_id=$1`,
+  [anaPack.id],
+);
+check(
+  creationLedger?.type === "package_created" && creationLedger.available_after === 7,
+  "criação do pacote registada no livro-razão",
+);
+
+const template = await one(
+  `insert into public.package_templates
+     (organization_id, teacher_id, sport_id, name, default_credits, validity_days)
+   values ($1,$2,$3,'Modelo Padel 4',4,30)
+   returning id`,
+  [org, teacher.id, padel],
+);
+const fromTemplate = await assignPackage({ student: ana.id, templateId: template.id });
+const templateCopy = await one(
+  `select template_id, name, sport_id, initial_credits,
+          expires_on = starts_on + 30 as copied_validity
+   from public.student_packages where id=$1`,
+  [fromTemplate.id],
+);
+check(
+  templateCopy.template_id === template.id &&
+    templateCopy.name === "Modelo Padel 4" &&
+    templateCopy.sport_id === padel &&
+    templateCopy.initial_credits === 4 &&
+    templateCopy.copied_validity,
+  "atribuição por modelo copia nome, modalidade, quantidade e validade",
+);
+
+await mustReject("atribuição com quantidade negativa", () =>
+  db.query(
+    `select public.assign_student_package(
+       p_student_id => $1, p_credits => -1, p_name => 'Inválido',
+       p_assignment_idempotency_key => $2
+     )`,
+    [ana.id, randomUUID()],
+  ),
+);
+
+await mustReject("pacote com saldo incoerente", () =>
+  db.exec(`insert into public.student_packages
+             (organization_id, student_id, name, initial_credits, credits_total, credits_available, credits_used)
+           values ('${org}','${ana.id}','Incoerente',5,5,5,3)`),
+);
+
+// ── 5. Ciclo de vida de uma reserva ──────────────────────────────────────────
+
+section("Reserva, consumo e libertação");
+
+const lessonA = await createLesson({ title: "Aula A" });
+const partA = await one(`select public.reserve_participation_credits($1,$2) as id`, [
+  lessonA.id,
+  ana.id,
+]);
+
+let state = await pkg(anaPack.id);
+check(
+  state.credits_available === 6 && state.credits_reserved === 1 && state.credits_used === 0,
+  "agendar reserva 1 crédito (6 disponíveis, 1 reservado, 0 usados)",
+);
+
+// O crédito não pode ser gasto duas vezes enquanto está reservado.
+const lessonB = await createLesson({ title: "Aula B", start: "2026-09-11 17:00+00" });
+await one(`select public.reserve_participation_credits($1,$2) as id`, [lessonB.id, ana.id]);
+state = await pkg(anaPack.id);
+check(
+  state.credits_available === 5 && state.credits_reserved === 2,
+  "segunda aula reserva um crédito diferente (5 disponíveis, 2 reservados)",
+);
+
+await mustReject("consumir antes de concluir a aula", () =>
+  db.query(`select public.consume_participation_credits($1)`, [partA.id]),
+);
+await completeLesson(lessonA.id);
+await one(`select public.consume_participation_credits($1) as done`, [partA.id]);
+state = await pkg(anaPack.id);
+check(
+  state.credits_available === 5 && state.credits_reserved === 1 && state.credits_used === 1,
+  "concluir a aula transforma a reserva em consumo (5 / 1 / 1)",
+);
+
+const consumedTwice = await one(`select public.consume_participation_credits($1) as done`, [
+  partA.id,
+]);
+state = await pkg(anaPack.id);
+check(
+  consumedTwice.done === false && state.credits_used === 1,
+  "consumo duplicado é ignorado — o saldo não se move",
+);
+
+const lessonC = await createLesson({ title: "Aula C", start: "2026-09-12 17:00+00" });
+const partC = await one(`select public.reserve_participation_credits($1,$2) as id`, [
+  lessonC.id,
+  ana.id,
+]);
+await mustReject("libertar antes de existir um desfecho compatível", () =>
+  db.query(`select public.release_participation_credits($1)`, [partC.id]),
+);
+await cancelLesson(lessonC.id);
+await one(`select public.release_participation_credits($1,'Cancelada pelo professor') as done`, [
+  partC.id,
+]);
+state = await pkg(anaPack.id);
+check(
+  state.credits_available === 5 && state.credits_reserved === 1,
+  "cancelar liberta a reserva de volta ao disponível",
+);
+
+const releasedTwice = await one(`select public.release_participation_credits($1) as done`, [
+  partC.id,
+]);
+state = await pkg(anaPack.id);
+check(
+  releasedTwice.done === false && state.credits_available === 5,
+  "libertação duplicada é ignorada — o crédito não é devolvido duas vezes",
+);
+
+// ── 6. Reagendamento ─────────────────────────────────────────────────────────
+
+section("Reagendamento");
+
+const lessonD = await createLesson({ title: "Aula D", start: "2026-09-15 17:00+00" });
+const partD = await one(`select public.reserve_participation_credits($1,$2) as id`, [
+  lessonD.id,
+  ana.id,
+]);
+const beforeReschedule = await pkg(anaPack.id);
+
+const lessonDNew = await createLesson({ title: "Aula D (nova)", start: "2026-09-17 17:00+00" });
+await linkReschedule(lessonD.id, lessonDNew.id);
+const partDNew = await one(`select public.transfer_participation_reservation($1,$2) as id`, [
+  partD.id,
+  lessonDNew.id,
+]);
+const afterReschedule = await pkg(anaPack.id);
+
+check(
+  beforeReschedule.credits_available === afterReschedule.credits_available &&
+    beforeReschedule.credits_reserved === afterReschedule.credits_reserved,
+  "reagendar não cobra segunda vez — o saldo fica igual",
+);
+
+const movedParticipation = await one(
+  `select lesson_id, billing_status, credits_reserved from public.lesson_participants where id=$1`,
+  [partDNew.id],
+);
+check(
+  movedParticipation.lesson_id === lessonDNew.id &&
+    movedParticipation.billing_status === "reserved" &&
+    movedParticipation.credits_reserved === 1,
+  "a reserva passou a pertencer à aula nova",
+);
+
+const oldParticipation = await one(
+  `select billing_status, credits_reserved from public.lesson_participants where id=$1`,
+  [partD.id],
+);
+check(
+  oldParticipation.credits_reserved === 0,
+  "a participação antiga deixou de deter a reserva",
+);
+
+const conflictPack = await assignPackage({
+  student: bruno.id,
+  name: "Conflito de reagendamento",
+  credits: 2,
+});
+const conflictOldLesson = await createLesson({
+  title: "Conflito (original)",
+  start: "2026-09-18 17:00+00",
+});
+const conflictNewLesson = await createLesson({
+  title: "Conflito (destino)",
+  start: "2026-09-19 17:00+00",
+});
+const conflictOld = await one(
+  `select public.reserve_participation_credits($1,$2,$3) as id`,
+  [conflictOldLesson.id, bruno.id, conflictPack.id],
+);
+const conflictTarget = await one(
+  `select public.reserve_participation_credits($1,$2,$3) as id`,
+  [conflictNewLesson.id, bruno.id, conflictPack.id],
+);
+await linkReschedule(conflictOldLesson.id, conflictNewLesson.id);
+const beforeConflict = await pkg(conflictPack.id);
+
+await mustReject("reagendamento não sobrepõe uma reserva existente no destino", () =>
+  db.query(`select public.transfer_participation_reservation($1,$2)`, [
+    conflictOld.id,
+    conflictNewLesson.id,
+  ]),
+);
+
+const [afterConflict, conflictRows] = await Promise.all([
+  pkg(conflictPack.id),
+  rows(
+    `select id, billing_status, credits_reserved
+     from public.lesson_participants where id = any($1::uuid[]) order by id`,
+    [[conflictOld.id, conflictTarget.id]],
+  ),
+]);
+check(
+  afterConflict.credits_available === beforeConflict.credits_available &&
+    afterConflict.credits_reserved === beforeConflict.credits_reserved &&
+    conflictRows.length === 2 &&
+    conflictRows.every((row) => row.billing_status === "reserved" && row.credits_reserved === 1),
+  "uma transferência rejeitada conserva as duas reservas e o saldo",
+);
+
+// ── 7. Escolha entre vários pacotes ──────────────────────────────────────────
+
+section("Vários pacotes");
+
+const brunoLater = await assignPackage({
+  student: bruno.id,
+  name: "Expira em dezembro",
+  credits: 5,
+  expires: "2026-12-31",
+});
+const brunoSooner = await assignPackage({
+  student: bruno.id,
+  name: "Expira em outubro",
+  credits: 5,
+  expires: "2026-10-31",
+});
+const brunoNoExpiry = await assignPackage({
+  student: bruno.id,
+  name: "Sem validade",
+  credits: 5,
+});
+
+const suggested = await one(`select public.select_package_for_student($1,1,null) as id`, [bruno.id]);
+check(
+  suggested.id === brunoSooner.id,
+  "sugere primeiro o pacote que expira mais cedo",
+  `sugeriu o pacote errado (${suggested.id})`,
+);
+
+// Um pacote sem validade nunca deve ser gasto antes de um que expira.
+check(
+  suggested.id !== brunoNoExpiry.id && suggested.id !== brunoLater.id,
+  "pacotes sem validade e de validade distante ficam para depois",
+);
+
+// ── 8. Aula de grupo com pacotes diferentes ──────────────────────────────────
+
+section("Aula de grupo");
+
+const groupLesson = await createLesson({ title: "Turma", start: "2026-09-20 17:00+00", cost: 1 });
+await one(`select public.reserve_participation_credits($1,$2) as id`, [groupLesson.id, ana.id]);
+await one(`select public.reserve_participation_credits($1,$2,$3,$4) as id`, [
+  groupLesson.id,
+  bruno.id,
+  brunoLater.id,
+  2,
+]);
+
+const groupRows = await rows(
+  `select lp.student_id, lp.student_package_id, lp.credits_reserved
+   from public.lesson_participants lp where lp.lesson_id=$1 order by lp.credits_reserved`,
+  [groupLesson.id],
+);
+
+check(
+  groupRows.length === 2 &&
+    groupRows[0].student_package_id !== groupRows[1].student_package_id &&
+    groupRows[0].credits_reserved === 1 &&
+    groupRows[1].credits_reserved === 2,
+  "na mesma aula, dois alunos usam pacotes diferentes e quantidades diferentes",
+);
+
+const brunoLaterState = await pkg(brunoLater.id);
+check(
+  brunoLaterState.credits_reserved === 2,
+  "o pacote escolhido manualmente foi respeitado, com 2 créditos reservados",
+);
+
+// ── 9. O que tem de ser impossível ───────────────────────────────────────────
+
+section("Proteções");
+
+const anaState = await pkg(anaPack.id);
+const drainLesson = await createLesson({
+  title: "Esgotar",
+  start: "2026-09-25 17:00+00",
+  cost: anaState.credits_available + 1,
+});
+
+await mustReject("reservar mais créditos do que existem", () =>
+  db.query(`select public.reserve_participation_credits($1,$2)`, [drainLesson.id, ana.id]),
+);
+
+const foreignLesson = await createLesson({ title: "Alheio", start: "2026-09-26 17:00+00" });
+await mustReject("usar o pacote de outro aluno", () =>
+  db.query(`select public.reserve_participation_credits($1,$2,$3)`, [
+    foreignLesson.id,
+    ana.id,
+    brunoLater.id,
+  ]),
+);
+
+const cancelledPack = await assignPackage({
+  student: bruno.id,
+  name: "Cancelado",
+  credits: 5,
+});
+await db.query(`update public.student_packages set status='cancelled' where id=$1`, [
+  cancelledPack.id,
+]);
+
+const cancelledLesson = await createLesson({
+  title: "Com cancelado",
+  start: "2026-09-27 17:00+00",
+});
+await mustReject("usar um pacote cancelado", () =>
+  db.query(`select public.reserve_participation_credits($1,$2,$3)`, [
+    cancelledLesson.id,
+    bruno.id,
+    cancelledPack.id,
+  ]),
+);
+
+await mustReject("allow_exception NULL não contorna a validação de pacote", () =>
+  db.query(`select public.reserve_participation_credits($1,$2,$3,1,null,$4)`, [
+    cancelledLesson.id,
+    bruno.id,
+    cancelledPack.id,
+    "Não deve ser aceite",
+  ]),
+);
+
+const wrongSportPack = await assignPackage({
+  student: bruno.id,
+  name: "Apenas padel",
+  credits: 2,
+  sportId: padel,
+});
+const wrongSportLesson = await createLesson({
+  title: "Modalidade incompatível",
+  start: "2026-09-28 17:00+00",
+});
+await mustReject("pacote manual de outra modalidade sem exceção", () =>
+  db.query(`select public.reserve_participation_credits($1,$2,$3)`, [
+    wrongSportLesson.id,
+    bruno.id,
+    wrongSportPack.id,
+  ]),
+);
+const wrongSportPart = await one(
+  `select public.reserve_participation_credits($1,$2,$3,1,true,$4) as id`,
+  [wrongSportLesson.id, bruno.id, wrongSportPack.id, "Autorização pontual"],
+);
+const auditedException = await one(
+  `select billing_status, is_exception, exception_reason, exception_authorized_by
+   from public.lesson_participants where id=$1`,
+  [wrongSportPart.id],
+);
+check(
+  auditedException.billing_status === "reserved" &&
+    auditedException.is_exception &&
+    auditedException.exception_reason === "Autorização pontual" &&
+    auditedException.exception_authorized_by === TEACHER_UID,
+  "exceção de modalidade fica explícita, justificada e atribuída",
+);
+
+const expiredPack = await assignPackage({
+  student: bruno.id,
+  name: "Expira antes da aula",
+  credits: 2,
+  expires: "2026-09-01",
+});
+const expiredLesson = await createLesson({
+  title: "Depois da validade",
+  start: "2026-09-29 17:00+00",
+});
+await mustReject("validade do pacote é comparada com a data da aula", () =>
+  db.query(`select public.reserve_participation_credits($1,$2,$3)`, [
+    expiredLesson.id,
+    bruno.id,
+    expiredPack.id,
+  ]),
+);
+
+await db.query(
+  `update public.cancellation_policies
+      set allow_manual_exceptions=false
+    where organization_id=$1 and is_default`,
+  [org],
+);
+await mustReject("política pode proibir uma exceção pedida explicitamente", () =>
+  db.query(`select public.reserve_participation_credits($1,$2,$3,1,true,$4)`, [
+    expiredLesson.id,
+    bruno.id,
+    expiredPack.id,
+    "Exceção bloqueada pela política",
+  ]),
+);
+await db.query(
+  `update public.cancellation_policies
+      set allow_manual_exceptions=true
+    where organization_id=$1 and is_default`,
+  [org],
+);
+
+await mustReject("retirar mais créditos do que estão disponíveis", () =>
+  db.query(`select public.adjust_package_credits($1,$2,$3)`, [anaPack.id, -999, "teste"]),
+);
+
+await mustReject("ajuste manual sem motivo", () =>
+  db.query(`select public.adjust_package_credits($1,$2,$3)`, [anaPack.id, 1, ""]),
+);
+
+await mustReject("alterar uma movimentação do livro-razão", () =>
+  db.exec(`update public.package_credit_transactions set quantity = 99`),
+);
+
+await mustReject("apagar uma movimentação do livro-razão", () =>
+  db.exec(`delete from public.package_credit_transactions`),
+);
+
+// O último crédito só pode pagar uma aula. Duas tentativas, uma passa.
+section("Último crédito");
+
+const duel = await assignPackage({ student: bruno.id, name: "Um crédito", credits: 1 });
+const duelA = await createLesson({ title: "Duelo A", start: "2026-10-01 17:00+00" });
+const duelB = await createLesson({ title: "Duelo B", start: "2026-10-02 17:00+00" });
+
+await db.query(`select public.reserve_participation_credits($1,$2,$3)`, [
+  duelA.id,
+  bruno.id,
+  duel.id,
+]);
+
+await mustReject("segunda reserva sobre o mesmo último crédito", () =>
+  db.query(`select public.reserve_participation_credits($1,$2,$3)`, [duelB.id, bruno.id, duel.id]),
+);
+
+const duelState = await pkg(duel.id);
+check(
+  duelState.credits_available === 0 && duelState.credits_reserved === 1,
+  "o saldo não fica negativo: 0 disponíveis, 1 reservado",
+);
+
+// Ainda NÃO é 'depleted': o crédito está reservado, não gasto. Se a aula for
+// cancelada, ele volta ao saldo disponível. "Esgotado" fica reservado para
+// quando não há mesmo nada — nem disponível, nem por decidir.
+check(
+  duelState.status === "active",
+  "um pacote com reserva pendente continua ativo, não esgotado",
+  `estado inesperado: ${duelState.status}`,
+);
+
+await completeLesson(duelA.id);
+await one(`select public.consume_participation_credits($1) as done`, [
+  (
+    await one(
+      `select id from public.lesson_participants where lesson_id=$1 and student_id=$2`,
+      [duelA.id, bruno.id],
+    )
+  ).id,
+]);
+
+const duelAfter = await pkg(duel.id);
+check(
+  duelAfter.status === "depleted" && duelAfter.credits_used === 1,
+  "depois de consumido, o pacote passa a esgotado",
+  `estado inesperado: ${duelAfter.status}`,
+);
+
+// ── 10. Ajustes manuais e correções ──────────────────────────────────────────
+
+section("Ajustes manuais");
+
+const beforeAdjust = await pkg(anaPack.id);
+await db.query(`select public.adjust_package_credits($1,$2,$3)`, [
+  anaPack.id,
+  3,
+  "Oferta de fim de época",
+]);
+const afterAdjust = await pkg(anaPack.id);
+
+check(
+  afterAdjust.credits_available === beforeAdjust.credits_available + 3 &&
+    afterAdjust.credits_total === beforeAdjust.credits_total + 3,
+  "ajuste manual soma ao disponível e ao total",
+);
+
+const adjustment = await one(
+  `select id, type, quantity, reason, available_before, available_after
+   from public.package_credit_transactions
+   where student_package_id=$1 and type='credit_added_manually'
+   order by created_at desc limit 1`,
+  [anaPack.id],
+);
+
+check(
+  adjustment.quantity === 3 &&
+    adjustment.reason === "Oferta de fim de época" &&
+    adjustment.available_after - adjustment.available_before === 3,
+  "o ajuste ficou registado com motivo, saldo anterior e saldo posterior",
+);
+
+// Uma correção não apaga o erro: acrescenta-se-lhe uma movimentação nova.
+const ledgerBefore = await one(
+  `select count(*)::int as n from public.package_credit_transactions where student_package_id=$1`,
+  [anaPack.id],
+);
+const correction = await one(`select public.correct_package_credit_transaction($1,$2,$3) as id`, [
+  adjustment.id,
+  -3,
+  "Correção: oferta lançada por engano",
+]);
+const ledgerAfter = await one(
+  `select count(*)::int as n from public.package_credit_transactions where student_package_id=$1`,
+  [anaPack.id],
+);
+
+check(
+  ledgerAfter.n === ledgerBefore.n + 1,
+  "a correção acrescenta uma movimentação — nenhuma é apagada",
+);
+
+const correctionEntry = await one(
+  `select type, quantity, reason, corrects_transaction_id
+   from public.package_credit_transactions where id=$1`,
+  [correction.id],
+);
+check(
+  correctionEntry.type === "administrative_correction" &&
+    correctionEntry.quantity === 3 &&
+    correctionEntry.corrects_transaction_id === adjustment.id,
+  "a correção é compensatória e referencia a movimentação original",
+);
+
+const beforeDuplicateCorrection = await pkg(anaPack.id);
+await mustReject("uma movimentação não recebe duas correções", () =>
+  db.query(`select public.correct_package_credit_transaction($1,$2,$3)`, [
+    adjustment.id,
+    -3,
+    "Segunda correção indevida",
+  ]),
+);
+const afterDuplicateCorrection = await pkg(anaPack.id);
+check(
+  afterDuplicateCorrection.credits_total === beforeDuplicateCorrection.credits_total &&
+    afterDuplicateCorrection.credits_available === beforeDuplicateCorrection.credits_available,
+  "uma correção duplicada rejeitada não altera o saldo",
+);
+
+const stillThere = await one(
+  `select count(*)::int as n from public.package_credit_transactions
+   where student_package_id=$1 and type='credit_added_manually'`,
+  [anaPack.id],
+);
+check(stillThere.n === 1, "a movimentação original continua no histórico");
+
+// A soma do livro-razão tem de bater certo com o saldo guardado.
+const reconciled = await one(
+  `select sp.credits_available, sp.credits_reserved, sp.credits_used,
+          (select t.available_after from public.package_credit_transactions t
+            where t.student_package_id = sp.id order by t.created_at desc, t.id desc limit 1) as ledger_available
+   from public.student_packages sp where sp.id=$1`,
+  [anaPack.id],
+);
+check(
+  reconciled.credits_available === reconciled.ledger_available,
+  "o saldo do pacote bate certo com a última movimentação do livro-razão",
+);
+
+// ── 11. RLS e isolamento entre organizações ─────────────────────────────────
+
+section("RLS em runtime");
+
+const OTHER_TEACHER_UID = "22222222-2222-2222-2222-222222222222";
+await db.exec(`
+  insert into auth.users (id, email, email_confirmed_at, raw_user_meta_data)
+  values ('${OTHER_TEACHER_UID}', 'outro.prof@exemplo.pt', now(),
+          '{"role":"teacher","full_name":"Outro Professor"}'::jsonb)
+`);
+const otherTeacher = await one(
+  `select id, organization_id from public.teacher_profiles where profile_id=$1`,
+  [OTHER_TEACHER_UID],
+);
+const otherStudent = await one(
+  `insert into public.student_profiles
+     (organization_id, created_by_teacher_id, full_name, email)
+   values ($1,$2,'Aluno Externo','externo@exemplo.pt') returning id`,
+  [otherTeacher.organization_id, otherTeacher.id],
+);
+
+await db.exec(`select set_config('request.jwt.claim.sub', '${OTHER_TEACHER_UID}', false)`);
+const otherPackage = await assignPackage({
+  student: otherStudent.id,
+  name: "Pacote externo",
+  credits: 3,
+});
+await db.exec(`select set_config('request.jwt.claim.sub', '${TEACHER_UID}', false)`);
+
+await mustReject("conta de professor não reclama uma ficha de aluno", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.claim_student_profile(null::text)`),
+  ),
+);
+
+await mustReject("professor não atribui pacote a aluno de outra organização", () =>
+  db.query(
+    `select public.assign_student_package(
+       p_student_id => $1, p_credits => 3, p_name => 'Injeção cruzada',
+       p_assignment_idempotency_key => $2
+     )`,
+    [otherStudent.id, randomUUID()],
+  ),
+);
+
+await mustReject("política não aceita professor de outra organização", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(
+      `insert into public.cancellation_policies
+         (organization_id, teacher_id, name, is_default)
+       values ($1,$2,'Política cruzada',false)`,
+      [org, otherTeacher.id],
+    ),
+  ),
+);
+
+const ANA_UID = "33333333-3333-3333-3333-333333333333";
+await db.exec(`
+  insert into auth.users (id, email, email_confirmed_at, raw_user_meta_data)
+  values ('${ANA_UID}', 'ana@exemplo.pt', now(),
+          '{"role":"student","full_name":"Ana Marques"}'::jsonb)
+`);
+const claimedAna = await asDatabaseRole("authenticated", ANA_UID, () =>
+  one(`select public.claim_student_profile(null::text) as id`),
+);
+check(claimedAna.id === ana.id, "aluna com email confirmado reclamou a ficha certa");
+
+const anaVisiblePackages = await asDatabaseRole("authenticated", ANA_UID, () =>
+  rows(`select id, student_id from public.student_packages order by id`),
+);
+check(
+  anaVisiblePackages.length >= 2 &&
+    anaVisiblePackages.every((row) => row.student_id === ana.id) &&
+    !anaVisiblePackages.some((row) => row.id === otherPackage.id),
+  "RLS deixa a aluna ver os próprios pacotes e oculta os restantes",
+);
+
+const anaVisibleTransactions = await asDatabaseRole("authenticated", ANA_UID, () =>
+  rows(`select distinct student_id from public.package_credit_transactions`),
+);
+check(
+  anaVisibleTransactions.length === 1 && anaVisibleTransactions[0].student_id === ana.id,
+  "RLS deixa a aluna ver apenas as próprias movimentações",
+);
+
+const teacherVisibleOrganizations = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  rows(`select distinct organization_id from public.student_packages`),
+);
+check(
+  teacherVisibleOrganizations.length === 1 && teacherVisibleOrganizations[0].organization_id === org,
+  "RLS isola os pacotes de professores de organizações diferentes",
+);
+
+// ── 12. Herança do esquema da Fase 1 ─────────────────────────────────────────
+
+section("Perfis e administração (Fase 2)");
+
+const teacherOwnProfiles = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  rows(`select id, full_name, email from public.profiles order by id`),
+);
+check(
+  teacherOwnProfiles.length === 1 && teacherOwnProfiles[0].id === TEACHER_UID,
+  "professor lê apenas o próprio perfil de conta",
+);
+
+const updatedTeacherAccount = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `update public.profiles
+        set full_name='Marta Sousa Silva', phone='+351 912 345 678',
+            locale='pt-PT', timezone='Atlantic/Madeira', preferred_contact_method='phone'
+      where id=$1
+      returning full_name, phone, timezone, preferred_contact_method`,
+    [TEACHER_UID],
+  ),
+);
+check(
+  updatedTeacherAccount?.full_name === "Marta Sousa Silva" &&
+    updatedTeacherAccount?.preferred_contact_method === "phone",
+  "professor atualiza apenas os dados permitidos da própria conta",
+);
+
+await mustReject("professor não altera o próprio papel", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`update public.profiles set role='admin' where id=$1`, [TEACHER_UID]),
+  ),
+);
+await mustReject("telefone inválido é recusado pela base", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`update public.profiles set phone='telefone inválido' where id=$1`, [TEACHER_UID]),
+  ),
+);
+await mustReject("fuso horário fora da lista é recusado pela base", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`update public.profiles set timezone='UTC' where id=$1`, [TEACHER_UID]),
+  ),
+);
+
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(
+    `select public.update_teacher_public_profile(
+       'Marta Sousa', 'Professora de modalidades de raquete.', 'Lisboa e margem sul', $1::uuid[]
+     )`,
+    [[sport, padel]],
+  ),
+);
+const teacherPublicProfile = await one(
+  `select public_name, bio, service_area, default_sport_id
+   from public.teacher_profiles where id=$1`,
+  [teacher.id],
+);
+const teacherSportIds = (
+  await rows(`select sport_id from public.teacher_sports where teacher_id=$1 order by sport_id`, [
+    teacher.id,
+  ])
+).map((entry) => entry.sport_id);
+check(
+  teacherPublicProfile.public_name === "Marta Sousa" &&
+    teacherPublicProfile.service_area === "Lisboa e margem sul" &&
+    teacherSportIds.length === 2 &&
+    teacherSportIds.includes(sport) &&
+    teacherSportIds.includes(padel),
+  "RPC guarda perfil público e modalidades do professor de forma atómica",
+);
+
+const otherOrganizationSport = await one(
+  `insert into public.sports (organization_id, slug, name)
+   values ($1, 'modalidade-externa', 'Modalidade externa') returning id`,
+  [otherTeacher.organization_id],
+);
+await mustReject("perfil público não aceita modalidade de outra organização", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(
+      `select public.update_teacher_public_profile('Marta Sousa', null, null, $1::uuid[])`,
+      [[otherOrganizationSport.id]],
+    ),
+  ),
+);
+const unchangedTeacherSports = await one(
+  `select count(*)::int as n from public.teacher_sports where teacher_id=$1`,
+  [teacher.id],
+);
+check(
+  unchangedTeacherSports.n === 2,
+  "falha na atualização pública não remove modalidades existentes",
+);
+
+const hiddenOtherTeacherUpdate = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  rows(
+    `update public.teacher_profiles set public_name='Intrusão'
+      where id=$1 returning id`,
+    [otherTeacher.id],
+  ),
+);
+check(hiddenOtherTeacherUpdate.length === 0, "professor não altera o perfil de outro professor");
+
+await mustReject("aluno não consegue pedir as observações privadas da ficha", () =>
+  asDatabaseRole("authenticated", ANA_UID, () =>
+    db.query(`select notes from public.student_profiles where profile_id=$1`, [ANA_UID]),
+  ),
+);
+await mustReject("aluno não consegue pedir notas privadas de aulas", () =>
+  asDatabaseRole("authenticated", ANA_UID, () =>
+    db.query(`select private_notes from public.lessons where id=$1`, [lessonA.id]),
+  ),
+);
+
+const anaSelfProfile = await asDatabaseRole("authenticated", ANA_UID, () =>
+  rows(`select id, full_name, created_by_teacher_id from public.student_self_profile`),
+);
+const anaTeacherDirectory = await asDatabaseRole("authenticated", ANA_UID, () =>
+  rows(`select id, public_name, bio, service_area from public.teacher_public_profiles`),
+);
+const anaTeacherSports = await asDatabaseRole("authenticated", ANA_UID, () =>
+  rows(`select teacher_id, sport_id, name from public.teacher_public_sports`),
+);
+check(
+  anaSelfProfile.length === 1 &&
+    anaSelfProfile[0].id === ana.id &&
+    anaTeacherDirectory.length === 1 &&
+    anaTeacherDirectory[0].id === teacher.id &&
+    anaTeacherSports.length === 2,
+  "aluno recebe apenas as projeções seguras da própria ficha e do professor",
+);
+
+const anaVisibleStudentRows = await asDatabaseRole("authenticated", ANA_UID, () =>
+  rows(`select id, profile_id, full_name from public.student_profiles order by id`),
+);
+check(
+  anaVisibleStudentRows.length === 1 && anaVisibleStudentRows[0].id === ana.id,
+  "aluno não consulta a ficha de outro aluno",
+);
+const updatedAnaAccount = await asDatabaseRole("authenticated", ANA_UID, () =>
+  one(
+    `update public.profiles
+        set full_name='Ana Marques Silva', phone='+351913456789',
+            locale='pt-PT', timezone='Atlantic/Azores', preferred_contact_method='phone'
+      where id=$1
+      returning full_name, phone, timezone, preferred_contact_method`,
+    [ANA_UID],
+  ),
+);
+check(
+  updatedAnaAccount?.full_name === "Ana Marques Silva" &&
+    updatedAnaAccount?.preferred_contact_method === "phone",
+  "aluno atualiza apenas os dados permitidos da própria conta",
+);
+await mustReject("aluno não altera a própria função", () =>
+  asDatabaseRole("authenticated", ANA_UID, () =>
+    db.query(`update public.profiles set role='teacher' where id=$1`, [ANA_UID]),
+  ),
+);
+await mustReject("aluno não altera a organização", () =>
+  asDatabaseRole("authenticated", ANA_UID, () =>
+    db.query(`update public.profiles set organization_id=$1 where id=$2`, [
+      otherTeacher.organization_id,
+      ANA_UID,
+    ]),
+  ),
+);
+await mustReject("aluno não altera o professor responsável da ficha", () =>
+  asDatabaseRole("authenticated", ANA_UID, () =>
+    db.query(`update public.student_profiles set created_by_teacher_id=$1 where id=$2`, [
+      otherTeacher.id,
+      ana.id,
+    ]),
+  ),
+);
+await mustReject("aluno não altera diretamente o saldo de créditos", () =>
+  asDatabaseRole("authenticated", ANA_UID, () =>
+    db.query(`update public.student_packages set credits_available=99 where id=$1`, [anaPack.id]),
+  ),
+);
+
+await mustReject("professor não altera a própria organização", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`update public.profiles set organization_id=$1 where id=$2`, [
+      otherTeacher.organization_id,
+      TEACHER_UID,
+    ]),
+  ),
+);
+
+const ADMIN_UID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+await db.exec(`
+  insert into auth.users (id, email, email_confirmed_at, raw_user_meta_data)
+  values ('${ADMIN_UID}', 'admin@exemplo.pt', now(),
+          '{"role":"student","full_name":"Administração AulaFlow"}'::jsonb)
+`);
+await db.query(`update public.profiles set role='admin' where id=$1`, [ADMIN_UID]);
+
+const adminDirectory = await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  rows(`select id, full_name, email, role, status, organization_name from public.admin_user_directory`),
+);
+check(
+  adminDirectory.length >= 4 && adminDirectory.some((entry) => entry.id === TEACHER_UID),
+  "administrador ativo lê o diretório básico de contas",
+);
+const teacherAdminDirectory = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  rows(`select id from public.admin_user_directory`),
+);
+check(teacherAdminDirectory.length === 0, "utilizador comum não lê o diretório administrativo");
+
+await mustReject("professor não bloqueia contas", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.admin_set_account_status($1, 'blocked', 'Tentativa indevida')`, [
+      ANA_UID,
+    ]),
+  ),
+);
+await mustReject("administrador não se bloqueia a si próprio", () =>
+  asDatabaseRole("authenticated", ADMIN_UID, () =>
+    db.query(`select public.admin_set_account_status($1, 'blocked', 'Auto bloqueio')`, [ADMIN_UID]),
+  ),
+);
+await mustReject("administração não atribui estado pendente", () =>
+  asDatabaseRole("authenticated", ADMIN_UID, () =>
+    db.query(`select public.admin_set_account_status($1, 'pending', 'Estado fora do fluxo')`, [
+      ANA_UID,
+    ]),
+  ),
+);
+await mustReject("bloqueio exige motivo auditável", () =>
+  asDatabaseRole("authenticated", ADMIN_UID, () =>
+    db.query(`select public.admin_set_account_status($1, 'blocked', 'x')`, [ANA_UID]),
+  ),
+);
+
+await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  db.query(`select public.admin_set_account_status($1, 'blocked', 'Pedido do responsável')`, [
+    ANA_UID,
+  ]),
+);
+const blockedAna = await one(
+  `select status, blocked_at, blocked_reason from public.profiles where id=$1`,
+  [ANA_UID],
+);
+const blockAudit = await one(
+  `select action, metadata from public.audit_log
+   where actor_id=$1 and target_id=$2 order by created_at desc limit 1`,
+  [ADMIN_UID, ANA_UID],
+);
+check(
+  blockedAna.status === "blocked" &&
+    blockedAna.blocked_at !== null &&
+    blockedAna.blocked_reason === "Pedido do responsável" &&
+    blockAudit.action === "account.blocked" &&
+    blockAudit.metadata.previous_status === "active" &&
+    blockAudit.metadata.new_status === "blocked",
+  "bloqueio é coerente e deixa rasto de auditoria",
+);
+
+const blockedAnaProtectedRows = await asDatabaseRole("authenticated", ANA_UID, async () => {
+  const self = await rows(`select id from public.student_self_profile`);
+  const organizations = await rows(`select id from public.organizations`);
+  const packages = await rows(`select id from public.student_packages`);
+  const preferences = await rows(`select profile_id from public.notification_preferences`);
+  const updated = await rows(
+    `update public.profiles set full_name='Nome bloqueado' where id=$1 returning id`,
+    [ANA_UID],
+  );
+  return { self, organizations, packages, preferences, updated };
+});
+check(
+  Object.values(blockedAnaProtectedRows).every((entries) => entries.length === 0),
+  "conta bloqueada não lê nem altera dados protegidos",
+);
+await mustReject("conta bloqueada não executa claim", () =>
+  asDatabaseRole("authenticated", ANA_UID, () =>
+    db.query(`select public.claim_student_profile(null::text)`),
+  ),
+);
+
+await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  db.query(`select public.admin_set_account_status($1, 'active', null)`, [ANA_UID]),
+);
+const reactivatedAna = await one(
+  `select status, blocked_at, blocked_reason from public.profiles where id=$1`,
+  [ANA_UID],
+);
+check(
+  reactivatedAna.status === "active" &&
+    reactivatedAna.blocked_at === null &&
+    reactivatedAna.blocked_reason === null,
+  "reativação limpa os dados de bloqueio",
+);
+
+section("Ligação segura da conta do aluno (Fase 2)");
+
+const anaClaimBefore = await one(
+  `select id, claimed_at from public.student_profiles where profile_id=$1`,
+  [ANA_UID],
+);
+const repeatedAnaClaim = await asDatabaseRole("authenticated", ANA_UID, () =>
+  one(`select public.claim_student_profile(null::text) as id`),
+);
+const anaClaimAfter = await one(
+  `select id, claimed_at from public.student_profiles where profile_id=$1`,
+  [ANA_UID],
+);
+check(
+  repeatedAnaClaim.id === ana.id &&
+    anaClaimAfter.id === anaClaimBefore.id &&
+    String(anaClaimAfter.claimed_at) === String(anaClaimBefore.claimed_at),
+  "claim repetido é idempotente e conserva a ligação existente",
+);
+
+async function createStudentAuthUser(id, email, confirmed = true) {
+  await db.query(
+    `insert into auth.users (id, email, email_confirmed_at, raw_user_meta_data)
+     values ($1, $2, case when $3 then now() else null end,
+             '{"role":"student","full_name":"Aluno de teste"}'::jsonb)`,
+    [id, email, confirmed],
+  );
+}
+
+const NO_MATCH_UID = "44444444-4444-4444-4444-444444444444";
+await createStudentAuthUser(NO_MATCH_UID, "sem-ficha@exemplo.pt");
+const noMatchClaim = await asDatabaseRole("authenticated", NO_MATCH_UID, () =>
+  one(`select public.claim_student_profile(null::text) as id`),
+);
+check(noMatchClaim.id === null, "claim sem ficha correspondente termina sem ligar dados");
+
+const UNCONFIRMED_UID = "55555555-5555-5555-5555-555555555555";
+await createStudentAuthUser(UNCONFIRMED_UID, "nao-confirmado@exemplo.pt", false);
+await mustReject(
+  "email não confirmado não reclama ficha",
+  () =>
+    asDatabaseRole("authenticated", UNCONFIRMED_UID, () =>
+      db.query(`select public.claim_student_profile(null::text)`),
+    ),
+  "Confirme o seu email",
+);
+
+const ambiguousEmail = "duplicado@exemplo.pt";
+const ambiguousCandidates = await Promise.all([
+  one(
+    `insert into public.student_profiles
+       (organization_id, created_by_teacher_id, full_name, email)
+     values ($1,$2,'Duplicado Lisboa',$3) returning id`,
+    [org, teacher.id, ambiguousEmail],
+  ),
+  one(
+    `insert into public.student_profiles
+       (organization_id, created_by_teacher_id, full_name, email)
+     values ($1,$2,'Duplicado Externo',$3) returning id`,
+    [otherTeacher.organization_id, otherTeacher.id, ambiguousEmail],
+  ),
+]);
+const AMBIGUOUS_UID = "66666666-6666-6666-6666-666666666666";
+await createStudentAuthUser(AMBIGUOUS_UID, ambiguousEmail);
+await mustReject(
+  "email existente em várias organizações não é escolhido arbitrariamente",
+  () =>
+    asDatabaseRole("authenticated", AMBIGUOUS_UID, () =>
+      db.query(`select public.claim_student_profile(null::text)`),
+    ),
+  "várias fichas",
+);
+const ambiguousLinks = await one(
+  `select count(*)::int as n from public.student_profiles
+   where id = any($1::uuid[]) and profile_id is not null`,
+  [ambiguousCandidates.map((candidate) => candidate.id)],
+);
+check(ambiguousLinks.n === 0, "claim ambíguo não liga nenhuma das fichas candidatas");
+
+const PRESET_ORG_UID = "77777777-7777-7777-7777-777777777777";
+const presetEmail = "predefinido@exemplo.pt";
+const presetOrgCandidate = await one(
+  `insert into public.student_profiles
+     (organization_id, created_by_teacher_id, full_name, email)
+   values ($1,$2,'Organização errada',$3) returning id`,
+  [otherTeacher.organization_id, otherTeacher.id, presetEmail],
+);
+await createStudentAuthUser(PRESET_ORG_UID, presetEmail);
+await db.query(`update public.profiles set organization_id=$1 where id=$2`, [org, PRESET_ORG_UID]);
+const presetOrgClaim = await asDatabaseRole("authenticated", PRESET_ORG_UID, () =>
+  one(`select public.claim_student_profile(null::text) as id`),
+);
+const presetOrgProfile = await one(`select organization_id from public.profiles where id=$1`, [
+  PRESET_ORG_UID,
+]);
+check(
+  presetOrgClaim.id === null && presetOrgProfile.organization_id === org,
+  "organização já definida limita o claim e nunca é trocada",
+);
+
+const linkedEmail = "ligacao-unica@exemplo.pt";
+const linkedCandidate = await one(
+  `insert into public.student_profiles
+     (organization_id, created_by_teacher_id, full_name, email)
+   values ($1,$2,'Ligação única',$3) returning id`,
+  [org, teacher.id, linkedEmail],
+);
+const FIRST_LINK_UID = "88888888-8888-8888-8888-888888888888";
+const SECOND_LINK_UID = "99999999-9999-9999-9999-999999999999";
+await createStudentAuthUser(FIRST_LINK_UID, linkedEmail);
+await createStudentAuthUser(SECOND_LINK_UID, linkedEmail);
+const firstLink = await asDatabaseRole("authenticated", FIRST_LINK_UID, () =>
+  one(`select public.claim_student_profile(null::text) as id`),
+);
+const secondLink = await asDatabaseRole("authenticated", SECOND_LINK_UID, () =>
+  one(`select public.claim_student_profile(null::text) as id`),
+);
+const linkedOwner = await one(`select profile_id from public.student_profiles where id=$1`, [
+  linkedCandidate.id,
+]);
+check(
+  firstLink.id === linkedCandidate.id &&
+    secondLink.id === null &&
+    linkedOwner.profile_id === FIRST_LINK_UID,
+  "uma ficha já ligada não pode ser reclamada por outra conta",
+);
+
+const INACTIVE_UID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+const inactiveEmail = "inativo@exemplo.pt";
+await one(
+  `insert into public.student_profiles
+     (organization_id, created_by_teacher_id, full_name, email, is_active)
+   values ($1,$2,'Ficha inativa',$3,false) returning id`,
+  [org, teacher.id, inactiveEmail],
+);
+await createStudentAuthUser(INACTIVE_UID, inactiveEmail);
+const inactiveClaim = await asDatabaseRole("authenticated", INACTIVE_UID, () =>
+  one(`select public.claim_student_profile(null::text) as id`),
+);
+check(inactiveClaim.id === null, "ficha inativa não é ligada por email");
+
+const INVITE_UID = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+await createStudentAuthUser(INVITE_UID, "convite@exemplo.pt");
+await mustReject(
+  "código de convite fraco permanece desativado até existir fluxo seguro",
+  () =>
+    asDatabaseRole("authenticated", INVITE_UID, () =>
+      db.query(`select public.claim_student_profile('codigo-em-claro')`),
+    ),
+  "ainda não está disponível",
+);
+
+// ── 13. Gestão operacional do professor (Fase 3) ─────────────────────────────
+
+section("Gestão de alunos, convites, turmas, locais e políticas (Fase 3)");
+
+const PHASE3_FUNCTIONS = [
+  "prepare_student_invitation",
+  "revoke_student_invitation",
+  "add_group_member",
+  "remove_group_member",
+  "save_teacher_cancellation_policy",
+];
+
+const phase3FunctionSecurity = await rows(
+  `select p.proname, p.prosecdef,
+          coalesce(p.proconfig @> array['search_path=public, pg_temp'], false) as safe_search_path
+   from pg_proc p
+   join pg_namespace n on n.oid = p.pronamespace
+   where n.nspname='public' and p.proname = any($1)
+   order by p.proname`,
+  [PHASE3_FUNCTIONS],
+);
+check(
+  phase3FunctionSecurity.length === PHASE3_FUNCTIONS.length &&
+    phase3FunctionSecurity.every((fn) => fn.prosecdef && fn.safe_search_path),
+  "RPCs da Fase 3 existem e fixam um search_path seguro",
+  `RPCs ausentes ou sem proteção: ${PHASE3_FUNCTIONS.filter(
+    (name) =>
+      !phase3FunctionSecurity.some(
+        (fn) => fn.proname === name && fn.prosecdef && fn.safe_search_path,
+      ),
+  ).join(", ")}`,
+);
+
+const teacherPolicySaveSource = await one(
+  `select p.prosrc
+   from pg_proc p
+   join pg_namespace n on n.oid = p.pronamespace
+   where n.nspname='public' and p.proname='save_teacher_cancellation_policy'`,
+);
+check(
+  /from public\.teacher_profiles teacher\s+where teacher\.id = v_teacher_id\s+for update;/i.test(
+    teacherPolicySaveSource.prosrc,
+  ),
+  "a primeira gravação da política é serializada pelo bloqueio da linha do professor",
+  "save_teacher_cancellation_policy não bloqueia a linha estável do professor antes do insert",
+);
+
+const phase3Views = await rows(
+  `select table_name
+   from information_schema.views
+   where table_schema='public' and table_name = any($1)`,
+  [[
+    "teacher_student_management_records",
+    "teacher_student_package_summary",
+    "teacher_group_records",
+    "teacher_location_records",
+  ]],
+);
+check(
+  phase3Views.length === 4,
+  "as quatro projeções privadas da Fase 3 existem",
+  `vistas em falta: ${[
+    "teacher_student_management_records",
+    "teacher_student_package_summary",
+    "teacher_group_records",
+    "teacher_location_records",
+  ]
+    .filter((name) => !phase3Views.some((view) => view.table_name === name))
+    .join(", ")}`,
+);
+
+const legacyInvitePrivileges = await rows(
+  `select privilege_type
+   from information_schema.column_privileges
+   where table_schema='public'
+     and table_name='student_profiles'
+     and column_name='invite_code'
+     and grantee='authenticated'`,
+);
+check(
+  legacyInvitePrivileges.length === 0,
+  "invite_code legado não faz parte de nenhum contrato autenticado",
+  `privilégios indevidos em invite_code: ${legacyInvitePrivileges
+    .map((privilege) => privilege.privilege_type)
+    .join(", ")}`,
+);
+
+const legacyStudentViewPrivileges = await rows(
+  `select privilege_type
+   from information_schema.table_privileges
+   where table_schema='public' and table_name='teacher_student_records'
+     and grantee='authenticated'`,
+);
+check(
+  legacyStudentViewPrivileges.length === 0,
+  "a vista legada com a assinatura de invite_code não é consultável",
+  `privilégios indevidos na vista legada: ${legacyStudentViewPrivileges
+    .map((privilege) => privilege.privilege_type)
+    .join(", ")}`,
+);
+
+const invitationSecretColumns = await rows(
+  `select column_name
+   from information_schema.columns
+   where table_schema='public' and table_name='student_invitations'
+     and column_name ~* '(token|code|secret|hash)'`,
+);
+check(
+  invitationSecretColumns.length === 0,
+  "o estado de convite não guarda token, código, segredo nem hash",
+  `colunas de segredo inesperadas: ${invitationSecretColumns.map((c) => c.column_name).join(", ")}`,
+);
+
+const privateManagementColumns = await rows(
+  `select table_name, column_name
+   from information_schema.column_privileges
+   where table_schema='public' and grantee='authenticated' and privilege_type='SELECT'
+     and (
+       (table_name='groups' and column_name='administrative_notes')
+       or (table_name='locations' and column_name in ('internal_reference','notes'))
+     )`,
+);
+check(
+  privateManagementColumns.length === 0,
+  "observações e referências administrativas ficam fora do SELECT autenticado",
+  `colunas privadas expostas: ${privateManagementColumns
+    .map((column) => `${column.table_name}.${column.column_name}`)
+    .join(", ")}`,
+);
+
+const destructiveManagementPrivileges = await rows(
+  `select table_name
+   from information_schema.table_privileges
+   where table_schema='public' and grantee='authenticated' and privilege_type='DELETE'
+     and table_name = any($1)`,
+  [["student_profiles", "student_invitations", "groups", "group_members", "locations"]],
+);
+check(
+  destructiveManagementPrivileges.length === 0,
+  "fichas, convites, turmas, adesões e locais não são apagados pelo cliente",
+  `DELETE concedido em: ${destructiveManagementPrivileges.map((p) => p.table_name).join(", ")}`,
+);
+
+const directInvitationWrites = await rows(
+  `select privilege_type
+   from information_schema.table_privileges
+   where table_schema='public' and table_name='student_invitations'
+     and grantee='authenticated' and privilege_type in ('INSERT','UPDATE','DELETE')`,
+);
+check(
+  directInvitationWrites.length === 0,
+  "convites só mudam pelas RPCs de preparação, revogação e claim",
+  `escrita direta de convites concedida: ${directInvitationWrites
+    .map((privilege) => privilege.privilege_type)
+    .join(", ")}`,
+);
+
+const SAME_ORG_TEACHER_UID = "dddddddd-dddd-dddd-dddd-dddddddddddd";
+await db.exec(`
+  insert into auth.users (id, email, email_confirmed_at, raw_user_meta_data)
+  values ('${SAME_ORG_TEACHER_UID}', 'colega.prof@exemplo.pt', now(),
+          '{"role":"teacher","full_name":"Professor Colega"}'::jsonb)
+`);
+const sameOrgTeacher = await one(
+  `select id, organization_id from public.teacher_profiles where profile_id=$1`,
+  [SAME_ORG_TEACHER_UID],
+);
+await db.query(`update public.profiles set organization_id=$1 where id=$2`, [
+  org,
+  SAME_ORG_TEACHER_UID,
+]);
+await db.query(`update public.teacher_profiles set organization_id=$1 where id=$2`, [
+  org,
+  sameOrgTeacher.id,
+]);
+
+const sameOrgOtherStudent = await one(
+  `insert into public.student_profiles
+     (organization_id, created_by_teacher_id, full_name, email)
+   values ($1,$2,'Aluno do colega','aluno.colega@exemplo.pt') returning id`,
+  [org, sameOrgTeacher.id],
+);
+
+section("Modelos de pacotes (Etapa 1A)");
+
+const packageTemplateDangerousUpdateColumns = await rows(
+  `select column_name
+   from information_schema.column_privileges
+   where table_schema='public'
+     and table_name='package_templates'
+     and grantee='authenticated'
+     and privilege_type='UPDATE'
+     and column_name in ('id', 'organization_id', 'teacher_id', 'created_at', 'updated_at')`,
+);
+const packageTemplateDeletePrivilege = await rows(
+  `select privilege_type
+   from information_schema.table_privileges
+   where table_schema='public'
+     and table_name='package_templates'
+     and grantee='authenticated'
+     and privilege_type='DELETE'`,
+);
+check(
+  packageTemplateDangerousUpdateColumns.length === 0 &&
+    packageTemplateDeletePrivilege.length === 0,
+  "grants impedem trocar dono, auditoria ou apagar modelos de pacote",
+  `privilégios perigosos em package_templates: ${[
+    ...packageTemplateDangerousUpdateColumns.map((column) => `UPDATE ${column.column_name}`),
+    ...packageTemplateDeletePrivilege.map((privilege) => privilege.privilege_type),
+  ].join(", ")}`,
+);
+
+const template3 = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `insert into public.package_templates
+       (organization_id, teacher_id, sport_id, name, default_credits,
+        description, validity_days, reference_price_cents)
+     values ($1,$2,$3,'Pacote de 3 aulas',3,'Treino inicial',30,4500)
+     returning id, default_credits, reference_price_cents`,
+    [org, teacher.id, sport],
+  ),
+);
+check(
+  template3?.default_credits === 3 && template3.reference_price_cents === 4500,
+  "professor cria modelo com 3 créditos",
+);
+
+const template10 = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `insert into public.package_templates
+       (organization_id, teacher_id, name, default_credits)
+     values ($1,$2,'Pacote de 10 aulas',10)
+     returning id, default_credits`,
+    [org, teacher.id],
+  ),
+);
+check(template10?.default_credits === 10, "professor cria modelo com 10 créditos");
+
+const templateCustom = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `insert into public.package_templates
+       (organization_id, teacher_id, name, default_credits)
+     values ($1,$2,'Pacote personalizado 37',37)
+     returning id, default_credits`,
+    [org, teacher.id],
+  ),
+);
+check(templateCustom?.default_credits === 37, "professor cria modelo com quantidade personalizada");
+
+await mustReject("quantidade zero em modelo", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(
+      `insert into public.package_templates
+         (organization_id, teacher_id, name, default_credits)
+       values ($1,$2,'Zero',0)`,
+      [org, teacher.id],
+    ),
+  ),
+);
+await mustReject("quantidade negativa em modelo", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(
+      `insert into public.package_templates
+         (organization_id, teacher_id, name, default_credits)
+       values ($1,$2,'Negativo',-1)`,
+      [org, teacher.id],
+    ),
+  ),
+);
+await mustReject("quantidade decimal em modelo", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(
+      `insert into public.package_templates
+         (organization_id, teacher_id, name, default_credits)
+       values ($1,$2,'Decimal',$3)`,
+      [org, teacher.id, "1.5"],
+    ),
+  ),
+);
+await mustReject("nome vazio em modelo", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(
+      `insert into public.package_templates
+         (organization_id, teacher_id, name, default_credits)
+       values ($1,$2,'   ',4)`,
+      [org, teacher.id],
+    ),
+  ),
+);
+await mustReject("valor negativo em modelo", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(
+      `insert into public.package_templates
+         (organization_id, teacher_id, name, default_credits, reference_price_cents)
+       values ($1,$2,'Valor negativo',4,-1)`,
+      [org, teacher.id],
+    ),
+  ),
+);
+await mustReject("validade inválida em modelo", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(
+      `insert into public.package_templates
+         (organization_id, teacher_id, name, default_credits, validity_days)
+       values ($1,$2,'Validade inválida',4,0)`,
+      [org, teacher.id],
+    ),
+  ),
+);
+
+const templateUpdatedAtBefore = await one(
+  `select updated_at from public.package_templates where id=$1`,
+  [template3.id],
+);
+const editedTemplate = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `update public.package_templates
+        set name='Pacote de 3 aulas praia',
+            description='Descrição atualizada',
+            default_credits=4,
+            sport_id=$2,
+            validity_days=45,
+            reference_price_cents=5000
+      where id=$1
+      returning id, name, default_credits, sport_id, validity_days, reference_price_cents, updated_at`,
+    [template3.id, padel],
+  ),
+);
+check(
+  editedTemplate?.name === "Pacote de 3 aulas praia" &&
+    editedTemplate.default_credits === 4 &&
+    editedTemplate.sport_id === padel &&
+    editedTemplate.validity_days === 45 &&
+    editedTemplate.reference_price_cents === 5000 &&
+    editedTemplate.updated_at >= templateUpdatedAtBefore.updated_at,
+  "professor edita campos permitidos do modelo",
+);
+
+await mustReject("professor não altera organização do modelo", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`update public.package_templates set organization_id=$1 where id=$2`, [
+      otherTeacher.organization_id,
+      template3.id,
+    ]),
+  ),
+);
+await mustReject("professor não altera proprietário do modelo", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`update public.package_templates set teacher_id=$1 where id=$2`, [
+      sameOrgTeacher.id,
+      template3.id,
+    ]),
+  ),
+);
+
+const colleagueTemplate = await asDatabaseRole("authenticated", SAME_ORG_TEACHER_UID, () =>
+  one(
+    `insert into public.package_templates
+       (organization_id, teacher_id, name, default_credits)
+     values ($1,$2,'Pacote do colega',6)
+     returning id`,
+    [org, sameOrgTeacher.id],
+  ),
+);
+const otherOrgTemplate = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  one(
+    `insert into public.package_templates
+       (organization_id, teacher_id, name, default_credits)
+     values ($1,$2,'Pacote externo do outro professor',6)
+     returning id`,
+    [otherTeacher.organization_id, otherTeacher.id],
+  ),
+);
+const teacherVisibleTemplates = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  rows(`select id from public.package_templates order by id`),
+);
+check(
+  teacherVisibleTemplates.some((row) => row.id === template3.id) &&
+    !teacherVisibleTemplates.some(
+      (row) => row.id === colleagueTemplate.id || row.id === otherOrgTemplate.id,
+    ),
+  "professor consulta apenas modelos próprios",
+);
+const colleagueTemplateUpdateAttempt = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(`update public.package_templates set name='Invasão' where id=$1`, [
+    colleagueTemplate.id,
+  ]),
+);
+const colleagueTemplateAfterUpdateAttempt = await one(
+  `select name from public.package_templates where id=$1`,
+  [colleagueTemplate.id],
+);
+check(
+  colleagueTemplateUpdateAttempt.affectedRows === 0 &&
+    colleagueTemplateAfterUpdateAttempt.name === "Pacote do colega",
+  "professor não edita modelo de outro professor da organização",
+);
+const otherOrgTemplateUpdateAttempt = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(`update public.package_templates set name='Invasão externa' where id=$1`, [
+    otherOrgTemplate.id,
+  ]),
+);
+const otherOrgTemplateAfterUpdateAttempt = await one(
+  `select name from public.package_templates where id=$1`,
+  [otherOrgTemplate.id],
+);
+check(
+  otherOrgTemplateUpdateAttempt.affectedRows === 0 &&
+    otherOrgTemplateAfterUpdateAttempt.name === "Pacote externo do outro professor",
+  "professor não edita modelo de outra organização",
+);
+
+const STUDENT_TEMPLATE_UID = "abababab-abab-abab-abab-abababababab";
+await db.exec(`
+  insert into auth.users (id, email, email_confirmed_at, raw_user_meta_data)
+  values ('${STUDENT_TEMPLATE_UID}', 'aluno.modelos@exemplo.pt', now(),
+          '{"role":"student","full_name":"Aluno Modelos"}'::jsonb)
+`);
+await mustReject("aluno não cria modelo de pacote", () =>
+  asDatabaseRole("authenticated", STUDENT_TEMPLATE_UID, () =>
+    db.query(
+      `insert into public.package_templates
+         (organization_id, teacher_id, name, default_credits)
+       values ($1,$2,'Modelo de aluno',3)`,
+      [org, teacher.id],
+    ),
+  ),
+);
+const studentTemplateUpdateAttempt = await asDatabaseRole("authenticated", STUDENT_TEMPLATE_UID, () =>
+  db.query(`update public.package_templates set name='Aluno editou' where id=$1`, [
+    template3.id,
+  ]),
+);
+const templateAfterStudentUpdateAttempt = await one(
+  `select name from public.package_templates where id=$1`,
+  [template3.id],
+);
+check(
+  studentTemplateUpdateAttempt.affectedRows === 0 &&
+    templateAfterStudentUpdateAttempt.name === "Pacote de 3 aulas praia",
+  "aluno não edita modelo de pacote",
+);
+
+const BLOCKED_TEMPLATE_UID = "bcbcbcbc-bcbc-bcbc-bcbc-bcbcbcbcbcbc";
+await db.exec(`
+  insert into auth.users (id, email, email_confirmed_at, raw_user_meta_data)
+  values ('${BLOCKED_TEMPLATE_UID}', 'bloqueado.modelos@exemplo.pt', now(),
+          '{"role":"teacher","full_name":"Professor Bloqueado"}'::jsonb)
+`);
+const blockedTemplateTeacher = await one(
+  `select id, organization_id from public.teacher_profiles where profile_id=$1`,
+  [BLOCKED_TEMPLATE_UID],
+);
+await db.query(
+  `update public.profiles
+      set organization_id=$1, status='blocked', blocked_at=now(),
+          blocked_reason='Teste de modelos'
+    where id=$2`,
+  [org, BLOCKED_TEMPLATE_UID],
+);
+await db.query(`update public.teacher_profiles set organization_id=$1 where id=$2`, [
+  org,
+  blockedTemplateTeacher.id,
+]);
+await mustReject("conta bloqueada não cria modelo de pacote", () =>
+  asDatabaseRole("authenticated", BLOCKED_TEMPLATE_UID, () =>
+    db.query(
+      `insert into public.package_templates
+         (organization_id, teacher_id, name, default_credits)
+       values ($1,$2,'Modelo bloqueado',3)`,
+      [org, blockedTemplateTeacher.id],
+    ),
+  ),
+);
+const blockedTemplateUpdateAttempt = await asDatabaseRole("authenticated", BLOCKED_TEMPLATE_UID, () =>
+  db.query(`update public.package_templates set name='Bloqueado editou' where id=$1`, [
+    template3.id,
+  ]),
+);
+const templateAfterBlockedUpdateAttempt = await one(
+  `select name from public.package_templates where id=$1`,
+  [template3.id],
+);
+check(
+  blockedTemplateUpdateAttempt.affectedRows === 0 &&
+    templateAfterBlockedUpdateAttempt.name === "Pacote de 3 aulas praia",
+  "conta bloqueada não edita modelo de pacote",
+);
+
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(`update public.package_templates set is_active=false where id=$1`, [template3.id]),
+);
+const inactiveTemplate = await one(
+  `select id, is_active from public.package_templates where id=$1`,
+  [template3.id],
+);
+check(
+  inactiveTemplate?.id === template3.id && inactiveTemplate.is_active === false,
+  "modelo pode ser desativado e permanece no histórico",
+);
+const inactiveFromTemplateReject = await mustReject("modelo inativo não é sugerido para atribuição", () =>
+  db.query(`select public.assign_student_package(
+      p_student_id => $1,
+      p_template_id => $2,
+      p_assignment_idempotency_key => $3
+    )`, [
+    ana.id,
+    template3.id,
+    randomUUID(),
+  ]),
+);
+void inactiveFromTemplateReject;
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(`update public.package_templates set is_active=true where id=$1`, [template3.id]),
+);
+const reactivatedTemplate = await one(
+  `select is_active from public.package_templates where id=$1`,
+  [template3.id],
+);
+check(reactivatedTemplate?.is_active === true, "modelo pode ser reativado");
+
+const duplicatedTemplate = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `insert into public.package_templates
+       (organization_id, teacher_id, sport_id, name, description, default_credits,
+        validity_days, reference_price_cents, currency, is_active)
+     select organization_id, teacher_id, sport_id, 'Cópia de ' || name, description,
+            default_credits, validity_days, reference_price_cents, currency, is_active
+       from public.package_templates
+      where id=$1
+      returning id, name, created_at`,
+    [template3.id],
+  ),
+);
+check(
+  duplicatedTemplate?.id !== template3.id &&
+    duplicatedTemplate.name.startsWith("Cópia de "),
+  "duplicação cria um novo identificador e não altera o original",
+);
+
+const copiedPackageBeforeTemplateChange = await assignPackage({
+  student: bruno.id,
+  templateId: template10.id,
+});
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(
+    `update public.package_templates
+        set name='Pacote de 10 aulas atualizado', default_credits=12, validity_days=90
+      where id=$1`,
+    [template10.id],
+  ),
+);
+const copiedPackageAfterTemplateChange = await one(
+  `select name, initial_credits, credits_total
+   from public.student_packages where id=$1`,
+  [copiedPackageBeforeTemplateChange.id],
+);
+check(
+  copiedPackageAfterTemplateChange.name === "Pacote de 10 aulas" &&
+    copiedPackageAfterTemplateChange.initial_credits === 10 &&
+    copiedPackageAfterTemplateChange.credits_total === 10,
+  "alterar um modelo não modifica pacotes já atribuídos",
+);
+
+section("Atribuição de pacotes (Etapa 1B)");
+
+const packageAssignmentColumns = await rows(
+  `select column_name
+   from information_schema.columns
+   where table_schema='public'
+     and table_name='student_packages'
+     and column_name in ('origin', 'assignment_idempotency_key')`,
+);
+check(
+  packageAssignmentColumns.length === 2,
+  "pacotes atribuídos guardam origem administrativa e chave idempotente",
+);
+
+const assignmentTemplate3Source = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `insert into public.package_templates
+       (organization_id, teacher_id, sport_id, name, default_credits,
+        validity_days, reference_price_cents)
+     values ($1,$2,$3,'Modelo 3 Etapa 1B',3,30,4500)
+     returning id`,
+    [org, teacher.id, sport],
+  ),
+);
+const assignmentTemplate3 = await assignPackage({
+  student: bruno.id,
+  templateId: assignmentTemplate3Source.id,
+  origin: "purchased",
+});
+const assignmentTemplate3Snapshot = await one(
+  `select template_id, name, initial_credits, credits_available, credits_reserved,
+          credits_used, status, origin, assignment_idempotency_key
+   from public.student_packages
+   where id=$1`,
+  [assignmentTemplate3.id],
+);
+check(
+  assignmentTemplate3Snapshot.template_id === assignmentTemplate3Source.id &&
+    assignmentTemplate3Snapshot.initial_credits === 3 &&
+    assignmentTemplate3Snapshot.credits_available === 3 &&
+    assignmentTemplate3Snapshot.credits_reserved === 0 &&
+    assignmentTemplate3Snapshot.credits_used === 0 &&
+    assignmentTemplate3Snapshot.status === "active" &&
+    assignmentTemplate3Snapshot.origin === "purchased" &&
+    assignmentTemplate3Snapshot.assignment_idempotency_key,
+  "professor atribui modelo de 3 aulas com saldos iniciais corretos",
+  `snapshot inesperado do modelo de 3 aulas: ${JSON.stringify(assignmentTemplate3Snapshot)}`,
+);
+
+const assignmentTemplate10Source = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `insert into public.package_templates
+       (organization_id, teacher_id, sport_id, name, default_credits, validity_days)
+     values ($1,$2,$3,'Modelo 10 Etapa 1B',10,45)
+     returning id`,
+    [org, teacher.id, sport],
+  ),
+);
+const assignmentTemplate10 = await assignPackage({
+  student: bruno.id,
+  templateId: assignmentTemplate10Source.id,
+  origin: "gifted",
+});
+const assignmentTemplate10Snapshot = await one(
+  `select template_id, name, initial_credits, credits_total, origin
+   from public.student_packages
+   where id=$1`,
+  [assignmentTemplate10.id],
+);
+check(
+  assignmentTemplate10Snapshot.template_id === assignmentTemplate10Source.id &&
+    assignmentTemplate10Snapshot.name === "Modelo 10 Etapa 1B" &&
+    assignmentTemplate10Snapshot.initial_credits === 10 &&
+    assignmentTemplate10Snapshot.credits_total === 10 &&
+    assignmentTemplate10Snapshot.origin === "gifted",
+  "professor atribui modelo de 10 aulas",
+);
+
+const customAssignment = await assignPackage({
+  student: bruno.id,
+  name: "Pacote personalizado 12",
+  credits: 12,
+  sportId: sport,
+  starts: "2026-08-03",
+  expires: "2026-12-31",
+  paidAmount: 7500,
+  notes: "Condição combinada com o professor.",
+  origin: "manual",
+});
+const customAssignmentSnapshot = await one(
+  `select template_id, name, sport_id, initial_credits, paid_amount_cents, notes, origin
+   from public.student_packages
+   where id=$1`,
+  [customAssignment.id],
+);
+check(
+  customAssignmentSnapshot.template_id === null &&
+    customAssignmentSnapshot.name === "Pacote personalizado 12" &&
+    customAssignmentSnapshot.sport_id === sport &&
+    customAssignmentSnapshot.initial_credits === 12 &&
+    customAssignmentSnapshot.paid_amount_cents === 7500 &&
+    customAssignmentSnapshot.notes === "Condição combinada com o professor." &&
+    customAssignmentSnapshot.origin === "manual",
+  "professor atribui pacote personalizado sem criar modelo",
+);
+
+const brunoAccount = await one(`select profile_id from public.student_profiles where id=$1`, [
+  bruno.id,
+]);
+check(
+  brunoAccount.profile_id === null && customAssignmentSnapshot.initial_credits === 12,
+  "aluno sem conta recebe pacote atribuído",
+);
+
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(
+    `update public.package_templates
+        set name='Modelo alterado após atribuição', default_credits=20,
+            validity_days=180, reference_price_cents=9999, is_active=false
+      where id=$1`,
+    [assignmentTemplate3Source.id],
+  ),
+);
+const packageAfterTemplateMutation = await one(
+  `select name, initial_credits, credits_total, expires_on, paid_amount_cents
+   from public.student_packages
+   where id=$1`,
+  [assignmentTemplate3.id],
+);
+check(
+  packageAfterTemplateMutation.name === assignmentTemplate3Snapshot.name &&
+    packageAfterTemplateMutation.initial_credits === 3 &&
+    packageAfterTemplateMutation.credits_total === 3,
+  "snapshot mantém dados originais mesmo após alteração/desativação do modelo",
+  `snapshot alterado inesperadamente: antes=${JSON.stringify(assignmentTemplate3Snapshot)} depois=${JSON.stringify(packageAfterTemplateMutation)}`,
+);
+
+await mustReject("modelo desativado não pode ser usado numa nova atribuição normal", () =>
+  assignPackage({ student: bruno.id, templateId: assignmentTemplate3Source.id }),
+);
+
+const inactiveAssignmentStudent = await one(
+  `insert into public.student_profiles
+     (organization_id, created_by_teacher_id, full_name, email, is_active)
+   values ($1,$2,'Aluno inativo 1B','inativo.1b@exemplo.pt',false)
+   returning id`,
+  [org, teacher.id],
+);
+await mustReject("aluno inativo é recusado na atribuição", () =>
+  assignPackage({ student: inactiveAssignmentStudent.id, name: "Pacote indevido", credits: 3 }),
+);
+
+await mustReject("aluno de outro professor da organização é recusado na atribuição", () =>
+  assignPackage({ student: sameOrgOtherStudent.id, name: "Pacote indevido", credits: 3 }),
+);
+
+await mustReject("modelo de outro professor da organização é recusado na atribuição", () =>
+  assignPackage({ student: bruno.id, templateId: colleagueTemplate.id }),
+);
+
+await mustReject("modelo de outra organização é recusado na atribuição", () =>
+  assignPackage({ student: bruno.id, templateId: otherOrgTemplate.id }),
+);
+
+await mustReject("quantidade zero é recusada na atribuição", () =>
+  assignPackage({ student: bruno.id, name: "Zero", credits: 0 }),
+);
+
+await mustReject("quantidade negativa é recusada na atribuição", () =>
+  assignPackage({ student: bruno.id, name: "Negativo", credits: -2 }),
+);
+
+await mustReject("data final anterior à inicial é recusada na atribuição", () =>
+  assignPackage({
+    student: bruno.id,
+    name: "Datas inválidas",
+    credits: 3,
+    starts: "2026-09-10",
+    expires: "2026-09-09",
+  }),
+);
+
+await mustReject("valor negativo é recusado na atribuição", () =>
+  assignPackage({ student: bruno.id, name: "Valor inválido", credits: 3, paidAmount: -1 }),
+);
+
+await mustReject("origem inválida é recusada na atribuição", () =>
+  db.query(
+    `select public.assign_student_package(
+       p_student_id => $1,
+       p_credits => 3,
+       p_name => 'Origem inválida',
+       p_origin => 'checkout'::public.package_assignment_origin,
+       p_assignment_idempotency_key => $2
+     )`,
+    [bruno.id, randomUUID()],
+  ),
+);
+
+const todayInLisbon = await one(`select (now() at time zone 'Europe/Lisbon')::date::text as today`);
+const currentStatusAssignment = await assignPackage({
+  student: bruno.id,
+  name: "Começa hoje",
+  credits: 4,
+  starts: todayInLisbon.today,
+});
+const futureStatusAssignment = await assignPackage({
+  student: bruno.id,
+  name: "Começa no futuro",
+  credits: 4,
+  starts: "2036-01-10",
+  expires: "2036-02-10",
+});
+const statusAssignments = await rows(
+  `select id, status from public.student_packages where id in ($1,$2) order by name`,
+  [currentStatusAssignment.id, futureStatusAssignment.id],
+);
+check(
+  statusAssignments.some((row) => row.id === currentStatusAssignment.id && row.status === "active") &&
+    statusAssignments.some((row) => row.id === futureStatusAssignment.id && row.status === "not_started"),
+  "estado inicial é ativo hoje e ainda não iniciado no futuro",
+);
+
+const assignmentLedger = await one(
+  `select type, quantity, available_before, reserved_before, used_before,
+          available_after, reserved_after, used_after, performed_by
+   from public.package_credit_transactions
+   where student_package_id=$1`,
+  [customAssignment.id],
+);
+check(
+  assignmentLedger?.type === "package_created" &&
+    assignmentLedger.quantity === 12 &&
+    assignmentLedger.available_before === 0 &&
+    assignmentLedger.reserved_before === 0 &&
+    assignmentLedger.used_before === 0 &&
+    assignmentLedger.available_after === 12 &&
+    assignmentLedger.reserved_after === 0 &&
+    assignmentLedger.used_after === 0 &&
+    assignmentLedger.performed_by === TEACHER_UID,
+  "a transação inicial é criada com autoria e saldos antes/depois",
+);
+
+const rollbackBefore = await one(
+  `select count(*)::int as n from public.student_packages where name='Falha de livro-razão'`,
+);
+await db.exec(`
+  create or replace function public.fail_package_assignment_after_insert()
+  returns trigger
+  language plpgsql
+  as $$
+  begin
+    raise exception 'falha simulada no histórico';
+  end;
+  $$;
+
+  drop trigger if exists trg_fail_package_assignment_after_insert on public.student_packages;
+  create trigger trg_fail_package_assignment_after_insert
+    after insert on public.student_packages
+    for each row
+    when (new.name = 'Falha de livro-razão')
+    execute function public.fail_package_assignment_after_insert();
+`);
+await mustReject("falha na transação inicial reverte a criação", () =>
+  assignPackage({ student: bruno.id, name: "Falha de livro-razão", credits: 3 }),
+);
+await db.exec(`
+  drop trigger if exists trg_fail_package_assignment_after_insert on public.student_packages;
+  drop function if exists public.fail_package_assignment_after_insert();
+`);
+const rollbackAfter = await one(
+  `select count(*)::int as n from public.student_packages where name='Falha de livro-razão'`,
+);
+check(
+  rollbackBefore.n === rollbackAfter.n,
+  "pacote não permanece criado quando a transação aborta",
+);
+
+const repeatedKey = randomUUID();
+const firstIdempotent = await assignPackage({
+  student: bruno.id,
+  name: "Submissão repetida",
+  credits: 5,
+  idempotencyKey: repeatedKey,
+});
+const repeatedIdempotent = await assignPackage({
+  student: bruno.id,
+  name: "Submissão repetida alterada",
+  credits: 9,
+  idempotencyKey: repeatedKey,
+});
+const idempotentCount = await one(
+  `select count(*)::int as n from public.student_packages
+   where created_by=$1 and assignment_idempotency_key=$2`,
+  [TEACHER_UID, repeatedKey],
+);
+check(
+  firstIdempotent.id === repeatedIdempotent.id && idempotentCount.n === 1,
+  "dupla submissão da mesma operação não duplica o pacote",
+);
+
+const intentionalA = await assignPackage({
+  student: bruno.id,
+  name: "Atribuição intencional A",
+  credits: 3,
+});
+const intentionalB = await assignPackage({
+  student: bruno.id,
+  name: "Atribuição intencional B",
+  credits: 3,
+});
+check(
+  intentionalA.id !== intentionalB.id,
+  "duas atribuições intencionais diferentes continuam permitidas",
+);
+
+await mustReject("conta bloqueada é recusada na atribuição de pacote", () =>
+  asDatabaseRole("authenticated", BLOCKED_TEMPLATE_UID, () =>
+    assignPackage({ student: bruno.id, name: "Bloqueado atribuiu", credits: 3 }),
+  ),
+);
+
+await mustReject("aluno autenticado não atribui pacote", () =>
+  asDatabaseRole("authenticated", ANA_UID, () =>
+    assignPackage({ student: bruno.id, name: "Aluno atribuiu", credits: 3 }),
+  ),
+);
+
+await mustReject("anónimo não atribui pacote", () =>
+  asDatabaseRole("anon", null, () =>
+    assignPackage({ student: bruno.id, name: "Anon atribuiu", credits: 3 }),
+  ),
+);
+
+await mustReject("administrador não atribui pacote funcional de professor", () =>
+  asDatabaseRole("authenticated", ADMIN_UID, () =>
+    assignPackage({ student: bruno.id, name: "Admin atribuiu", credits: 3 }),
+  ),
+);
+
+await mustReject("professor não altera organização ou proprietário por payload", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(
+      `insert into public.student_packages
+         (organization_id, student_id, teacher_id, name,
+          initial_credits, credits_total, credits_available, created_by)
+       values ($1,$2,$3,'Forjado',3,3,3,$4)`,
+      [otherTeacher.organization_id, bruno.id, otherTeacher.id, TEACHER_UID],
+    ),
+  ),
+);
+
+const managedStudent = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `insert into public.student_profiles
+       (organization_id, created_by_teacher_id, full_name, email, phone, skill_level, notes)
+     values ($1,$2,'  Leonor Costa  ','leonor.costa@exemplo.pt','+351914000001','Intermédio',
+             'Acompanhar evolução técnica')
+     returning id, full_name, email, phone, skill_level`,
+    [org, teacher.id],
+  ),
+);
+check(
+  managedStudent?.full_name.trim() === "Leonor Costa" &&
+    managedStudent.email === "leonor.costa@exemplo.pt",
+  "professor cria uma ficha sem exigir conta de autenticação",
+);
+
+const updatedManagedStudent = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `update public.student_profiles
+        set full_name='Leonor Costa Silva', phone='+351914000002',
+            skill_level='Avançado', notes='Objetivo técnico atualizado'
+      where id=$1
+      returning id, full_name, phone, skill_level`,
+    [managedStudent.id],
+  ),
+);
+const managedStudentPrivate = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select notes, profile_id, account_status, invitation_status
+     from public.teacher_student_management_records where id=$1`,
+    [managedStudent.id],
+  ),
+);
+check(
+  updatedManagedStudent?.full_name === "Leonor Costa Silva" &&
+    managedStudentPrivate?.notes === "Objetivo técnico atualizado" &&
+    managedStudentPrivate.profile_id === null,
+  "professor edita os campos administrativos permitidos da própria ficha",
+);
+
+await mustReject("professor não altera organização ou proprietário da ficha", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(
+      `update public.student_profiles
+          set organization_id=$1, created_by_teacher_id=$2
+        where id=$3`,
+      [otherTeacher.organization_id, otherTeacher.id, managedStudent.id],
+    ),
+  ),
+);
+await mustReject("professor não liga profile_id, claimed_at nem convite legado por PATCH", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(
+      `update public.student_profiles
+          set profile_id=$1, claimed_at=now(), invite_code='codigo-fraco'
+        where id=$2`,
+      [INVITE_UID, managedStudent.id],
+    ),
+  ),
+);
+
+const hiddenExternalStudent = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  rows(`select id from public.student_profiles where id=$1`, [otherStudent.id]),
+);
+const hiddenColleagueStudent = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  rows(`select id from public.teacher_student_management_records where id=$1`, [
+    sameOrgOtherStudent.id,
+  ]),
+);
+const hiddenManagedFromColleague = await asDatabaseRole(
+  "authenticated",
+  SAME_ORG_TEACHER_UID,
+  () =>
+    rows(`select id from public.teacher_student_management_records where id=$1`, [
+      managedStudent.id,
+    ]),
+);
+check(
+  hiddenExternalStudent.length === 0 &&
+    hiddenColleagueStudent.length === 0 &&
+    hiddenManagedFromColleague.length === 0,
+  "fichas ficam isoladas por organização e por professor proprietário",
+);
+
+await db.query(`update public.student_packages set status='expired' where id=$1`, [
+  wrongSportPack.id,
+]);
+const expiredSummaryFixture = await pkg(wrongSportPack.id);
+const expectedBrunoPackageSummary = await one(
+  `select
+     count(*)::int as package_count,
+     count(*) filter (where status in ('active','not_started'))::int as usable_package_count,
+     coalesce(sum(credits_available) filter (
+       where status in ('active','not_started')
+     ), 0)::int as credits_available,
+     coalesce(sum(credits_reserved) filter (
+       where status in ('active','not_started')
+     ), 0)::int as credits_reserved,
+     coalesce(sum(credits_used), 0)::int as credits_used,
+     coalesce(sum(credits_available), 0)::int as all_credits_available,
+     coalesce(sum(credits_reserved), 0)::int as all_credits_reserved
+   from public.student_packages
+   where student_id=$1`,
+  [bruno.id],
+);
+const teacherPackageSummary = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  rows(
+    `select student_id, package_count, usable_package_count,
+            credits_available, credits_reserved, credits_used
+     from public.teacher_student_package_summary`,
+  ),
+);
+const brunoPackageSummary = teacherPackageSummary.find((entry) => entry.student_id === bruno.id);
+check(
+  teacherPackageSummary.some((entry) => entry.student_id === ana.id) &&
+    !teacherPackageSummary.some(
+      (entry) => entry.student_id === otherStudent.id || entry.student_id === sameOrgOtherStudent.id,
+    ),
+  "resumo de pacotes inclui apenas os alunos do professor, sem expor o livro-razão",
+);
+check(
+  expiredSummaryFixture.status === "expired" &&
+    expiredSummaryFixture.credits_available > 0 &&
+    expiredSummaryFixture.credits_reserved > 0 &&
+    expectedBrunoPackageSummary.all_credits_available >
+      expectedBrunoPackageSummary.credits_available &&
+    expectedBrunoPackageSummary.all_credits_reserved >
+      expectedBrunoPackageSummary.credits_reserved &&
+    brunoPackageSummary?.package_count === expectedBrunoPackageSummary.package_count &&
+    brunoPackageSummary.usable_package_count ===
+      expectedBrunoPackageSummary.usable_package_count &&
+    brunoPackageSummary.credits_available === expectedBrunoPackageSummary.credits_available &&
+    brunoPackageSummary.credits_reserved === expectedBrunoPackageSummary.credits_reserved &&
+    brunoPackageSummary.credits_used === expectedBrunoPackageSummary.credits_used,
+  "pacote expirado conserva o livro-razão mas não conta como crédito disponível ou reservado",
+);
+
+section("Consulta de pacotes e saldos (Etapa 1C)");
+
+const packageReadViews = await rows(
+  `select table_name
+   from information_schema.views
+   where table_schema='public'
+     and table_name in (
+       'teacher_package_records',
+       'student_package_records',
+       'student_package_transaction_records'
+     )`,
+);
+check(packageReadViews.length === 3, "views seguras de consulta de pacotes existem");
+
+const studentPackageViewColumns = await rows(
+  `select column_name
+   from information_schema.columns
+   where table_schema='public' and table_name='student_package_records'
+   order by ordinal_position`,
+);
+const forbiddenStudentColumns = studentPackageViewColumns
+  .map((column) => column.column_name)
+  .filter((column) =>
+    [
+      "organization_id",
+      "student_id",
+      "teacher_id",
+      "template_id",
+      "paid_amount_cents",
+      "origin",
+      "notes",
+      "created_by",
+      "created_by_name",
+      "assignment_idempotency_key",
+    ].includes(column),
+  );
+check(
+  forbiddenStudentColumns.length === 0,
+  "view do aluno não contém valor, origem, notas, autoria nem IDs internos sensíveis",
+  `colunas indevidas na view do aluno: ${forbiddenStudentColumns.join(", ")}`,
+);
+
+const teacherPackageRows = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  rows(
+    `select id, student_id, student_name, name, sport_name, credits_available,
+            credits_reserved, credits_used, expires_on, status, origin,
+            paid_amount_cents, notes, created_by_name
+     from public.teacher_package_records
+     order by created_at desc`,
+  ),
+);
+check(
+  teacherPackageRows.some((row) => row.id === customAssignment.id) &&
+    teacherPackageRows.some((row) => row.id === assignmentTemplate3.id) &&
+    teacherPackageRows.every((row) => row.student_id !== otherStudent.id),
+  "professor consulta pacotes atribuídos autorizados, incluindo vários do mesmo aluno",
+);
+
+const searchedTeacherPackages = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  rows(
+    `select id from public.teacher_package_records
+     where student_name ilike '%Bruno%' or name ilike '%Bruno%'`,
+  ),
+);
+check(
+  searchedTeacherPackages.some((row) => row.id === customAssignment.id),
+  "professor pesquisa pacotes por aluno",
+);
+
+const activeTeacherPackages = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  rows(`select id from public.teacher_package_records where status='active'`),
+);
+check(
+  activeTeacherPackages.some((row) => row.id === customAssignment.id),
+  "professor filtra pacotes por estado",
+);
+
+const sportTeacherPackages = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  rows(`select id from public.teacher_package_records where sport_id=$1`, [sport]),
+);
+check(
+  sportTeacherPackages.some((row) => row.id === customAssignment.id),
+  "professor filtra pacotes por modalidade",
+);
+
+await db.query(`update public.student_packages set credits_available=2, credits_total=2 where id=$1`, [
+  assignmentTemplate10.id,
+]);
+const lowBalancePackages = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  rows(
+    `select id from public.teacher_package_records
+     where credits_available between 1 and 2`,
+  ),
+);
+check(
+  lowBalancePackages.some((row) => row.id === assignmentTemplate10.id),
+  "professor filtra pacotes com saldo baixo",
+);
+
+await db.query(
+  `update public.student_packages
+      set expires_on=((now() at time zone 'Europe/Lisbon')::date + 7)
+    where id=$1`,
+  [assignmentTemplate10.id],
+);
+const expiringTeacherPackages = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  rows(
+    `select id
+     from public.teacher_package_records
+     where expires_on between (now() at time zone 'Europe/Lisbon')::date
+       and ((now() at time zone 'Europe/Lisbon')::date + 7)`,
+  ),
+);
+check(
+  expiringTeacherPackages.some((row) => row.id === assignmentTemplate10.id),
+  "professor filtra pacotes próximos da validade",
+);
+
+const unauthorizedTeacherDetail = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  rows(`select id from public.teacher_package_records where id=$1`, [customAssignment.id]),
+);
+check(
+  unauthorizedTeacherDetail.length === 0,
+  "professor não abre detalhe de pacote não autorizado",
+);
+
+const studentOwnPackages = await asDatabaseRole("authenticated", ANA_UID, () =>
+  rows(
+    `select id, name, sport_name, initial_credits, credits_available,
+            credits_reserved, credits_used, starts_on, expires_on, status
+     from public.student_package_records
+     order by created_at desc`,
+  ),
+);
+check(
+  studentOwnPackages.some((row) => row.id === anaPack.id) &&
+    studentOwnPackages.every((row) => row.id !== customAssignment.id),
+  "aluno consulta somente os próprios pacotes",
+);
+
+await mustReject("aluno não recebe valor registado pela projeção segura", () =>
+  asDatabaseRole("authenticated", ANA_UID, () =>
+    db.query(`select paid_amount_cents from public.student_package_records`),
+  ),
+);
+await mustReject("aluno não recebe origem administrativa pela projeção segura", () =>
+  asDatabaseRole("authenticated", ANA_UID, () =>
+    db.query(`select origin from public.student_package_records`),
+  ),
+);
+await mustReject("aluno não recebe observações administrativas pela projeção segura", () =>
+  asDatabaseRole("authenticated", ANA_UID, () =>
+    db.query(`select notes from public.student_package_records`),
+  ),
+);
+await mustReject("aluno não recebe autoria pela projeção segura", () =>
+  asDatabaseRole("authenticated", ANA_UID, () =>
+    db.query(`select created_by from public.student_package_records`),
+  ),
+);
+
+const studentMovements = await asDatabaseRole("authenticated", ANA_UID, () =>
+  rows(
+    `select id, student_package_id, type, quantity, created_at
+     from public.student_package_transaction_records`,
+  ),
+);
+const studentPackageIds = new Set(studentOwnPackages.map((row) => row.id));
+check(
+  studentMovements.some((row) => row.student_package_id === anaPack.id) &&
+    studentMovements.every((row) => studentPackageIds.has(row.student_package_id)) &&
+    studentMovements.every((row) =>
+      ["package_created", "credit_reserved", "reservation_released", "credit_consumed"].includes(
+        row.type,
+      ),
+    ),
+  "aluno recebe apenas movimentações básicas e compreensíveis",
+);
+await mustReject("aluno não recebe saldos internos do histórico", () =>
+  asDatabaseRole("authenticated", ANA_UID, () =>
+    db.query(`select available_before from public.student_package_transaction_records`),
+  ),
+);
+
+await mustReject("anónimo não consulta pacotes", () =>
+  asDatabaseRole("anon", null, () => rows(`select id from public.student_package_records`)),
+);
+
+await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  db.query(`select public.admin_set_account_status($1,'blocked','Teste da consulta de pacotes')`, [
+    ANA_UID,
+  ]),
+);
+const blockedStudentPackageRows = await asDatabaseRole("authenticated", ANA_UID, () =>
+  rows(`select id from public.student_package_records`),
+);
+const blockedStudentTeacherRows = await asDatabaseRole("authenticated", ANA_UID, () =>
+  rows(`select id from public.teacher_package_records`),
+);
+check(
+  blockedStudentPackageRows.length === 0 && blockedStudentTeacherRows.length === 0,
+  "conta bloqueada não consulta pacotes pelas views da Etapa 1C",
+);
+await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  db.query(`select public.admin_set_account_status($1,'active','Reativação após teste 1C')`, [
+    ANA_UID,
+  ]),
+);
+
+const directStudentPackageRows = await asDatabaseRole("authenticated", ANA_UID, () =>
+  rows(`select id, paid_amount_cents, origin, notes, created_by from public.student_packages`),
+);
+check(
+  directStudentPackageRows.some((row) => row.id === anaPack.id) &&
+    directStudentPackageRows.every((row) => row.id !== customAssignment.id),
+  "RLS da tabela base continua a isolar linhas do aluno",
+);
+
+const PREPARED_UNLINKED_UID = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+await createStudentAuthUser(PREPARED_UNLINKED_UID, managedStudent.email);
+const preparedUnlinkedAccount = await one(
+  `select role, organization_id from public.profiles where id=$1`,
+  [PREPARED_UNLINKED_UID],
+);
+const preparedInvitation = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select public.prepare_student_invitation($1) as id`, [managedStudent.id]),
+);
+const repeatedPreparedInvitation = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select public.prepare_student_invitation($1) as id`, [managedStudent.id]),
+);
+const preparedInvitationState = await one(
+  `select status, target_email, prepared_by_teacher_id, prepared_at
+   from public.student_invitations where id=$1`,
+  [preparedInvitation.id],
+);
+const preparedInvitationAudit = await one(
+  `select metadata
+   from public.audit_log
+   where actor_id=$1 and action='student.invitation_prepared'
+     and target_table='student_profiles' and target_id=$2
+   order by created_at desc limit 1`,
+  [TEACHER_UID, managedStudent.id],
+);
+const preparedInvitationAuditCount = await one(
+  `select count(*)::int as n
+   from public.audit_log
+   where actor_id=$1 and action='student.invitation_prepared'
+     and target_table='student_profiles' and target_id=$2`,
+  [TEACHER_UID, managedStudent.id],
+);
+check(
+  preparedUnlinkedAccount.role === "student" &&
+    preparedUnlinkedAccount.organization_id === null &&
+    repeatedPreparedInvitation.id === preparedInvitation.id &&
+    preparedInvitationState.status === "prepared" &&
+    preparedInvitationState.target_email === "leonor.costa@exemplo.pt" &&
+    preparedInvitationState.prepared_by_teacher_id === teacher.id &&
+    preparedInvitationAudit.metadata.delivery === "not_sent" &&
+    preparedInvitationAuditCount.n === 1,
+  "conta de aluno sem organização pode ser preparada de forma idempotente e auditável",
+);
+
+const emailChangeStudent = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `insert into public.student_profiles
+       (organization_id, created_by_teacher_id, full_name, email)
+     values ($1,$2,'Mudança de email','mudanca.email@exemplo.pt') returning id`,
+    [org, teacher.id],
+  ),
+);
+const PREPARED_SAME_ORG_UID = "f0f0f0f0-f0f0-f0f0-f0f0-f0f0f0f0f0f0";
+await createStudentAuthUser(PREPARED_SAME_ORG_UID, "mudanca.email@exemplo.pt");
+await db.query(`update public.profiles set organization_id=$1 where id=$2`, [
+  org,
+  PREPARED_SAME_ORG_UID,
+]);
+const emailChangeInvitation = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select public.prepare_student_invitation($1) as id`, [emailChangeStudent.id]),
+);
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(`update public.student_profiles set email='novo.email@exemplo.pt' where id=$1`, [
+    emailChangeStudent.id,
+  ]),
+);
+const invitationRevokedByEmail = await one(
+  `select status, revoked_at from public.student_invitations where id=$1`,
+  [emailChangeInvitation.id],
+);
+const emailRevocationAudit = await one(
+  `select metadata from public.audit_log
+   where action='student.invitation_revoked' and target_id=$1
+   order by created_at desc limit 1`,
+  [emailChangeStudent.id],
+);
+check(
+  invitationRevokedByEmail.status === "revoked" &&
+    invitationRevokedByEmail.revoked_at !== null &&
+    emailRevocationAudit.metadata.reason === "student_email_changed",
+  "alterar o email de uma ficha não ligada revoga a preparação anterior e deixa auditoria",
+);
+
+await mustReject("outro professor da organização não prepara convite para ficha alheia", () =>
+  asDatabaseRole("authenticated", SAME_ORG_TEACHER_UID, () =>
+    db.query(`select public.prepare_student_invitation($1)`, [managedStudent.id]),
+  ),
+);
+await mustReject("professor externo não prepara convite para outra organização", () =>
+  asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+    db.query(`select public.prepare_student_invitation($1)`, [managedStudent.id]),
+  ),
+);
+await mustReject("ficha já ligada não recebe novo convite", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.prepare_student_invitation($1)`, [ana.id]),
+  ),
+);
+await mustReject("email ambíguo não prepara uma ligação arbitrária", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.prepare_student_invitation($1)`, [ambiguousCandidates[0].id]),
+  ),
+);
+
+const linkedEmailOtherStudent = await asDatabaseRole(
+  "authenticated",
+  OTHER_TEACHER_UID,
+  () =>
+    one(
+      `insert into public.student_profiles
+         (organization_id, created_by_teacher_id, full_name, email)
+       values ($1,$2,'Email já ligado noutra organização',$3) returning id`,
+      [otherTeacher.organization_id, otherTeacher.id, linkedEmail],
+    ),
+);
+await mustReject(
+  "email já ligado noutra ficha não cria uma preparação impossível",
+  () =>
+    asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+      db.query(`select public.prepare_student_invitation($1)`, [linkedEmailOtherStudent.id]),
+    ),
+  "já está ligado",
+);
+const linkedEmailInvitationCount = await one(
+  `select count(*)::int as n from public.student_invitations where student_id=$1`,
+  [linkedEmailOtherStudent.id],
+);
+check(
+  linkedEmailInvitationCount.n === 0,
+  "rejeitar um email já ligado não deixa estado parcial de convite",
+);
+
+for (const [label, email] of [
+  ["professor", "prof@exemplo.pt"],
+  ["administrador", "admin@exemplo.pt"],
+]) {
+  const incompatibleAccountStudent = await asDatabaseRole(
+    "authenticated",
+    TEACHER_UID,
+    () =>
+      one(
+        `insert into public.student_profiles
+           (organization_id, created_by_teacher_id, full_name, email)
+         values ($1,$2,$3,$4) returning id`,
+        [org, teacher.id, `Conta de ${label}`, email],
+      ),
+  );
+  await mustReject(
+    `email pertencente a conta de ${label} não é preparado como aluno`,
+    () =>
+      asDatabaseRole("authenticated", TEACHER_UID, () =>
+        db.query(`select public.prepare_student_invitation($1)`, [incompatibleAccountStudent.id]),
+      ),
+    "não pode ser ligada",
+  );
+}
+
+await mustReject(
+  "conta de aluno já atribuída a outra organização não prepara uma ficha incompatível",
+  () =>
+    asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+      db.query(`select public.prepare_student_invitation($1)`, [presetOrgCandidate.id]),
+    ),
+  "não pode ser ligada",
+);
+
+const preparedEmailIndex = "indice.convite@exemplo.pt";
+const preparedEmailIndexStudents = await Promise.all([
+  one(
+    `insert into public.student_profiles
+       (organization_id, created_by_teacher_id, full_name, email)
+     values ($1,$2,'Índice Lisboa',$3) returning id`,
+    [org, teacher.id, preparedEmailIndex],
+  ),
+  one(
+    `insert into public.student_profiles
+       (organization_id, created_by_teacher_id, full_name, email)
+     values ($1,$2,'Índice externo',$3) returning id`,
+    [otherTeacher.organization_id, otherTeacher.id, preparedEmailIndex],
+  ),
+]);
+const firstIndexedInvitation = await one(
+  `insert into public.student_invitations
+     (organization_id, student_id, prepared_by_teacher_id, target_email)
+   values ($1,$2,$3,$4) returning id`,
+  [org, preparedEmailIndexStudents[0].id, teacher.id, preparedEmailIndex],
+);
+await mustReject("só existe uma preparação ativa por email entre organizações", () =>
+  db.query(
+    `insert into public.student_invitations
+       (organization_id, student_id, prepared_by_teacher_id, target_email)
+     values ($1,$2,$3,$4)`,
+    [
+      otherTeacher.organization_id,
+      preparedEmailIndexStudents[1].id,
+      otherTeacher.id,
+      preparedEmailIndex.toUpperCase(),
+    ],
+  ),
+);
+await db.query(
+  `update public.student_invitations
+      set status='revoked', revoked_at=now()
+    where id=$1`,
+  [firstIndexedInvitation.id],
+);
+const secondIndexedInvitation = await one(
+  `insert into public.student_invitations
+     (organization_id, student_id, prepared_by_teacher_id, target_email)
+   values ($1,$2,$3,$4) returning id`,
+  [
+    otherTeacher.organization_id,
+    preparedEmailIndexStudents[1].id,
+    otherTeacher.id,
+    preparedEmailIndex,
+  ],
+);
+check(
+  secondIndexedInvitation.id !== firstIndexedInvitation.id,
+  "revogar liberta o índice parcial para uma nova preparação legítima",
+);
+await db.query(
+  `update public.student_invitations
+      set status='revoked', revoked_at=now()
+    where id=$1`,
+  [secondIndexedInvitation.id],
+);
+
+const studentWithoutEmail = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `insert into public.student_profiles
+       (organization_id, created_by_teacher_id, full_name)
+     values ($1,$2,'Aluno sem email') returning id`,
+    [org, teacher.id],
+  ),
+);
+await mustReject("ficha sem email não prepara uma ligação", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.prepare_student_invitation($1)`, [studentWithoutEmail.id]),
+  ),
+);
+
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(`update public.student_profiles set is_active=false where id=$1`, [managedStudent.id]),
+);
+await mustReject("ficha inativa não recebe convite", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.prepare_student_invitation($1)`, [managedStudent.id]),
+  ),
+);
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(`update public.student_profiles set is_active=true where id=$1`, [managedStudent.id]),
+);
+
+await mustReject("outro professor não revoga a preparação de uma ficha alheia", () =>
+  asDatabaseRole("authenticated", SAME_ORG_TEACHER_UID, () =>
+    db.query(`select public.revoke_student_invitation($1)`, [managedStudent.id]),
+  ),
+);
+await mustReject("professor externo não revoga preparação de outra organização", () =>
+  asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+    db.query(`select public.revoke_student_invitation($1)`, [managedStudent.id]),
+  ),
+);
+
+const firstRevocation = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select public.revoke_student_invitation($1) as done`, [managedStudent.id]),
+);
+const revokedAt = (
+  await one(`select revoked_at from public.student_invitations where id=$1`, [preparedInvitation.id])
+).revoked_at;
+const repeatedRevocation = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select public.revoke_student_invitation($1) as done`, [managedStudent.id]),
+);
+const invitationAfterRepeatedRevocation = await one(
+  `select status, revoked_at from public.student_invitations where id=$1`,
+  [preparedInvitation.id],
+);
+const teacherRevocationAuditCount = await one(
+  `select count(*)::int as n
+   from public.audit_log
+   where actor_id=$1 and action='student.invitation_revoked'
+     and target_table='student_profiles' and target_id=$2
+     and metadata->>'reason'='teacher_request'`,
+  [TEACHER_UID, managedStudent.id],
+);
+check(
+  firstRevocation.done === true &&
+    repeatedRevocation.done === false &&
+    invitationAfterRepeatedRevocation.status === "revoked" &&
+    String(invitationAfterRepeatedRevocation.revoked_at) === String(revokedAt) &&
+    teacherRevocationAuditCount.n === 1,
+  "revogar convite é idempotente e uma repetição não duplica estado nem auditoria",
+);
+
+const claimAuditStudent = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `insert into public.student_profiles
+       (organization_id, created_by_teacher_id, full_name, email)
+     values ($1,$2,'Ligação auditada','ligacao.auditada@exemplo.pt') returning id`,
+    [org, teacher.id],
+  ),
+);
+const claimInvitation = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select public.prepare_student_invitation($1) as id`, [claimAuditStudent.id]),
+);
+const CLAIM_AUDIT_UID = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
+await createStudentAuthUser(CLAIM_AUDIT_UID, "ligacao.auditada@exemplo.pt");
+const firstAuditedClaim = await asDatabaseRole("authenticated", CLAIM_AUDIT_UID, () =>
+  one(`select public.claim_student_profile(null::text) as id`),
+);
+const repeatedAuditedClaim = await asDatabaseRole("authenticated", CLAIM_AUDIT_UID, () =>
+  one(`select public.claim_student_profile(null::text) as id`),
+);
+const claimAuditEntries = await rows(
+  `select action, actor_id, target_id
+   from public.audit_log
+   where actor_id=$1 and target_table='student_profiles' and target_id=$2`,
+  [CLAIM_AUDIT_UID, claimAuditStudent.id],
+);
+const claimedInvitationState = await one(
+  `select status, claimed_at from public.student_invitations where id=$1`,
+  [claimInvitation.id],
+);
+check(
+  firstAuditedClaim.id === claimAuditStudent.id &&
+    repeatedAuditedClaim.id === claimAuditStudent.id &&
+    claimAuditEntries.length === 1 &&
+    claimedInvitationState.status === "claimed" &&
+    claimedInvitationState.claimed_at !== null,
+  "claim confirmado é idempotente, conclui o convite e deixa exatamente uma auditoria",
+);
+
+await mustReject("professor não altera o email de uma ficha já ligada", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`update public.student_profiles set email='forjado@exemplo.pt' where id=$1`, [
+      claimAuditStudent.id,
+    ]),
+  ),
+);
+
+const invitationsHiddenFromStudent = await asDatabaseRole("authenticated", ANA_UID, () =>
+  rows(`select id from public.student_invitations`),
+);
+check(
+  invitationsHiddenFromStudent.length === 0,
+  "aluno não consulta o estado administrativo dos convites",
+);
+
+const managedGroup = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `insert into public.groups
+       (organization_id, teacher_id, sport_id, name, description,
+        administrative_notes, max_participants)
+     values ($1,$2,$3,'Turma Fase 3','Treino técnico semanal',
+             'Observação exclusiva do professor',4)
+     returning id, name, max_participants`,
+    [org, teacher.id, sport],
+  ),
+);
+const updatedManagedGroup = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `update public.groups
+        set name='Turma Fase 3 atualizada', description='Treino técnico e tático',
+            administrative_notes='Nota administrativa atualizada', max_participants=3
+      where id=$1
+      returning id, name, max_participants`,
+    [managedGroup.id],
+  ),
+);
+const managedGroupRecord = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select name, administrative_notes, participant_count, is_active
+     from public.teacher_group_records where id=$1`,
+    [managedGroup.id],
+  ),
+);
+check(
+  updatedManagedGroup?.name === "Turma Fase 3 atualizada" &&
+    updatedManagedGroup.max_participants === 3 &&
+    managedGroupRecord?.administrative_notes === "Nota administrativa atualizada" &&
+    managedGroupRecord.participant_count === 0,
+  "professor cria e atualiza uma turma própria com observações privadas",
+);
+
+await mustReject("professor não troca organização nem proprietário da turma", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`update public.groups set organization_id=$1, teacher_id=$2 where id=$3`, [
+      otherTeacher.organization_id,
+      otherTeacher.id,
+      managedGroup.id,
+    ]),
+  ),
+);
+const groupHiddenFromColleague = await asDatabaseRole(
+  "authenticated",
+  SAME_ORG_TEACHER_UID,
+  () => rows(`select id from public.teacher_group_records where id=$1`, [managedGroup.id]),
+);
+const groupHiddenFromExternalTeacher = await asDatabaseRole(
+  "authenticated",
+  OTHER_TEACHER_UID,
+  () => rows(`select id from public.teacher_group_records where id=$1`, [managedGroup.id]),
+);
+const groupUpdateFromColleague = await asDatabaseRole(
+  "authenticated",
+  SAME_ORG_TEACHER_UID,
+  () =>
+    rows(`update public.groups set name='Intrusão do colega' where id=$1 returning id`, [
+      managedGroup.id,
+    ]),
+);
+check(
+  groupHiddenFromColleague.length === 0 &&
+    groupHiddenFromExternalTeacher.length === 0 &&
+    groupUpdateFromColleague.length === 0,
+  "turma não é gerida por outro professor, mesmo dentro da organização",
+);
+
+const anaMembership = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select public.add_group_member($1,$2) as id`, [managedGroup.id, ana.id]),
+);
+const brunoMembership = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select public.add_group_member($1,$2) as id`, [managedGroup.id, bruno.id]),
+);
+await mustReject("a mesma adesão ativa não pode ser adicionada duas vezes", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.add_group_member($1,$2)`, [managedGroup.id, ana.id]),
+  ),
+);
+await mustReject("turma não aceita aluno de outro professor da organização", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.add_group_member($1,$2)`, [managedGroup.id, sameOrgOtherStudent.id]),
+  ),
+);
+await mustReject("turma não aceita aluno de outra organização", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.add_group_member($1,$2)`, [managedGroup.id, otherStudent.id]),
+  ),
+);
+
+const groupVisibleToMember = await asDatabaseRole("authenticated", ANA_UID, () =>
+  one(`select id, name, description from public.groups where id=$1`, [managedGroup.id]),
+);
+await mustReject("aluno não lê observações administrativas da turma", () =>
+  asDatabaseRole("authenticated", ANA_UID, () =>
+    db.query(`select administrative_notes from public.groups where id=$1`, [managedGroup.id]),
+  ),
+);
+await mustReject("aluno não adiciona participantes à turma", () =>
+  asDatabaseRole("authenticated", ANA_UID, () =>
+    db.query(`select public.add_group_member($1,$2)`, [managedGroup.id, ana.id]),
+  ),
+);
+check(
+  anaMembership.id !== null &&
+    brunoMembership.id !== null &&
+    groupVisibleToMember?.id === managedGroup.id,
+  "aluno participa em turma por relação N:N e lê apenas a projeção pública",
+);
+
+const firstMemberRemoval = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select public.remove_group_member($1,$2) as done`, [managedGroup.id, ana.id]),
+);
+const repeatedMemberRemoval = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select public.remove_group_member($1,$2) as done`, [managedGroup.id, ana.id]),
+);
+const membershipStateAfterRemoval = await rows(
+  `select student_id, is_active, left_at
+   from public.group_members where group_id=$1 order by student_id`,
+  [managedGroup.id],
+);
+const groupAfterRemoval = await one(`select id, is_active from public.groups where id=$1`, [
+  managedGroup.id,
+]);
+check(
+  firstMemberRemoval.done === true &&
+    repeatedMemberRemoval.done === false &&
+    groupAfterRemoval.id === managedGroup.id &&
+    groupAfterRemoval.is_active &&
+    membershipStateAfterRemoval.some(
+      (membership) =>
+        membership.student_id === ana.id && !membership.is_active && membership.left_at !== null,
+    ) &&
+    membershipStateAfterRemoval.some(
+      (membership) => membership.student_id === bruno.id && membership.is_active,
+    ),
+  "remoção é lógica, idempotente e preserva a turma e os restantes membros",
+);
+
+const reenteredMembership = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select public.add_group_member($1,$2) as id`, [managedGroup.id, ana.id]),
+);
+const anaMembershipPeriods = await rows(
+  `select id, joined_at, left_at, is_active
+   from public.group_members
+   where group_id=$1 and student_id=$2
+   order by joined_at, id`,
+  [managedGroup.id, ana.id],
+);
+check(
+  reenteredMembership.id !== anaMembership.id &&
+    anaMembershipPeriods.length === 2 &&
+    anaMembershipPeriods.some(
+      (membership) =>
+        membership.id === anaMembership.id &&
+        !membership.is_active &&
+        membership.left_at !== null,
+    ) &&
+    anaMembershipPeriods.some(
+      (membership) =>
+        membership.id === reenteredMembership.id &&
+        membership.is_active &&
+        membership.left_at === null,
+    ),
+  "reentrada cria um novo período e conserva a adesão anterior fechada",
+);
+
+const capacityGroup = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `insert into public.groups
+       (organization_id, teacher_id, name, max_participants)
+     values ($1,$2,'Turma com limite',1) returning id`,
+    [org, teacher.id],
+  ),
+);
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(`select public.add_group_member($1,$2)`, [capacityGroup.id, ana.id]),
+);
+await mustReject("limite máximo da turma é aplicado atomicamente", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.add_group_member($1,$2)`, [capacityGroup.id, bruno.id]),
+  ),
+);
+
+await mustReject("cliente autenticado não apaga uma turma", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`delete from public.groups where id=$1`, [managedGroup.id]),
+  ),
+);
+await mustReject("cliente autenticado não apaga o histórico de adesão", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`delete from public.group_members where id=$1`, [brunoMembership.id]),
+  ),
+);
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(`update public.groups set is_active=false where id=$1`, [managedGroup.id]),
+);
+const deactivatedGroup = await one(`select is_active from public.groups where id=$1`, [
+  managedGroup.id,
+]);
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(`update public.groups set is_active=true where id=$1`, [managedGroup.id]),
+);
+check(!deactivatedGroup.is_active, "turma é arquivada sem eliminação definitiva");
+
+const managedLocation = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `insert into public.locations
+       (organization_id, teacher_id, name, address, city, internal_reference, notes)
+     values ($1,$2,'Campo Fase 3','Rua do Desporto, 10','Lisboa','Court A',
+             'Acesso pela receção')
+     returning id, name, city`,
+    [org, teacher.id],
+  ),
+);
+const updatedManagedLocation = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `update public.locations
+        set name='Campo Fase 3 atualizado', address='Avenida do Desporto, 20',
+            city='Oeiras', internal_reference='Court B', notes='Levar bolas próprias'
+      where id=$1 returning id, name, city`,
+    [managedLocation.id],
+  ),
+);
+const managedLocationRecord = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select name, internal_reference, notes, is_active, can_manage
+     from public.teacher_location_records where id=$1`,
+    [managedLocation.id],
+  ),
+);
+check(
+  updatedManagedLocation?.name === "Campo Fase 3 atualizado" &&
+    updatedManagedLocation.city === "Oeiras" &&
+    managedLocationRecord?.internal_reference === "Court B" &&
+    managedLocationRecord.notes === "Levar bolas próprias" &&
+    managedLocationRecord.can_manage,
+  "professor cria e edita um local próprio com dados administrativos",
+);
+
+const sharedLocation = await one(
+  `insert into public.locations
+     (organization_id, teacher_id, name, address, city, internal_reference, notes)
+   values ($1,null,'Campo partilhado','Rua Comum, 1','Lisboa','SHARED-01',
+           'Nota da organização')
+   returning id`,
+  [org],
+);
+const sharedLocationRecord = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select id, name, address, city, internal_reference, notes, can_manage
+     from public.teacher_location_records where id=$1`,
+    [sharedLocation.id],
+  ),
+);
+const sharedLocationUpdate = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  rows(`update public.locations set name='Apropriação indevida' where id=$1 returning id`, [
+    sharedLocation.id,
+  ]),
+);
+
+await mustReject("professor não troca organização nem proprietário do local", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`update public.locations set organization_id=$1, teacher_id=$2 where id=$3`, [
+      otherTeacher.organization_id,
+      otherTeacher.id,
+      managedLocation.id,
+    ]),
+  ),
+);
+const locationVisibleToColleague = await asDatabaseRole(
+  "authenticated",
+  SAME_ORG_TEACHER_UID,
+  () =>
+    one(
+      `select id, name, address, city, internal_reference, notes, can_manage
+       from public.teacher_location_records where id=$1`,
+      [managedLocation.id],
+    ),
+);
+const locationHiddenFromExternalTeacher = await asDatabaseRole(
+  "authenticated",
+  OTHER_TEACHER_UID,
+  () => rows(`select id from public.teacher_location_records where id=$1`, [managedLocation.id]),
+);
+const locationUpdateFromColleague = await asDatabaseRole(
+  "authenticated",
+  SAME_ORG_TEACHER_UID,
+  () =>
+    rows(`update public.locations set name='Intrusão do colega' where id=$1 returning id`, [
+      managedLocation.id,
+    ]),
+);
+const locationVisibleToStudent = await asDatabaseRole("authenticated", ANA_UID, () =>
+  one(`select id, name, address, city from public.locations where id=$1`, [managedLocation.id]),
+);
+await mustReject("aluno não lê observações privadas do local", () =>
+  asDatabaseRole("authenticated", ANA_UID, () =>
+    db.query(`select notes from public.locations where id=$1`, [managedLocation.id]),
+  ),
+);
+await mustReject("aluno não lê a referência interna do local", () =>
+  asDatabaseRole("authenticated", ANA_UID, () =>
+    db.query(`select internal_reference from public.locations where id=$1`, [managedLocation.id]),
+  ),
+);
+const studentLocationUpdate = await asDatabaseRole("authenticated", ANA_UID, () =>
+  rows(`update public.locations set name='Alteração indevida' where id=$1 returning id`, [
+    managedLocation.id,
+  ]),
+);
+check(
+  sharedLocationRecord?.id === sharedLocation.id &&
+    sharedLocationRecord.name === "Campo partilhado" &&
+    sharedLocationRecord.internal_reference === null &&
+    sharedLocationRecord.notes === null &&
+    !sharedLocationRecord.can_manage &&
+    sharedLocationUpdate.length === 0 &&
+    locationVisibleToColleague?.id === managedLocation.id &&
+    locationVisibleToColleague.name === "Campo Fase 3 atualizado" &&
+    locationVisibleToColleague.internal_reference === null &&
+    locationVisibleToColleague.notes === null &&
+    !locationVisibleToColleague.can_manage &&
+    locationHiddenFromExternalTeacher.length === 0 &&
+    locationUpdateFromColleague.length === 0 &&
+    locationVisibleToStudent?.id === managedLocation.id &&
+    studentLocationUpdate.length === 0,
+  "locais da organização são listados com privados mascarados e escrita limitada ao proprietário",
+);
+
+await mustReject("cliente autenticado não apaga um local", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`delete from public.locations where id=$1`, [managedLocation.id]),
+  ),
+);
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(`update public.locations set is_active=false where id=$1`, [managedLocation.id]),
+);
+const deactivatedLocation = await one(`select is_active from public.locations where id=$1`, [
+  managedLocation.id,
+]);
+check(!deactivatedLocation.is_active, "local é desativado sem eliminação definitiva");
+
+const savedTeacherPolicy = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.save_teacher_cancellation_policy(
+       'Política da Marta',12,'refund','teacher_decides',true,true
+     ) as id`,
+  ),
+);
+const updatedTeacherPolicy = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.save_teacher_cancellation_policy(
+       'Política da Marta atualizada',8,'charge','refund',false,true
+     ) as id`,
+  ),
+);
+const teacherPolicyState = await one(
+  `select name, min_hours_before_cancel, late_cancellation, student_no_show,
+          allow_manual_exceptions, is_active
+   from public.cancellation_policies where id=$1`,
+  [savedTeacherPolicy.id],
+);
+const resolvedTeacherPolicy = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select (public.resolve_cancellation_policy($1)).id as id`, [teacher.id]),
+);
+check(
+  updatedTeacherPolicy.id === savedTeacherPolicy.id &&
+    teacherPolicyState.name === "Política da Marta atualizada" &&
+    teacherPolicyState.min_hours_before_cancel === 8 &&
+    teacherPolicyState.late_cancellation === "charge" &&
+    teacherPolicyState.student_no_show === "refund" &&
+    !teacherPolicyState.allow_manual_exceptions &&
+    teacherPolicyState.is_active &&
+    resolvedTeacherPolicy.id === savedTeacherPolicy.id,
+  "política do professor é criada, atualizada e prevalece sobre a organização",
+);
+
+const studentResolvedPolicy = await asDatabaseRole("authenticated", ANA_UID, () =>
+  one(`select (public.resolve_cancellation_policy($1)).id as id`, [teacher.id]),
+);
+check(
+  studentResolvedPolicy.id === savedTeacherPolicy.id,
+  "aluno lê a política ativa que se aplica ao seu professor",
+);
+await mustReject("aluno não consulta a política de outro professor", () =>
+  asDatabaseRole("authenticated", ANA_UID, () =>
+    db.query(`select public.resolve_cancellation_policy($1)`, [otherTeacher.id]),
+  ),
+);
+await mustReject("nem o professor atualiza diretamente a política ou o seu âmbito", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(
+      `update public.cancellation_policies
+          set name='Atalho indevido', organization_id=$1, teacher_id=$2
+        where id=$3`,
+      [otherTeacher.organization_id, otherTeacher.id, savedTeacherPolicy.id],
+    ),
+  ),
+);
+
+for (const invalidHours of [-1, 337]) {
+  await mustReject(`política recusa prazo inválido (${invalidHours}h)`, () =>
+    asDatabaseRole("authenticated", TEACHER_UID, () =>
+      db.query(
+        `select public.save_teacher_cancellation_policy(
+           'Prazo inválido',$1,'charge','charge',true,true
+         )`,
+        [invalidHours],
+      ),
+    ),
+  );
+}
+await mustReject("política recusa nome vazio", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(
+      `select public.save_teacher_cancellation_policy(
+         '  ',24,'charge','charge',true,true
+       )`,
+    ),
+  ),
+);
+await mustReject("política recusa nome com mais de 120 caracteres", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(
+      `select public.save_teacher_cancellation_policy(
+         $1,24,'charge','charge',true,true
+       )`,
+      ["A".repeat(121)],
+    ),
+  ),
+);
+await mustReject("política recusa regra de cobrança desconhecida", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(
+      `select public.save_teacher_cancellation_policy(
+         'Regra inválida',24,'invalid'::public.credit_charge_rule,'charge',true,true
+       )`,
+    ),
+  ),
+);
+
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(
+    `select public.save_teacher_cancellation_policy(
+       'Política da Marta atualizada',8,'charge','refund',false,false
+     )`,
+  ),
+);
+const organizationDefaultPolicy = await one(
+  `select id from public.cancellation_policies
+   where organization_id=$1 and teacher_id is null and is_default and is_active`,
+  [org],
+);
+const resolvedInactiveFallback = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select (public.resolve_cancellation_policy($1)).id as id`, [teacher.id]),
+);
+check(
+  resolvedInactiveFallback.id === organizationDefaultPolicy.id,
+  "política inativa do professor é ignorada e a organização serve de fallback",
+);
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(
+    `select public.save_teacher_cancellation_policy(
+       'Política da Marta atualizada',8,'charge','refund',false,true
+     )`,
+  ),
+);
+
+await mustReject("colega da organização não altera a política do professor", () =>
+  asDatabaseRole("authenticated", SAME_ORG_TEACHER_UID, () =>
+    db.query(`update public.cancellation_policies set name='Intrusão do colega' where id=$1`, [
+      savedTeacherPolicy.id,
+    ]),
+  ),
+);
+await mustReject("professor externo não altera a política", () =>
+  asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+    db.query(`update public.cancellation_policies set name='Intrusão externa' where id=$1`, [
+      savedTeacherPolicy.id,
+    ]),
+  ),
+);
+
+for (const [label, role, uid] of [
+  ["aluno", "authenticated", ANA_UID],
+  ["anon", "anon", null],
+]) {
+  await mustReject(`${label} não prepara convites`, () =>
+    asDatabaseRole(role, uid, () =>
+      db.query(`select public.prepare_student_invitation($1)`, [managedStudent.id]),
+    ),
+  );
+  await mustReject(`${label} não gere membros de turmas`, () =>
+    asDatabaseRole(role, uid, () =>
+      db.query(`select public.add_group_member($1,$2)`, [managedGroup.id, ana.id]),
+    ),
+  );
+  await mustReject(`${label} não guarda políticas de professor`, () =>
+    asDatabaseRole(role, uid, () =>
+      db.query(
+        `select public.save_teacher_cancellation_policy(
+           'Política indevida',24,'charge','charge',true,true
+         )`,
+      ),
+    ),
+  );
+}
+
+const adminPhase3Visibility = await asDatabaseRole("authenticated", ADMIN_UID, async () => ({
+  students: await rows(`select id from public.teacher_student_management_records where id=$1`, [
+    managedStudent.id,
+  ]),
+  groups: await rows(`select id from public.teacher_group_records where id=$1`, [managedGroup.id]),
+  location: await one(
+    `select id, internal_reference, notes, can_manage
+     from public.teacher_location_records where id=$1`,
+    [managedLocation.id],
+  ),
+  policy: await one(`select (public.resolve_cancellation_policy($1)).id as id`, [teacher.id]),
+}));
+check(
+  adminPhase3Visibility.students.length === 1 &&
+    adminPhase3Visibility.groups.length === 1 &&
+    adminPhase3Visibility.location.id === managedLocation.id &&
+    adminPhase3Visibility.location.internal_reference === "Court B" &&
+    adminPhase3Visibility.location.notes === "Levar bolas próprias" &&
+    !adminPhase3Visibility.location.can_manage &&
+    adminPhase3Visibility.policy.id === savedTeacherPolicy.id,
+  "administrador ativo mantém apenas a leitura global prevista",
+);
+await mustReject("administrador não prepara convites funcionais", () =>
+  asDatabaseRole("authenticated", ADMIN_UID, () =>
+    db.query(`select public.prepare_student_invitation($1)`, [managedStudent.id]),
+  ),
+);
+await mustReject("administrador não gere membros de turmas", () =>
+  asDatabaseRole("authenticated", ADMIN_UID, () =>
+    db.query(`select public.add_group_member($1,$2)`, [managedGroup.id, ana.id]),
+  ),
+);
+await mustReject("administrador não cria política de professor", () =>
+  asDatabaseRole("authenticated", ADMIN_UID, () =>
+    db.query(
+      `select public.save_teacher_cancellation_policy(
+         'Política administrativa indevida',24,'charge','charge',true,true
+       )`,
+    ),
+  ),
+);
+
+await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  db.query(`select public.admin_set_account_status($1,'blocked','Teste das ações da Fase 3')`, [
+    TEACHER_UID,
+  ]),
+);
+const blockedTeacherVisibility = await asDatabaseRole("authenticated", TEACHER_UID, async () => ({
+  students: await rows(`select id from public.teacher_student_management_records`),
+  groups: await rows(`select id from public.teacher_group_records`),
+  locations: await rows(`select id from public.teacher_location_records`),
+  policies: await rows(`select id from public.cancellation_policies`),
+  updatedGroups: await rows(
+    `update public.groups set name='Alteração bloqueada' where id=$1 returning id`,
+    [managedGroup.id],
+  ),
+}));
+check(
+  Object.values(blockedTeacherVisibility).every((entries) => entries.length === 0),
+  "professor bloqueado não lê nem altera recursos da Fase 3",
+);
+await mustReject("professor bloqueado não prepara convite", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.prepare_student_invitation($1)`, [managedStudent.id]),
+  ),
+);
+await mustReject("professor bloqueado não gere turma", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.add_group_member($1,$2)`, [managedGroup.id, ana.id]),
+  ),
+);
+await mustReject("professor bloqueado não guarda política", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(
+      `select public.save_teacher_cancellation_policy(
+         'Política bloqueada',24,'charge','charge',true,true
+       )`,
+    ),
+  ),
+);
+await mustReject("professor bloqueado não resolve política", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.resolve_cancellation_policy($1)`, [teacher.id]),
+  ),
+);
+await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  db.query(`select public.admin_set_account_status($1,'active',null)`, [TEACHER_UID]),
+);
+const reactivatedTeacherPolicy = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select (public.resolve_cancellation_policy($1)).id as id`, [teacher.id]),
+);
+check(
+  reactivatedTeacherPolicy.id === savedTeacherPolicy.id,
+  "reativação devolve ao professor os acessos funcionais da Fase 3",
+);
+
+section("Aulas (Fase 1)");
+
+const [generated] = await rows(
+  `select is_generated from information_schema.columns
+   where table_name='lessons' and column_name='duration_minutes'`,
+);
+check(generated?.is_generated === "ALWAYS", "lessons.duration_minutes é coluna gerada");
+
+await mustReject("aula que termina antes de começar", () =>
+  db.query(
+    `insert into public.lessons (organization_id,teacher_id,sport_id,title,starts_at,ends_at)
+     values ($1,$2,$3,'X','2026-08-10 17:00+00','2026-08-10 16:00+00')`,
+    [org, teacher.id, sport],
+  ),
+);
+
+await mustReject("cancelamento sem motivo", () =>
+  db.query(
+    `insert into public.lessons (organization_id,teacher_id,sport_id,title,starts_at,ends_at,status,cancelled_at)
+     values ($1,$2,$3,'X','2026-08-10 17:00+00','2026-08-10 18:00+00','cancelled_by_teacher',now())`,
+    [org, teacher.id, sport],
+  ),
+);
+
+await mustReject("apagar uma aula em estado terminal", () =>
+  db.query(`delete from public.lessons where id=$1`, [lessonA.id]),
+);
+
+// ── Resultado ────────────────────────────────────────────────────────────────
+
+console.log(
+  failures === 0
+    ? `\n${assertions} verificações do esquema e das regras de créditos passaram.\n`
+    : `\n${failures} verificação(ões) falharam.\n`,
+);
+
+process.exit(failures === 0 ? 0 : 1);

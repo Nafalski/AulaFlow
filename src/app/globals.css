@@ -1,0 +1,187 @@
+@import "tailwindcss";
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   AulaFlow — sistema de design
+
+   O requisito é explícito: não pode parecer um painel administrativo. A
+   referência é uma aplicação de desporto — areia, oceano, sol ao fim da
+   tarde. Daí as decisões que mais se notam:
+
+     • o fundo é areia quente (#F7F1E8), nunca branco nem cinzento frio;
+     • os cantos são generosos, porque tudo é tocado com o polegar;
+     • o coral só aparece na ação principal de cada ecrã — se estivesse em
+       todo o lado, deixaria de indicar o que fazer a seguir.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+@theme {
+  /* ── Marca ─────────────────────────────────────────────────────────────── */
+  --color-ink: #0b1f2a;
+  --color-ink-soft: #37505c;
+  --color-muted: #6b7f89;
+
+  --color-brand: #0e7c86;
+  --color-brand-deep: #0a5a62;
+  --color-brand-soft: #d7edee;
+  --color-brand-tint: #eef8f8;
+
+  --color-sun: #ef6c33;
+  --color-sun-deep: #d4551d;
+  --color-sun-soft: #fde8dc;
+
+  /* ── Superfícies ───────────────────────────────────────────────────────── */
+  --color-sand: #f7f1e8;
+  --color-sand-deep: #efe6d8;
+  --color-surface: #ffffff;
+  --color-line: #e6dccc;
+  --color-line-soft: #f0e8db;
+
+  /* ── Estados das aulas ─────────────────────────────────────────────────── */
+  --color-state-neutral: #52697a;
+  --color-state-neutral-soft: #eaeff3;
+
+  --color-state-success: #0f7a58;
+  --color-state-success-soft: #dcf3ea;
+
+  --color-state-danger: #bc3326;
+  --color-state-danger-soft: #fbe3e0;
+
+  --color-state-warning: #96600a;
+  --color-state-warning-soft: #fbeed4;
+
+  --color-state-alert: #7c3aa8;
+  --color-state-alert-soft: #f0e6fa;
+
+  /* ── Formas ────────────────────────────────────────────────────────────── */
+  --radius-card: 1rem;
+  --radius-field: 0.75rem;
+  --radius-pill: 999px;
+
+  --shadow-card: 0 1px 2px rgb(11 31 42 / 0.04), 0 8px 24px -12px rgb(11 31 42 / 0.14);
+  --shadow-raised: 0 2px 4px rgb(11 31 42 / 0.06), 0 16px 32px -16px rgb(11 31 42 / 0.22);
+  --shadow-float: 0 8px 28px -8px rgb(239 108 51 / 0.5);
+
+  /* ── Tipografia ────────────────────────────────────────────────────────── */
+  --font-sans: var(--font-jakarta), ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+    sans-serif;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Base
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    background-color: var(--color-sand);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  /*
+    O anel de foco aparece na navegação por teclado mas não ao clicar com o
+    rato. Remover o contorno por completo — tentação comum — deixaria a
+    aplicação impossível de usar sem rato.
+  */
+  :focus-visible {
+    outline: 2px solid var(--color-brand);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+
+  h1,
+  h2,
+  h3 {
+    font-weight: 700;
+    letter-spacing: -0.02em;
+  }
+
+  /* Tipografia responsiva sem media queries: o tamanho acompanha a largura,
+     entre limites que garantem legibilidade em qualquer ecrã. */
+  h1 {
+    font-size: clamp(1.5rem, 1.2rem + 1.4vw, 2rem);
+    line-height: 1.15;
+  }
+
+  /* Respeita quem pediu ao sistema para reduzir animações — enjoo de
+     movimento e perturbações vestibulares são reais. */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Utilitários
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/*
+  A barra de navegação inferior tem de ficar acima da barra de gestos do iOS.
+  Sem isto, o último separador fica por baixo dela e é impossível de tocar.
+*/
+@utility pb-safe {
+  padding-bottom: max(0.5rem, env(safe-area-inset-bottom));
+}
+
+@utility mb-safe {
+  margin-bottom: max(0.5rem, env(safe-area-inset-bottom));
+}
+
+/* Visível para leitores de ecrã, invisível para os restantes. */
+@utility sr-only-focusable {
+  &:not(:focus):not(:focus-within) {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+}
+
+/* Areia com um brilho de sol no canto — o fundo das páginas públicas. */
+@utility bg-beach {
+  background-image:
+    radial-gradient(ellipse 80% 50% at 50% -20%, var(--color-brand-tint), transparent),
+    radial-gradient(ellipse 60% 40% at 100% 0%, var(--color-sun-soft), transparent);
+}
+
+@keyframes aulaflow-shimmer {
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+/* Esqueleto de carregamento: a forma do conteúdo que está a chegar. */
+@utility skeleton {
+  position: relative;
+  overflow: hidden;
+  background-color: var(--color-sand-deep);
+  border-radius: var(--radius-field);
+
+  &::after {
+    position: absolute;
+    inset: 0;
+    transform: translateX(-100%);
+    background-image: linear-gradient(
+      90deg,
+      transparent,
+      rgb(255 255 255 / 0.6),
+      transparent
+    );
+    animation: aulaflow-shimmer 1.6s infinite;
+    content: "";
+  }
+}

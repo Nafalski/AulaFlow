@@ -1,0 +1,51 @@
+{
+  "name": "aulaflow",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Plataforma de gestão de aulas desportivas",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint",
+    "lint:fix": "eslint --fix",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "db:verify": "node scripts/verify-schema.mjs",
+    "icons": "node scripts/generate-icons.mjs",
+    "check": "npm run lint && npm run typecheck && npm run test && npm run db:verify && npm run build",
+    "db:types": "npx --yes supabase gen types typescript --linked > src/types/database.ts",
+    "db:push": "npx --yes supabase db push",
+    "db:link": "npx --yes supabase link"
+  },
+  "dependencies": {
+    "@date-fns/tz": "^1.5.0",
+    "@supabase/ssr": "^0.12.4",
+    "@supabase/supabase-js": "^2.111.0",
+    "clsx": "^2.1.1",
+    "date-fns": "^4.4.0",
+    "lucide-react": "^1.28.0",
+    "next": "16.2.12",
+    "react": "19.2.4",
+    "react-dom": "19.2.4",
+    "server-only": "^0.0.1",
+    "tailwind-merge": "^3.6.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.4",
+    "@tailwindcss/postcss": "^4.3.3",
+    "@types/node": "^20.19.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "eslint": "^9.39.0",
+    "eslint-config-next": "16.2.12",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.10"
+  },
+  "engines": {
+    "node": ">=20.9.0"
+  }
+}
