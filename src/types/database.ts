@@ -116,6 +116,13 @@ export type CreditTransactionType =
   | "administrative_correction"
   | "exception_authorized";
 
+export type PackageAuditEventType =
+  | "package_suspended"
+  | "package_reactivated"
+  | "package_cancelled"
+  | "package_validity_changed"
+  | "package_start_changed";
+
 /** O que aconteceu aos créditos de UM aluno numa aula. */
 export type ParticipationBillingStatus =
   | "pending"
@@ -435,6 +442,23 @@ export type PackageCreditTransaction = {
   performed_by: UUID | null;
   /** Movimentação que esta corrige. A original nunca é apagada. */
   corrects_transaction_id: UUID | null;
+  /** Chave técnica para retries administrativos sem duplicar movimentações. */
+  idempotency_key: UUID | null;
+  created_at: Timestamp;
+};
+
+/** Eventos administrativos que não alteram saldo. Append-only. */
+export type StudentPackageAuditEvent = {
+  id: UUID;
+  organization_id: UUID;
+  student_package_id: UUID;
+  student_id: UUID;
+  event_type: PackageAuditEventType;
+  previous_values: Json;
+  new_values: Json;
+  reason: string;
+  performed_by: UUID | null;
+  idempotency_key: UUID | null;
   created_at: Timestamp;
 };
 
@@ -666,6 +690,47 @@ export type StudentPackageTransactionRecord = {
     "package_created" | "credit_reserved" | "reservation_released" | "credit_consumed"
   >;
   quantity: number;
+  created_at: Timestamp;
+};
+
+export type TeacherPackageAuditRecord = {
+  id: UUID;
+  organization_id: UUID;
+  student_package_id: UUID;
+  student_id: UUID;
+  student_name: string;
+  package_name: string;
+  event_type: PackageAuditEventType;
+  previous_values: Json;
+  new_values: Json;
+  reason: string;
+  performed_by: UUID | null;
+  performed_by_name: string | null;
+  created_at: Timestamp;
+};
+
+export type TeacherPackageHistoryRecord = {
+  id: UUID;
+  source: "credit" | "admin";
+  organization_id: UUID;
+  student_package_id: UUID;
+  student_id: UUID;
+  student_name: string;
+  package_name: string;
+  event_type: CreditTransactionType | PackageAuditEventType;
+  quantity: number | null;
+  available_before: number | null;
+  reserved_before: number | null;
+  used_before: number | null;
+  available_after: number | null;
+  reserved_after: number | null;
+  used_after: number | null;
+  reason: string | null;
+  performed_by: UUID | null;
+  performed_by_name: string | null;
+  corrects_transaction_id: UUID | null;
+  previous_values: Json | null;
+  new_values: Json | null;
   created_at: Timestamp;
 };
 
@@ -936,6 +1001,13 @@ export type Database = {
         Update: never;
         Relationships: [];
       };
+      student_package_audit_events: {
+        Row: StudentPackageAuditEvent;
+        // Histórico administrativo imutável. Escrita só por RPC.
+        Insert: never;
+        Update: never;
+        Relationships: [];
+      };
       cancellation_policies: {
         Row: CancellationPolicy;
         // A organização/professor e o default nunca vêm do formulário.
@@ -1046,6 +1118,14 @@ export type Database = {
       };
       student_package_transaction_records: {
         Row: StudentPackageTransactionRecord;
+        Relationships: [];
+      };
+      teacher_package_audit_records: {
+        Row: TeacherPackageAuditRecord;
+        Relationships: [];
+      };
+      teacher_package_history_records: {
+        Row: TeacherPackageHistoryRecord;
         Relationships: [];
       };
       teacher_lesson_records: {
@@ -1178,6 +1258,54 @@ export type Database = {
         Args: { p_transaction_id: UUID; p_delta: number; p_reason: string };
         Returns: UUID;
       };
+      admin_adjust_package_credits: {
+        Args: {
+          p_package_id: UUID;
+          p_delta: number;
+          p_reason: string;
+          p_idempotency_key: UUID;
+        };
+        Returns: UUID;
+      };
+      admin_correct_package_credit_transaction: {
+        Args: {
+          p_transaction_id: UUID;
+          p_delta: number;
+          p_reason: string;
+          p_idempotency_key: UUID;
+        };
+        Returns: UUID;
+      };
+      admin_suspend_student_package: {
+        Args: { p_package_id: UUID; p_reason: string; p_idempotency_key: UUID };
+        Returns: UUID;
+      };
+      admin_reactivate_student_package: {
+        Args: { p_package_id: UUID; p_reason: string; p_idempotency_key: UUID };
+        Returns: UUID;
+      };
+      admin_cancel_student_package: {
+        Args: { p_package_id: UUID; p_reason: string; p_idempotency_key: UUID };
+        Returns: UUID;
+      };
+      admin_update_student_package_validity: {
+        Args: {
+          p_package_id: UUID;
+          p_expires_on: DateOnly | null;
+          p_reason: string;
+          p_idempotency_key: UUID;
+        };
+        Returns: UUID;
+      };
+      admin_update_student_package_start: {
+        Args: {
+          p_package_id: UUID;
+          p_starts_on: DateOnly;
+          p_reason: string;
+          p_idempotency_key: UUID;
+        };
+        Returns: UUID;
+      };
       resolve_cancellation_policy: {
         Args: { p_teacher_id: UUID };
         Returns: CancellationPolicy;
@@ -1197,6 +1325,7 @@ export type Database = {
       recurrence_frequency: RecurrenceFrequency;
       package_status: PackageStatus;
       credit_transaction_type: CreditTransactionType;
+      package_audit_event_type: PackageAuditEventType;
       participation_billing_status: ParticipationBillingStatus;
       credit_charge_rule: CreditChargeRule;
       student_invitation_status: StudentInvitationStatus;

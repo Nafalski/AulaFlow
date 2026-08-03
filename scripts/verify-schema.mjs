@@ -705,7 +705,9 @@ const brunoNoExpiry = await assignPackage({
   credits: 5,
 });
 
-const suggested = await one(`select public.select_package_for_student($1,1,null) as id`, [bruno.id]);
+const suggested = await one(`select public.select_package_for_student($1::uuid,1,null::uuid) as id`, [
+  bruno.id,
+]);
 check(
   suggested.id === brunoSooner.id,
   "sugere primeiro o pacote que expira mais cedo",
@@ -2851,6 +2853,386 @@ check(
     directStudentPackageRows.every((row) => row.id !== customAssignment.id),
   "RLS da tabela base continua a isolar linhas do aluno",
 );
+
+section("Ajustes administrativos de pacotes (Etapa 1D)");
+
+const packageAdminObjects = await rows(
+  `select table_name
+   from information_schema.views
+   where table_schema='public'
+     and table_name in (
+       'teacher_package_audit_records',
+       'teacher_package_history_records'
+     )`,
+);
+check(packageAdminObjects.length === 2, "views de auditoria administrativa de pacotes existem");
+
+const auditTableRls = await one(
+  `select relrowsecurity as enabled
+   from pg_class c join pg_namespace n on n.oid=c.relnamespace
+   where n.nspname='public' and c.relname='student_package_audit_events'`,
+);
+check(auditTableRls?.enabled === true, "RLS ativo no histórico administrativo de pacotes");
+
+const packageAdminFunctionPrivileges = await rows(
+  `select p.proname,
+          has_function_privilege('authenticated', p.oid, 'EXECUTE') as authenticated_can_execute
+   from pg_proc p
+   join pg_namespace n on n.oid = p.pronamespace
+   where n.nspname = 'public'
+     and p.proname = any($1)
+   order by p.proname`,
+  [[
+    "adjust_package_credits",
+    "correct_package_credit_transaction",
+    "admin_adjust_package_credits",
+    "admin_correct_package_credit_transaction",
+    "admin_suspend_student_package",
+    "admin_reactivate_student_package",
+    "admin_cancel_student_package",
+    "admin_update_student_package_validity",
+    "admin_update_student_package_start",
+  ]],
+);
+const packageAdminPrivilegeMap = new Map(
+  packageAdminFunctionPrivileges.map((row) => [row.proname, row.authenticated_can_execute]),
+);
+check(
+  packageAdminPrivilegeMap.get("adjust_package_credits") === false &&
+    packageAdminPrivilegeMap.get("correct_package_credit_transaction") === false &&
+    packageAdminPrivilegeMap.get("admin_adjust_package_credits") === true &&
+    packageAdminPrivilegeMap.get("admin_cancel_student_package") === true,
+  "runtime autenticado usa apenas RPCs administrativas idempotentes para a Etapa 1D",
+);
+
+await mustReject("cliente autenticado não insere evento administrativo diretamente", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(
+      `insert into public.student_package_audit_events
+         (organization_id, student_package_id, student_id, event_type, reason, performed_by)
+       values ($1,$2,$3,'package_suspended','forjado',$4)`,
+      [org, customAssignment.id, bruno.id, TEACHER_UID],
+    ),
+  ),
+);
+
+const adminPackage = await assignPackage({
+  student: bruno.id,
+  name: "Administração 1D",
+  credits: 6,
+});
+const adminPackageBefore = await pkg(adminPackage.id);
+const addKey = randomUUID();
+const addTx = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.admin_adjust_package_credits($1,$2,$3,$4) as id`,
+    [adminPackage.id, 2, "Bónus autorizado pelo professor", addKey],
+  ),
+);
+const repeatedAddTx = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.admin_adjust_package_credits($1,$2,$3,$4) as id`,
+    [adminPackage.id, 2, "Bónus autorizado pelo professor", addKey],
+  ),
+);
+const adminPackageAfterAdd = await pkg(adminPackage.id);
+const addTxCount = await one(
+  `select count(*)::int as total
+   from public.package_credit_transactions
+   where student_package_id=$1 and idempotency_key=$2`,
+  [adminPackage.id, addKey],
+);
+check(
+  addTx.id === repeatedAddTx.id &&
+    addTxCount.total === 1 &&
+    adminPackageAfterAdd.credits_total === adminPackageBefore.credits_total + 2 &&
+    adminPackageAfterAdd.credits_available === adminPackageBefore.credits_available + 2,
+  "adicionar créditos é atómico e idempotente",
+);
+
+const removeKey = randomUUID();
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.admin_adjust_package_credits($1,$2,$3,$4) as id`,
+    [adminPackage.id, -3, "Remoção de crédito disponível lançado em excesso", removeKey],
+  ),
+);
+const adminPackageAfterRemove = await pkg(adminPackage.id);
+check(
+  adminPackageAfterRemove.credits_total === adminPackageAfterAdd.credits_total - 3 &&
+    adminPackageAfterRemove.credits_available === adminPackageAfterAdd.credits_available - 3,
+  "retirar créditos mexe apenas no saldo disponível e no total atual",
+);
+
+await mustReject("retirar mais créditos do que estão disponíveis pela RPC nova", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.admin_adjust_package_credits($1,$2,$3,$4)`, [
+      adminPackage.id,
+      -999,
+      "Tentativa inválida",
+      randomUUID(),
+    ]),
+  ),
+);
+
+const beforeSuspend = await pkg(adminPackage.id);
+const suspendKey = randomUUID();
+const suspendEvent = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.admin_suspend_student_package($1,$2,$3) as id`,
+    [adminPackage.id, "Suspensão temporária por acordo", suspendKey],
+  ),
+);
+const repeatedSuspendEvent = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.admin_suspend_student_package($1,$2,$3) as id`,
+    [adminPackage.id, "Suspensão temporária por acordo", suspendKey],
+  ),
+);
+const suspendedPackage = await pkg(adminPackage.id);
+check(
+  suspendEvent.id === repeatedSuspendEvent.id &&
+    suspendedPackage.status === "suspended" &&
+    suspendedPackage.credits_available === beforeSuspend.credits_available &&
+    suspendedPackage.credits_reserved === beforeSuspend.credits_reserved &&
+    suspendedPackage.credits_used === beforeSuspend.credits_used,
+  "suspender pacote cria evento idempotente sem alterar saldo",
+);
+
+const suspendedReservationLesson = await createLesson({
+  title: "Reserva suspensa",
+  start: "2026-10-03 17:00+00",
+});
+await mustReject("pacote suspenso bloqueia nova reserva", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.reserve_participation_credits($1,$2,$3)`, [
+      suspendedReservationLesson.id,
+      bruno.id,
+      adminPackage.id,
+    ]),
+  ),
+);
+
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.admin_adjust_package_credits($1,$2,$3,$4) as id`,
+    [adminPackage.id, 1, "Crédito incluído durante suspensão", randomUUID()],
+  ),
+);
+const stillSuspended = await pkg(adminPackage.id);
+check(stillSuspended.status === "suspended", "ajuste de crédito não reativa pacote suspenso");
+
+const reactivateEvent = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.admin_reactivate_student_package($1,$2,$3) as id`,
+    [adminPackage.id, "Retoma autorizada", randomUUID()],
+  ),
+);
+const reactivatedPackage = await pkg(adminPackage.id);
+check(
+  Boolean(reactivateEvent.id) && reactivatedPackage.status === "active",
+  "reativação calcula o estado derivado em vez de escolher estado arbitrário",
+);
+
+const reservedForCancel = await assignPackage({
+  student: bruno.id,
+  name: "Cancelamento bloqueado",
+  credits: 2,
+});
+const cancelLessonWithReservation = await createLesson({
+  title: "Reserva antes do cancelamento",
+  start: "2026-10-04 17:00+00",
+});
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.reserve_participation_credits($1,$2,$3) as id`,
+    [cancelLessonWithReservation.id, bruno.id, reservedForCancel.id],
+  ),
+);
+await mustReject("cancelamento com créditos reservados é bloqueado", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.admin_cancel_student_package($1,$2,$3)`, [
+      reservedForCancel.id,
+      "Cancelamento com reserva pendente",
+      randomUUID(),
+    ]),
+  ),
+);
+const blockedCancellationState = await pkg(reservedForCancel.id);
+check(blockedCancellationState.status !== "cancelled", "cancelamento bloqueado preserva o pacote");
+
+const cancelablePackageBefore = await pkg(adminPackage.id);
+const cancelEvent = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.admin_cancel_student_package($1,$2,$3) as id`,
+    [adminPackage.id, "Cancelamento administrativo final", randomUUID()],
+  ),
+);
+const cancelledPackage = await pkg(adminPackage.id);
+check(
+  Boolean(cancelEvent.id) &&
+    cancelledPackage.status === "cancelled" &&
+    cancelledPackage.credits_available === cancelablePackageBefore.credits_available &&
+    cancelledPackage.credits_used === cancelablePackageBefore.credits_used,
+  "cancelar pacote preserva saldo e histórico",
+);
+
+await mustReject("evento administrativo append-only não pode ser alterado", () =>
+  db.query(`update public.student_package_audit_events set reason='alterado' where id=$1`, [
+    cancelEvent.id,
+  ]),
+);
+await mustReject("evento administrativo append-only não pode ser apagado", () =>
+  db.query(`delete from public.student_package_audit_events where id=$1`, [cancelEvent.id]),
+);
+
+const validityPackage = await assignPackage({
+  student: bruno.id,
+  name: "Validade ajustável",
+  credits: 3,
+  expires: "2026-10-10",
+});
+const creditRowsBeforeValidity = await one(
+  `select count(*)::int as total from public.package_credit_transactions where student_package_id=$1`,
+  [validityPackage.id],
+);
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.admin_update_student_package_validity($1,$2,$3,$4) as id`,
+    [validityPackage.id, "2026-12-31", "Extensão combinada", randomUUID()],
+  ),
+);
+const validityAfter = await one(
+  `select expires_on::text as expires_on, status from public.student_packages where id=$1`,
+  [validityPackage.id],
+);
+const creditRowsAfterValidity = await one(
+  `select count(*)::int as total from public.package_credit_transactions where student_package_id=$1`,
+  [validityPackage.id],
+);
+const validityAudit = await one(
+  `select event_type, previous_values, new_values, new_values->>'expires_on' as new_expires_on
+   from public.student_package_audit_events
+   where student_package_id=$1 and event_type='package_validity_changed'
+   order by created_at desc limit 1`,
+  [validityPackage.id],
+);
+check(
+  validityAfter.expires_on === "2026-12-31" &&
+    creditRowsAfterValidity.total === creditRowsBeforeValidity.total &&
+    validityAudit?.new_expires_on === "2026-12-31",
+  "alterar validade cria auditoria administrativa sem movimentação de crédito",
+);
+
+const futureStartPackage = await assignPackage({
+  student: bruno.id,
+  name: "Início corrigível",
+  credits: 3,
+});
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.admin_update_student_package_start($1,$2,$3,$4) as id`,
+    [futureStartPackage.id, "2026-10-20", "Aluno começa mais tarde", randomUUID()],
+  ),
+);
+const futureStartState = await one(
+  `select starts_on::text as starts_on, status from public.student_packages where id=$1`,
+  [futureStartPackage.id],
+);
+check(
+  futureStartState.starts_on === "2026-10-20" && futureStartState.status === "not_started",
+  "alterar início sem reservas recalcula estado derivado",
+);
+const futureStartReservationLesson = await createLesson({
+  title: "Reserva após início",
+  start: "2026-10-21 17:00+00",
+});
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.reserve_participation_credits($1,$2,$3) as id`,
+    [futureStartReservationLesson.id, bruno.id, futureStartPackage.id],
+  ),
+);
+await mustReject("início não muda depois de existir reserva", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.admin_update_student_package_start($1,$2,$3,$4)`, [
+      futureStartPackage.id,
+      "2026-10-22",
+      "Tentativa tardia",
+      randomUUID(),
+    ]),
+  ),
+);
+
+const originalCreditTx = await one(
+  `select id from public.package_credit_transactions
+   where student_package_id=$1 and type='package_created'
+   order by created_at asc limit 1`,
+  [validityPackage.id],
+);
+const correctionKey = randomUUID();
+const adminCorrection = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.admin_correct_package_credit_transaction($1,$2,$3,$4) as id`,
+    [originalCreditTx.id, -1, "Correção compensatória do ajuste", correctionKey],
+  ),
+);
+const repeatedAdminCorrection = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.admin_correct_package_credit_transaction($1,$2,$3,$4) as id`,
+    [originalCreditTx.id, -1, "Correção compensatória do ajuste", correctionKey],
+  ),
+);
+await mustReject("uma movimentação não recebe segunda correção pela RPC nova", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.admin_correct_package_credit_transaction($1,$2,$3,$4)`, [
+      originalCreditTx.id,
+      -1,
+      "Segunda correção",
+      randomUUID(),
+    ]),
+  ),
+);
+const correctionRows = await rows(
+  `select id, corrects_transaction_id, idempotency_key
+   from public.package_credit_transactions
+   where corrects_transaction_id=$1`,
+  [originalCreditTx.id],
+);
+check(
+  adminCorrection.id === repeatedAdminCorrection.id &&
+    correctionRows.length === 1 &&
+    correctionRows[0].id === adminCorrection.id &&
+    correctionRows[0].idempotency_key === correctionKey,
+  "correção administrativa é compensatória e idempotente",
+);
+
+const packageHistoryRows = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  rows(
+    `select source, event_type, student_package_id
+     from public.teacher_package_history_records
+     where student_package_id in ($1,$2,$3)`,
+    [adminPackage.id, validityPackage.id, futureStartPackage.id],
+  ),
+);
+check(
+  packageHistoryRows.some((row) => row.source === "credit" && row.event_type === "administrative_correction") &&
+    packageHistoryRows.some((row) => row.source === "admin" && row.event_type === "package_cancelled") &&
+    packageHistoryRows.some((row) => row.source === "admin" && row.event_type === "package_validity_changed"),
+  "histórico do professor une livro-razão e eventos administrativos",
+);
+
+const studentPackageAdminHistory = await asDatabaseRole("authenticated", ANA_UID, () =>
+  rows(`select id from public.teacher_package_history_records`),
+);
+check(studentPackageAdminHistory.length === 0, "aluno não consulta histórico administrativo do professor");
+
+const otherTeacherAdminHistory = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  rows(`select id from public.teacher_package_history_records where student_package_id=$1`, [
+    adminPackage.id,
+  ]),
+);
+check(otherTeacherAdminHistory.length === 0, "outro professor não consulta histórico de pacote alheio");
 
 const PREPARED_UNLINKED_UID = "ffffffff-ffff-ffff-ffff-ffffffffffff";
 await createStudentAuthUser(PREPARED_UNLINKED_UID, managedStudent.email);

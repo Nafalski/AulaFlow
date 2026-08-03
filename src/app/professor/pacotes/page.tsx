@@ -1,4 +1,4 @@
-import { PackageCheck, PackagePlus, Ticket } from "lucide-react";
+import { History, PackageCheck, PackagePlus, Ticket } from "lucide-react";
 import type { Metadata } from "next";
 import Link from "next/link";
 
@@ -245,6 +245,9 @@ export default async function TeacherPackagesPage({
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
+          <Link href="/professor/pacotes/historico" className={buttonClasses({ variant: "outline" })}>
+            <History className="size-4.5" aria-hidden="true" /> Histórico
+          </Link>
           <Link href="/professor/pacotes/atribuir" className={buttonClasses({ variant: "accent" })}>
             <PackageCheck className="size-4.5" aria-hidden="true" /> Atribuir pacote
           </Link>

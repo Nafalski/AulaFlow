@@ -6,7 +6,7 @@
 
 **Documento vivo.** Atualizado no fim de cada fase com o que foi realmente construído.
 
-- **Estado atual:** Fases 1, 1.5, 2 e 3 concluídas. A Fase 4 está parcialmente concluída com a **Etapa 1A — modelos reutilizáveis de pacotes**, a **Etapa 1B — atribuição de pacotes aos alunos** e a **Etapa 1C — consulta de pacotes e saldos**; ajustes administrativos e histórico visual completo continuam pendentes.
+- **Estado atual:** Fases 1, 1.5, 2 e 3 concluídas. A Fase 4 está parcialmente concluída com a **Etapa 1A — modelos reutilizáveis de pacotes**, a **Etapa 1B — atribuição de pacotes aos alunos**, a **Etapa 1C — consulta de pacotes e saldos** e a **Etapa 1D — ajustes administrativos e histórico de pacotes**.
 - **Timezone do sistema:** `Europe/Lisbon`
 - **Idioma da interface:** Português (pt-PT)
 
@@ -45,7 +45,7 @@ O que **faltava** e foi acrescentado: a **densidade** de cada área. O `AppShell
 1. `proxy.ts` — verificação otimista: há sessão?
 2. Layouts de área — `requireRole()`, contra a base de dados
 3. GRANTs por coluna — `profiles.role` e `profiles.status` não são escrevíveis pelo cliente
-4. RLS — ativo nas 22 tabelas; policies explícitas onde há acesso de cliente e `default deny` na outbox interna
+4. RLS — ativo nas 23 tabelas; policies explícitas onde há acesso de cliente e `default deny` na outbox interna
 
 ### 1.3 O que foi preciso alterar
 
@@ -127,7 +127,7 @@ Se preferir os caminhos em inglês, a mudança é mecânica — renomear pastas 
                                 ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │                            SUPABASE                              │
-│  22 tabelas · RLS ativo em todas · 17 enums                      │
+│  23 tabelas · RLS ativo em todas · 18 enums                      │
 │  RPCs de créditos (atribuir / reservar / libertar / consumir /   │
 │  transferir / ajustar / corrigir)                                │
 │  Livro-razão imutável de movimentações                           │
@@ -161,7 +161,7 @@ A divisão entre as duas últimas linhas e as primeiras não é duplicação. O 
 | Base de dados | Supabase PostgreSQL | versão do projeto remoto por confirmar | RLS nativo |
 | Autenticação | Supabase Auth + `@supabase/ssr` | 0.12.x | Cookies e renovação geridos pela biblioteca |
 | Validação | Zod | 4.4.x | Um schema para cliente e servidor |
-| Testes (unidade/regressão) | Vitest | 4.1.x | 211 testes |
+| Testes (unidade/regressão) | Vitest | 4.1.x | 231 testes |
 | Testes (esquema) | PGlite | 0.5.x | PostgreSQL em WASM — ver D-14 |
 | Ícones | lucide-react | 1.28.x | |
 | Datas | date-fns + `@date-fns/tz` | 4.4.x | |
@@ -170,7 +170,7 @@ A divisão entre as duas últimas linhas e as primeiras não é duplicação. O 
 
 ## 4. Modelo de dados
 
-**22 tabelas.** As 16 da Fase 1, 4 de pacotes/créditos, `teacher_sports` para as modalidades N:N do perfil profissional e `student_invitations` para o estado administrativo — sem token — da ligação futura.
+**23 tabelas.** As 16 da Fase 1, 4 de pacotes/créditos, `student_package_audit_events` para eventos administrativos de pacotes, `teacher_sports` para as modalidades N:N do perfil profissional e `student_invitations` para o estado administrativo — sem token — da ligação futura.
 
 ### 4.1 Núcleo de créditos
 
@@ -343,7 +343,7 @@ A Fase 3 acrescentou a interface para configurar a política do professor sobre 
 | `proxy.ts` | Verificação otimista de sessão |
 | Layouts de área | `requireRole()` contra a base de dados |
 | GRANTs por coluna | `profiles.role`, `profiles.status`, saldos de pacotes |
-| RLS | Que linhas cada utilizador vê, em todas as 22 tabelas |
+| RLS | Que linhas cada utilizador vê, em todas as 23 tabelas |
 | Funções `SECURITY DEFINER` | Verificam quem chama antes de qualquer escrita |
 
 ### 7.2 Matriz de acesso — pacotes
@@ -445,7 +445,7 @@ A estrutura fica pronta para notificações push (Fase 8).
 | **1.5** | Fundação técnica de pacotes/créditos e PWA, sem interfaces de gestão | **Concluído** |
 | **2** | Perfis, definições e gestão administrativa básica de contas | **Concluído** |
 | **3** | Alunos, turmas, locais, política de cancelamento | **Concluído** |
-| **4** | Pacotes: modelos, atribuição, ajustes, painel de saldo | **Parcialmente concluído** — Etapas 1A, 1B e 1C |
+| **4** | Pacotes: modelos, atribuição, ajustes, painel de saldo | **Parcialmente concluído** — Etapas 1A, 1B, 1C e 1D |
 | **5** | Calendário e criação de aulas, com reserva de créditos | **Planeado** |
 | **6** | Cancelamento, reagendamento, presenças, histórico | **Planeado** |
 | **7** | Área do aluno: aulas, saldo, confirmação de presença | **Planeado** |
@@ -461,8 +461,8 @@ A ordem segue as prioridades pedidas: primeiro a área do professor ao computado
 - 4 tabelas, 5 enums, 7 RPCs de mutação, 1 seletor e funções auxiliares
 - 7 colunas de cobrança em `lesson_participants`, `credit_cost` em `lessons`
 - `lib/domain/packages.ts` — usabilidade, seleção, alertas, decisão de cobrança
-- 57 testes de domínio de pacotes; mantidos na suite atual de 211 testes
-- Garantias de créditos mantidas nas 268 verificações atuais; 25 migrações aplicadas do zero e reaplicadas
+- 57 testes de domínio de pacotes; mantidos na suite atual de 231 testes
+- Garantias de créditos mantidas nas 292 verificações atuais; 26 migrações aplicadas do zero e reaplicadas
 - Larguras por função, navegação responsiva, rotas marcadoras de pacotes, manifesto e ícones PWA
 
 ### Concluído na Etapa 1A — Modelos de pacotes
@@ -498,9 +498,22 @@ A ordem segue as prioridades pedidas: primeiro a área do professor ao computado
 - Migração incremental `20260802001700_phase4_package_read_views.sql`: `teacher_package_records`, `student_package_records` e `student_package_transaction_records`
 - Estratégia de privacidade: aluno consulta views sem valor registado, origem administrativa, observações, autoria, organização, professor, modelo ou saldos internos do livro-razão; a interface também usa seleção explícita de colunas
 - Regras visuais centralizadas em `lib/domain/package-display.ts`: saldo baixo = 1 ou 2 créditos disponíveis; sem saldo = 0; validade próxima = 7 dias ou menos em datas civis `Europe/Lisbon`
-- 13 testes Vitest novos de apresentação e 19 verificações PostgreSQL novas; suite atual com 211 testes e 268 verificações
+- 13 testes Vitest novos de apresentação e 19 verificações PostgreSQL novas naquela entrega
 
-**Não concluído na Fase 4:** ajustes manuais, correções de movimentações, transferência entre pacotes e histórico visual administrativo completo.
+### Concluído na Etapa 1D — Ajustes administrativos e histórico de pacotes
+
+- `/professor/pacotes/atribuicoes/[id]`: painel de ações administrativas compatíveis com o estado do pacote
+- Adicionar créditos e retirar apenas créditos disponíveis por RPC idempotente; o browser nunca envia saldo final
+- Suspensão e reativação explícitas; suspender não altera saldo e reativar recalcula o estado derivado a partir de datas e créditos
+- Cancelamento sem apagar o pacote, bloqueado quando existem créditos reservados pendentes
+- Correção de validade e início com motivo, preservando histórico; alteração de início só antes de reservas ou utilizações
+- Correção de movimentações por lançamento compensatório com `corrects_transaction_id`; a original permanece append-only
+- Migração incremental `20260802001800_phase4_package_admin.sql`: `student_package_audit_events`, idempotência em movimentações administrativas, views `teacher_package_audit_records` e `teacher_package_history_records`, novas RPCs administrativas e correção de datas civis `Europe/Lisbon`
+- `/professor/pacotes/historico`: histórico global com filtros por aluno/pacote, origem, tipo, responsável e período
+- A área do aluno continua somente leitura: não recebe motivos administrativos, autoria privada, saldos antes/depois nem eventos internos
+- 20 testes Vitest novos de validação e 24 verificações PostgreSQL novas; suite atual com 231 testes e 292 verificações
+
+**Não concluído na Fase 4:** transferência/fusão/divisão entre pacotes, expiração automática e integração do ciclo de aulas com reserva/consumo pela interface.
 
 ### Fase 2 — estado por item
 
@@ -544,7 +557,7 @@ A ordem segue as prioridades pedidas: primeiro a área do professor ao computado
 - **Não há upload de avatar.** Não existe bucket de Storage nem política de objetos; a interface usa iniciais e explica a limitação.
 - **Preferências de email não significam entrega automática.** Ficam persistidas, mas outbox/worker e lembretes agendados chegam na Fase 8.
 - **Preparar uma ligação não envia email.** A Fase 3 guarda apenas um estado auditável e sem segredo; entrega real e validação via GoTrue/PostgREST dependem de um Supabase remoto.
-- **A interface de pacotes ainda é parcial.** `/professor/pacotes` gere modelos, atribuição e consulta de saldos; `/aluno/pacotes` mostra os próprios pacotes. Ajustes administrativos, correções, transferências e histórico visual completo continuam pendentes.
+- **A interface de pacotes ainda é parcial.** `/professor/pacotes` gere modelos, atribuição, consulta, ajustes administrativos e histórico; `/aluno/pacotes` mostra os próprios pacotes. Transferências/fusões/divisões e integração com aulas reais continuam pendentes.
 - **A expiração de pacotes não é automática.** `refresh_package_status()` marca `expired` quando é chamada, mas nada corre à meia-noite. Precisa de uma tarefa agendada — Fase 8, com os lembretes.
 - **`credit_expired` e `credit_transferred_*` existem no enum mas não têm função.** Ficam para quando a expiração automática e a transferência entre pacotes forem implementadas (Fase 4).
 - **Não há teste com Supabase real.** O RLS é exercido diretamente como `authenticated`/`anon` no PGlite, mas GoTrue, JWT e PostgREST não existem nesse ambiente.

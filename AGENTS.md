@@ -138,7 +138,8 @@ update public.profiles set role = 'admin' where email = 'voce@exemplo.pt';
 │   ├── ..._phase3_management_functions.sql invariantes e RPCs atómicas da Fase 3
 │   ├── ..._phase4_package_templates.sql Etapa 1A: modelos reutilizáveis
 │   ├── ..._phase4_package_assignment.sql Etapa 1B: atribuição de pacotes
-│   └── ..._phase4_package_read_views.sql Etapa 1C: consulta de pacotes e saldos
+│   ├── ..._phase4_package_read_views.sql Etapa 1C: consulta de pacotes e saldos
+│   └── ..._phase4_package_admin.sql Etapa 1D: ajustes administrativos e histórico
 │
 └── src/
     ├── proxy.ts             Renova a sessão e protege rotas (era middleware.ts)
@@ -302,7 +303,7 @@ npm run typecheck
 
 ### `npm run db:verify`
 
-Executa **todas** as migrações, a partir de uma base vazia, contra PostgreSQL compilado para WebAssembly (PGlite), e volta a aplicá-las para confirmar idempotência. Depois exerce 268 garantias: RLS com papéis `authenticated`/`anon`, isolamento entre organizações e professores, privilégios das RPCs, perfis/claim/bloqueio, convites sem segredo, alunos, turmas, locais, modelos, atribuição e consulta de pacotes, políticas, reserva, consumo, libertação, reagendamento, exceções, correções, imutabilidade do livro-razão e constraints herdadas das aulas.
+Executa **todas** as migrações, a partir de uma base vazia, contra PostgreSQL compilado para WebAssembly (PGlite), e volta a aplicá-las para confirmar idempotência. Depois exerce 292 garantias: RLS com papéis `authenticated`/`anon`, isolamento entre organizações e professores, privilégios das RPCs, perfis/claim/bloqueio, convites sem segredo, alunos, turmas, locais, modelos, atribuição, consulta e ajustes administrativos de pacotes, políticas, reserva, consumo, libertação, reagendamento, exceções, correções, imutabilidade do livro-razão e constraints herdadas das aulas.
 
 Corre em segundos, sem Docker e sem projeto na nuvem — serve para o CI.
 
@@ -341,8 +342,13 @@ O frontend e as Server Actions **nunca** fazem `INSERT` direto em `student_packa
 | Libertar uma reserva | `release_participation_credits()` |
 | Consumir uma reserva | `consume_participation_credits()` |
 | Transferir num reagendamento | `transfer_participation_reservation()` |
-| Ajuste administrativo | `adjust_package_credits()` |
-| Corrigir uma movimentação | `correct_package_credit_transaction()` |
+| Ajuste administrativo pela interface | `admin_adjust_package_credits()` |
+| Corrigir uma movimentação pela interface | `admin_correct_package_credit_transaction()` |
+| Suspender pacote | `admin_suspend_student_package()` |
+| Reativar pacote | `admin_reactivate_student_package()` |
+| Cancelar pacote | `admin_cancel_student_package()` |
+| Alterar validade | `admin_update_student_package_validity()` |
+| Alterar início | `admin_update_student_package_start()` |
 
 Não copiar esta lógica para React, para o browser ou para várias Server Actions. As RPCs de mutação validam sessão ativa, organização, proprietário, modalidade, estado/validade do pacote, estado da aula e saldo. Toda a **alteração de saldo** bloqueia as linhas relevantes e regista a movimentação na mesma transação. O seletor apenas lê; a transferência de reagendamento não cria movimento porque nenhum saldo muda.
 
@@ -381,6 +387,17 @@ Regras visuais da Etapa 1C:
 
 Estas regras vivem em `lib/domain/package-display.ts` e são partilhadas entre professor e aluno.
 
+#### Ajustes administrativos e histórico (Etapa 1D)
+
+- O professor ajusta pacotes em `/professor/pacotes/atribuicoes/[id]`; a lista global fica em `/professor/pacotes/historico`.
+- Adicionar/remover créditos escreve em `package_credit_transactions` com `idempotency_key`; remoção só toca créditos disponíveis.
+- Suspensão, reativação, cancelamento e alterações de datas escrevem em `student_package_audit_events`, append-only, e não criam movimentações de crédito de quantidade zero.
+- Reativar usa `resolve_student_package_status()`; o professor não escolhe estados derivados como `active`, `expired` ou `depleted`.
+- Cancelar é bloqueado quando existem créditos reservados; não apaga pacote, saldo ou histórico.
+- Alterar início só é permitido antes de haver créditos reservados ou utilizados.
+- A área do aluno continua sem motivos administrativos, autoria privada e saldos antes/depois.
+- Datas civis de pacotes usam `Europe/Lisbon`; não usar `current_date` do servidor para derivar estado de pacote.
+
 #### RLS e exceções
 
 - Alunos leem apenas os próprios pacotes e movimentos; professores, apenas a sua organização; administradores têm leitura global.
@@ -407,7 +424,7 @@ As linhas são declaradas com `type`, **nunca com `interface`**. Um `interface` 
 
 Vitest, ambiente Node, `TZ=Europe/Lisbon` fixo para que um teste que passa localmente passe também no CI (que corre em UTC).
 
-Cobertura atual: **211 testes** em doze ficheiros — testes de domínio, regressões de respostas/autenticação do proxy, formulários da Fase 2, validação/normalização da gestão da Fase 3, modelos, atribuição e apresentação de pacotes.
+Cobertura atual: **231 testes** em treze ficheiros — testes de domínio, regressões de respostas/autenticação do proxy, formulários da Fase 2, validação/normalização da gestão da Fase 3, modelos, atribuição, apresentação e ajustes administrativos de pacotes.
 
 Os testes de domínio exercem funções puras, sem base de dados nem mocks. Os testes de validação garantem normalização, limites, identificadores, estados, valores monetários em cêntimos, datas civis e rejeição de campos extra/protegidos. A integração SQL fica separada em `db:verify`.
 
@@ -429,7 +446,7 @@ Não existe um comando de formatação separado. Use `npm run lint:fix` apenas p
 | 1.5 | Fundação técnica de pacotes/créditos e PWA, sem interfaces de gestão | **Concluído** |
 | 2 | Perfis, definições e gestão administrativa básica de contas | **Concluído** |
 | 3 | Alunos, turmas, locais, política de cancelamento | **Concluído** |
-| 4 | Interfaces de modelos, atribuição, ajustes e saldos | **Parcialmente concluído** — Etapas 1A, 1B e 1C |
+| 4 | Interfaces de modelos, atribuição, ajustes e saldos | **Parcialmente concluído** — Etapas 1A, 1B, 1C e 1D |
 | 5 | Calendário e criação de aulas com reserva | **Planeado** |
 | 6 | Cancelamento, reagendamento, presenças e histórico | **Planeado** |
 | 7 | Área do aluno: aulas, créditos e confirmação | **Planeado** |

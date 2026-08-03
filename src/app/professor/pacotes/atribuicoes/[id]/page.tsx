@@ -2,6 +2,7 @@ import {
   ArrowLeft,
   CalendarDays,
   Euro,
+  History,
   PackageOpen,
   StickyNote,
   Ticket,
@@ -13,6 +14,7 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 
 import { PackageBalanceBar } from "@/components/package-assignments/teacher-package-list";
+import { PackageAdminActions } from "@/components/package-admin/package-admin-actions";
 import { Alert } from "@/components/ui/alert";
 import { buttonClasses } from "@/components/ui/button";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
@@ -29,7 +31,7 @@ import { requireRole } from "@/lib/auth/session";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { studentPackageIdSchema } from "@/lib/validation/package-assignments";
 import { formatEuroCents } from "@/lib/validation/package-templates";
-import type { CreditTransactionType } from "@/types/database";
+import type { CreditTransactionType, PackageAuditEventType } from "@/types/database";
 
 export const metadata: Metadata = { title: "Detalhe do pacote" };
 export const dynamic = "force-dynamic";
@@ -37,7 +39,9 @@ export const dynamic = "force-dynamic";
 const PACKAGE_COLUMNS =
   "id, student_id, student_name, student_email, template_name, name, sport_name, initial_credits, credits_total, credits_available, credits_reserved, credits_used, purchased_at, starts_on, expires_on, status, paid_amount_cents, currency, notes, origin, created_by_name, created_at, updated_at";
 const TRANSACTION_COLUMNS =
-  "id, type, quantity, available_before, reserved_before, used_before, available_after, reserved_after, used_after, reason, created_at";
+  "id, type, quantity, corrects_transaction_id, created_at";
+const HISTORY_COLUMNS =
+  "id, source, event_type, quantity, available_after, reserved_after, used_after, reason, performed_by_name, previous_values, new_values, corrects_transaction_id, created_at";
 
 const TRANSACTION_LABELS: Record<CreditTransactionType, string> = {
   package_created: "Pacote atribuído",
@@ -53,8 +57,24 @@ const TRANSACTION_LABELS: Record<CreditTransactionType, string> = {
   exception_authorized: "Exceção autorizada",
 };
 
+const AUDIT_EVENT_LABELS: Record<PackageAuditEventType, string> = {
+  package_suspended: "Pacote suspenso",
+  package_reactivated: "Pacote reativado",
+  package_cancelled: "Pacote cancelado",
+  package_validity_changed: "Validade alterada",
+  package_start_changed: "Início alterado",
+};
+
 function dateLabel(value: string | null): string {
   return value ? formatFullDate(`${value}T12:00:00.000Z`) : "Sem validade";
+}
+
+function eventLabel(value: string): string {
+  return (
+    TRANSACTION_LABELS[value as CreditTransactionType] ??
+    AUDIT_EVENT_LABELS[value as PackageAuditEventType] ??
+    value
+  );
 }
 
 export default async function AssignedPackagePage({
@@ -86,23 +106,64 @@ export default async function AssignedPackagePage({
   }
   if (!pack) notFound();
 
+  const { data: history, error: historyError } = await supabase
+    .from("teacher_package_history_records")
+    .select(HISTORY_COLUMNS)
+    .eq("student_package_id", pack.id)
+    .order("created_at", { ascending: false })
+    .limit(30);
+
+  if (historyError) {
+    console.error("[AulaFlow] Falha ao carregar histórico do pacote.", historyError);
+    throw new Error("Não foi possível carregar o histórico do pacote.");
+  }
+
   const { data: transactions, error: transactionError } = await supabase
     .from("package_credit_transactions")
     .select(TRANSACTION_COLUMNS)
     .eq("student_package_id", pack.id)
     .order("created_at", { ascending: false })
-    .limit(8);
+    .limit(80);
 
   if (transactionError) {
     console.error("[AulaFlow] Falha ao carregar movimentações do pacote.", transactionError);
-    throw new Error("Não foi possível carregar o histórico básico do pacote.");
+    throw new Error("Não foi possível carregar as movimentações corrigíveis do pacote.");
   }
+
+  const correctedTransactionIds = new Set(
+    (transactions ?? [])
+      .map((transaction) => transaction.corrects_transaction_id)
+      .filter((value): value is string => Boolean(value)),
+  );
+  const correctableTransactions = (transactions ?? [])
+    .filter(
+      (transaction) =>
+        ["package_created", "credit_added_manually", "credit_removed_manually"].includes(
+          transaction.type,
+        ) && !correctedTransactionIds.has(transaction.id),
+    )
+    .map((transaction) => ({
+      id: transaction.id,
+      type: transaction.type,
+      quantity: transaction.quantity,
+      createdAt: transaction.created_at,
+    }));
 
   const query = await searchParams;
   const created = query.criado === "1";
   const today = lisbonDateKey(new Date());
   const expiryLabel = expiryAttentionLabel(expiryAttention(pack.expires_on, today));
-  const lastRelevantUpdate = transactions?.[0]?.created_at ?? pack.updated_at;
+  const lastRelevantUpdate = history?.[0]?.created_at ?? pack.updated_at;
+  const idempotencyKeys = {
+    addCredits: crypto.randomUUID(),
+    removeCredits: crypto.randomUUID(),
+    suspend: crypto.randomUUID(),
+    reactivate: crypto.randomUUID(),
+    cancel: crypto.randomUUID(),
+    validity: crypto.randomUUID(),
+    startDate: crypto.randomUUID(),
+    correction: crypto.randomUUID(),
+  };
 
   return (
     <div className="flex flex-col gap-6">
@@ -134,7 +195,7 @@ export default async function AssignedPackagePage({
         <Card>
           <CardHeader
             title="Detalhe do pacote"
-            description="Consulta administrativa. Ajustes chegam na Etapa 1D."
+            description="Consulta administrativa do pacote atribuído."
           />
           <CardBody>
             <dl className="grid gap-5 sm:grid-cols-2">
@@ -211,42 +272,87 @@ export default async function AssignedPackagePage({
               total={pack.initial_credits}
             />
             <p className="mt-4 text-sm text-muted">
-              Ajustes administrativos e histórico completo serão tratados na Etapa 1D.
+              O total atual inclui ajustes administrativos; a quantidade inicial é preservada para auditoria.
             </p>
           </CardBody>
         </Card>
       </div>
 
+      <PackageAdminActions
+        pack={{
+          id: pack.id,
+          name: pack.name,
+          status: pack.status,
+          creditsAvailable: pack.credits_available,
+          creditsReserved: pack.credits_reserved,
+          creditsUsed: pack.credits_used,
+          startsOn: pack.starts_on,
+          expiresOn: pack.expires_on,
+        }}
+        correctableTransactions={correctableTransactions}
+        idempotencyKeys={idempotencyKeys}
+      />
+
       <Card variant="plain">
         <CardHeader
-          title="Histórico básico"
-          description="Últimas movimentações registadas, em modo de consulta."
+          title="Histórico completo"
+          description="Movimentos de crédito e eventos administrativos deste pacote."
+          action={
+            <Link
+              href={`/professor/pacotes/historico?search=${encodeURIComponent(pack.student_name)}`}
+              className={buttonClasses({ variant: "ghost", size: "sm" })}
+            >
+              <History className="size-4" aria-hidden="true" />
+              Ver global
+            </Link>
+          }
         />
         <CardBody>
-          {transactions && transactions.length > 0 ? (
+          {history && history.length > 0 ? (
             <div className="overflow-hidden rounded-[var(--radius-card)] border border-line">
               <table className="w-full border-collapse text-left text-sm">
                 <thead className="bg-sand-deep text-xs tracking-wide text-muted uppercase">
                   <tr>
-                    <th scope="col" className="px-4 py-3 font-bold">Movimento</th>
+                    <th scope="col" className="px-4 py-3 font-bold">Registo</th>
                     <th scope="col" className="px-4 py-3 font-bold">Quantidade</th>
-                    <th scope="col" className="px-4 py-3 font-bold">Saldo depois</th>
+                    <th scope="col" className="px-4 py-3 font-bold">Detalhe</th>
                     <th scope="col" className="px-4 py-3 font-bold">Data</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-line">
-                  {transactions.map((transaction) => (
-                    <tr key={transaction.id}>
+                  {history.map((event) => (
+                    <tr key={`${event.source}-${event.id}`}>
                       <td className="px-4 py-3 font-bold text-ink">
-                        {TRANSACTION_LABELS[transaction.type]}
-                      </td>
-                      <td className="px-4 py-3 text-ink-soft">{transaction.quantity}</td>
-                      <td className="px-4 py-3 text-ink-soft">
-                        {transaction.available_after} disp. · {transaction.reserved_after} res. ·{" "}
-                        {transaction.used_after} util.
+                        {eventLabel(event.event_type)}
+                        <span className="block text-xs font-semibold text-muted">
+                          {event.source === "credit" ? "Crédito" : "Administrativo"}
+                        </span>
                       </td>
                       <td className="px-4 py-3 text-ink-soft">
-                        {formatFullDate(transaction.created_at)}
+                        {event.quantity ?? "—"}
+                      </td>
+                      <td className="px-4 py-3 text-ink-soft">
+                        {event.source === "credit" ? (
+                          <>
+                            {event.available_after} disp. · {event.reserved_after} res. ·{" "}
+                            {event.used_after} util.
+                            {event.corrects_transaction_id && (
+                              <span className="block text-xs text-muted">Correção compensatória</span>
+                            )}
+                          </>
+                        ) : (
+                          <>
+                            {event.reason}
+                            {event.performed_by_name && (
+                              <span className="block text-xs text-muted">
+                                Por {event.performed_by_name}
+                              </span>
+                            )}
+                          </>
+                        )}
+                      </td>
+                      <td className="px-4 py-3 text-ink-soft">
+                        {formatFullDate(event.created_at)}
                       </td>
                     </tr>
                   ))}
@@ -254,7 +360,7 @@ export default async function AssignedPackagePage({
               </table>
             </div>
           ) : (
-            <p className="text-sm text-muted">Ainda não há movimentações visíveis para este pacote.</p>
+            <p className="text-sm text-muted">Ainda não há histórico visível para este pacote.</p>
           )}
         </CardBody>
       </Card>
