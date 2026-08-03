@@ -23,6 +23,7 @@
 # misc
 .DS_Store
 *.pem
+/AulaFlow/
 
 # debug
 npm-debug.log*
