@@ -1,30 +1,31 @@
-import {
-  Bell,
-  CalendarDays,
-  CalendarRange,
-  History,
-  LayoutDashboard,
-  MapPin,
-  Settings,
-  ShieldCheck,
-  Ticket,
-  UserCircle,
-  Users,
-  UsersRound,
-} from "lucide-react";
-import type { LucideIcon } from "lucide-react";
-
 import type { UserRole } from "@/types/database";
 
-export interface NavItem {
+export const NAV_ICON_KEYS = [
+  "bell",
+  "calendar",
+  "calendarRange",
+  "dashboard",
+  "history",
+  "locations",
+  "packages",
+  "profile",
+  "settings",
+  "shield",
+  "students",
+  "groups",
+] as const;
+
+export type NavIconKey = (typeof NAV_ICON_KEYS)[number];
+
+export type NavItem = {
   href: string;
   label: string;
   /** Rótulo curto para a barra inferior, onde o espaço é de ~70px. */
   shortLabel?: string;
-  icon: LucideIcon;
+  iconKey: NavIconKey;
   /** Aparece na barra inferior do telemóvel. Máximo 5 por área. */
   primary?: boolean;
-}
+};
 
 /**
  * Navegação por tipo de conta.
@@ -35,38 +36,62 @@ export interface NavItem {
  * menu «Mais» da barra inferior.
  */
 
-const TEACHER_NAV: NavItem[] = [
-  { href: "/professor", label: "Painel", icon: LayoutDashboard, primary: true },
-  { href: "/professor/calendario", label: "Calendário", icon: CalendarDays, primary: true },
-  { href: "/professor/alunos", label: "Alunos", icon: Users, primary: true },
-  { href: "/professor/pacotes", label: "Pacotes", icon: Ticket, primary: true },
-  { href: "/professor/grupos", label: "Turmas", icon: UsersRound },
-  { href: "/professor/locais", label: "Locais", icon: MapPin },
-  { href: "/professor/historico", label: "Histórico", icon: History },
-  { href: "/professor/notificacoes", label: "Avisos", icon: Bell },
+const TEACHER_NAV = [
+  { href: "/professor", label: "Painel", iconKey: "dashboard", primary: true },
+  { href: "/professor/calendario", label: "Calendário", iconKey: "calendar", primary: true },
+  { href: "/professor/alunos", label: "Alunos", iconKey: "students", primary: true },
+  { href: "/professor/pacotes", label: "Pacotes", iconKey: "packages", primary: true },
+  { href: "/professor/grupos", label: "Turmas", iconKey: "groups" },
+  { href: "/professor/locais", label: "Locais", iconKey: "locations" },
+  { href: "/professor/historico", label: "Histórico", iconKey: "history" },
+  { href: "/professor/notificacoes", label: "Avisos", iconKey: "bell" },
   {
     href: "/professor/definicoes",
     label: "Definições",
-    icon: Settings,
+    iconKey: "settings",
   },
-];
+] as const satisfies readonly NavItem[];
 
-const STUDENT_NAV: NavItem[] = [
-  { href: "/aluno", label: "Próximas aulas", shortLabel: "Aulas", icon: CalendarDays, primary: true },
-  { href: "/aluno/calendario", label: "Calendário", shortLabel: "Agenda", icon: CalendarRange, primary: true },
-  { href: "/aluno/pacotes", label: "Os meus créditos", shortLabel: "Créditos", icon: Ticket, primary: true },
-  { href: "/aluno/notificacoes", label: "Avisos", icon: Bell, primary: true },
-  { href: "/aluno/perfil", label: "Perfil", icon: UserCircle },
-  { href: "/aluno/historico", label: "Histórico", icon: History },
-];
+const STUDENT_NAV = [
+  {
+    href: "/aluno",
+    label: "Próximas aulas",
+    shortLabel: "Aulas",
+    iconKey: "calendar",
+    primary: true,
+  },
+  {
+    href: "/aluno/calendario",
+    label: "Calendário",
+    shortLabel: "Agenda",
+    iconKey: "calendarRange",
+    primary: true,
+  },
+  {
+    href: "/aluno/pacotes",
+    label: "Os meus créditos",
+    shortLabel: "Créditos",
+    iconKey: "packages",
+    primary: true,
+  },
+  { href: "/aluno/notificacoes", label: "Avisos", iconKey: "bell", primary: true },
+  { href: "/aluno/perfil", label: "Perfil", iconKey: "profile" },
+  { href: "/aluno/historico", label: "Histórico", iconKey: "history" },
+] as const satisfies readonly NavItem[];
 
-const ADMIN_NAV: NavItem[] = [
-  { href: "/admin", label: "Visão geral", shortLabel: "Geral", icon: ShieldCheck, primary: true },
-  { href: "/admin/professores", label: "Professores", icon: Users, primary: true },
-  { href: "/admin/utilizadores", label: "Utilizadores", shortLabel: "Contas", icon: UsersRound, primary: true },
-];
+const ADMIN_NAV = [
+  { href: "/admin", label: "Visão geral", shortLabel: "Geral", iconKey: "shield", primary: true },
+  { href: "/admin/professores", label: "Professores", iconKey: "students", primary: true },
+  {
+    href: "/admin/utilizadores",
+    label: "Utilizadores",
+    shortLabel: "Contas",
+    iconKey: "groups",
+    primary: true,
+  },
+] as const satisfies readonly NavItem[];
 
-export function navItemsForRole(role: UserRole): NavItem[] {
+export function navItemsForRole(role: UserRole): readonly NavItem[] {
   switch (role) {
     case "teacher":
       return TEACHER_NAV;

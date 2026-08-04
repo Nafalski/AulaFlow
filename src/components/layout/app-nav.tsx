@@ -1,19 +1,49 @@
 "use client";
 
-import { Ellipsis } from "lucide-react";
+import {
+  Bell,
+  CalendarDays,
+  CalendarRange,
+  Ellipsis,
+  History,
+  LayoutDashboard,
+  MapPin,
+  Settings,
+  ShieldCheck,
+  Ticket,
+  UserCircle,
+  Users,
+  UsersRound,
+} from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import type { MouseEvent } from "react";
 
-import type { NavItem } from "./nav-items";
+import type { NavIconKey, NavItem } from "./nav-items";
 import { cn } from "@/lib/utils";
+
+const NAV_ICONS = {
+  bell: Bell,
+  calendar: CalendarDays,
+  calendarRange: CalendarRange,
+  dashboard: LayoutDashboard,
+  history: History,
+  locations: MapPin,
+  packages: Ticket,
+  profile: UserCircle,
+  settings: Settings,
+  shield: ShieldCheck,
+  students: Users,
+  groups: UsersRound,
+} satisfies Record<NavIconKey, LucideIcon>;
 
 /**
  * Um item está ativo se for a rota exata, ou se a rota atual estiver dentro
  * dele. A raiz de cada área ("/professor") é caso à parte: sem a comparação
  * exata, ficaria acesa em todos os ecrãs.
  */
-function isActive(pathname: string, href: string, roots: string[]): boolean {
+function isActive(pathname: string, href: string, roots: readonly string[]): boolean {
   if (roots.includes(href)) return pathname === href;
   return pathname === href || pathname.startsWith(`${href}/`);
 }
@@ -22,7 +52,13 @@ function closeMoreMenu(event: MouseEvent<HTMLAnchorElement>) {
   event.currentTarget.closest("details")?.removeAttribute("open");
 }
 
-export function BottomNav({ items, roots }: { items: NavItem[]; roots: string[] }) {
+export function BottomNav({
+  items,
+  roots,
+}: {
+  items: readonly NavItem[];
+  roots: readonly string[];
+}) {
   const pathname = usePathname();
   const primaryCandidates = items.filter((item) => item.primary);
   const needsMore = items.some((item) => !item.primary) || primaryCandidates.length > 5;
@@ -39,7 +75,7 @@ export function BottomNav({ items, roots }: { items: NavItem[]; roots: string[] 
       <ul className="flex items-stretch justify-around px-1 pt-1.5">
         {directItems.map((item) => {
           const active = isActive(pathname, item.href, roots);
-          const Icon = item.icon;
+          const Icon = NAV_ICONS[item.iconKey];
 
           return (
             <li key={item.href} className="flex-1">
@@ -80,7 +116,7 @@ export function BottomNav({ items, roots }: { items: NavItem[]; roots: string[] 
                 <ul className="flex flex-col gap-0.5" aria-label="Mais páginas">
                   {moreItems.map((item) => {
                     const active = isActive(pathname, item.href, roots);
-                    const Icon = item.icon;
+                    const Icon = NAV_ICONS[item.iconKey];
 
                     return (
                       <li key={item.href}>
@@ -119,7 +155,7 @@ export function BottomNav({ items, roots }: { items: NavItem[]; roots: string[] 
  * diferentes. O item mais específico ganha, para que `/professor/alunos/123`
  * mostre "Alunos" e não "Painel".
  */
-export function PageTitle({ items, fallback }: { items: NavItem[]; fallback: string }) {
+export function PageTitle({ items, fallback }: { items: readonly NavItem[]; fallback: string }) {
   const pathname = usePathname();
 
   const match = items
@@ -133,14 +169,20 @@ export function PageTitle({ items, fallback }: { items: NavItem[]; fallback: str
   );
 }
 
-export function Sidebar({ items, roots }: { items: NavItem[]; roots: string[] }) {
+export function Sidebar({
+  items,
+  roots,
+}: {
+  items: readonly NavItem[];
+  roots: readonly string[];
+}) {
   const pathname = usePathname();
 
   return (
     <nav aria-label="Navegação principal" className="flex flex-col gap-0.5">
       {items.map((item) => {
         const active = isActive(pathname, item.href, roots);
-        const Icon = item.icon;
+        const Icon = NAV_ICONS[item.iconKey];
 
         return (
           <Link
