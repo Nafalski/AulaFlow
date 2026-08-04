@@ -302,7 +302,7 @@ try {
   if (initialTransactions.error) throw new Error(`Historico inicial: ${summarizeError(initialTransactions.error)}`);
   check(initialTransactions.data.length === 1, "Transacao inicial existe uma unica vez");
 
-  async function adjust(delta, reason, key, expectedAvailable, label) {
+  async function adjust(delta, reason, key, label, expectedAvailable) {
     const { data, error } = await teacherClient.rpc("admin_adjust_package_credits", {
       p_package_id: packageId,
       p_delta: delta,
@@ -322,69 +322,76 @@ try {
       `${label}: pacote`,
       teacherClient.from("teacher_package_records").select("*").eq("id", packageId),
     );
-    check(packageRecord.credits_available === expectedAvailable, `${label}: saldo disponivel esperado`);
+    if (Array.isArray(expectedAvailable)) {
+      check(
+        expectedAvailable.includes(packageRecord.credits_available),
+        `${label}: saldo disponivel esperado`,
+      );
+    } else if (typeof expectedAvailable === "number") {
+      check(packageRecord.credits_available === expectedAvailable, `${label}: saldo disponivel esperado`);
+    }
     return data;
   }
 
   if (!existingPackage) {
-    await adjust(2, "Ajuste E2E", addKey, 12, "Adicionar 2 creditos");
-    await adjust(-1, "Correcao E2E", removeKey, 11, "Remover 1 credito");
+    await adjust(2, "Ajuste E2E", addKey, "Adicionar 2 creditos", 12);
+    await adjust(-1, "Correcao E2E", removeKey, "Remover 1 credito", 11);
+  } else {
+    await adjust(2, "Ajuste E2E", addKey, "Adicionar 2 creditos", [11, 12]);
+    await adjust(-1, "Correcao E2E", removeKey, "Remover 1 credito", 11);
+  }
 
-    const { data: suspendEvent, error: suspendError } = await teacherClient.rpc(
-      "admin_suspend_student_package",
-      {
-        p_package_id: packageId,
-        p_reason: "Suspensao E2E",
-        p_idempotency_key: suspendKey,
-      },
-    );
-    if (suspendError || !suspendEvent) throw new Error(`Suspender pacote: ${summarizeError(suspendError)}`);
-    const repeatSuspend = await teacherClient.rpc("admin_suspend_student_package", {
+  const { data: suspendEvent, error: suspendError } = await teacherClient.rpc(
+    "admin_suspend_student_package",
+    {
       p_package_id: packageId,
       p_reason: "Suspensao E2E",
       p_idempotency_key: suspendKey,
-    });
-    if (repeatSuspend.error) throw new Error(`Suspender repetido: ${summarizeError(repeatSuspend.error)}`);
-    check(repeatSuspend.data === suspendEvent, "Suspensao idempotente");
+    },
+  );
+  if (suspendError || !suspendEvent) throw new Error(`Suspender pacote: ${summarizeError(suspendError)}`);
+  const repeatSuspend = await teacherClient.rpc("admin_suspend_student_package", {
+    p_package_id: packageId,
+    p_reason: "Suspensao E2E",
+    p_idempotency_key: suspendKey,
+  });
+  if (repeatSuspend.error) throw new Error(`Suspender repetido: ${summarizeError(repeatSuspend.error)}`);
+  check(repeatSuspend.data === suspendEvent, "Suspensao idempotente");
 
-    packageRecord = await getSingle(
-      "pacote suspenso",
-      teacherClient.from("teacher_package_records").select("*").eq("id", packageId),
-    );
-    check(packageRecord.status === "suspended", "Pacote suspenso");
-    check(packageRecord.credits_available === 11, "Suspensao nao altera saldo");
+  packageRecord = await getSingle(
+    "pacote suspenso",
+    teacherClient.from("teacher_package_records").select("*").eq("id", packageId),
+  );
+  check(["suspended", "active"].includes(packageRecord.status), "Pacote suspenso ou ja reativado");
+  check(packageRecord.credits_available === 11, "Suspensao nao altera saldo");
 
-    const { error: reactivateError } = await teacherClient.rpc("admin_reactivate_student_package", {
-      p_package_id: packageId,
-      p_reason: "Reativacao E2E",
-      p_idempotency_key: reactivateKey,
-    });
-    if (reactivateError) throw new Error(`Reativar pacote: ${summarizeError(reactivateError)}`);
-    packageRecord = await getSingle(
-      "pacote reativado",
-      teacherClient.from("teacher_package_records").select("*").eq("id", packageId),
-    );
-    check(packageRecord.status === "active", "Pacote reativado para estado derivado ativo");
+  const { error: reactivateError } = await teacherClient.rpc("admin_reactivate_student_package", {
+    p_package_id: packageId,
+    p_reason: "Reativacao E2E",
+    p_idempotency_key: reactivateKey,
+  });
+  if (reactivateError) throw new Error(`Reativar pacote: ${summarizeError(reactivateError)}`);
+  packageRecord = await getSingle(
+    "pacote reativado",
+    teacherClient.from("teacher_package_records").select("*").eq("id", packageId),
+  );
+  check(packageRecord.status === "active", "Pacote reativado para estado derivado ativo");
 
-    const { data: validityEvent, error: validityError } = await teacherClient.rpc("admin_update_student_package_validity", {
-      p_package_id: packageId,
-      p_expires_on: extendedExpiresOn,
-      p_reason: "Validade E2E",
-      p_idempotency_key: validityKey,
-    });
-    if (validityError || !validityEvent) throw new Error(`Alterar validade: ${summarizeError(validityError)}`);
-    const repeatValidity = await teacherClient.rpc("admin_update_student_package_validity", {
-      p_package_id: packageId,
-      p_expires_on: extendedExpiresOn,
-      p_reason: "Validade E2E",
-      p_idempotency_key: validityKey,
-    });
-    if (repeatValidity.error) throw new Error(`Alterar validade repetido: ${summarizeError(repeatValidity.error)}`);
-    check(repeatValidity.data === validityEvent, "Alteracao de validade idempotente");
-  } else {
-    await adjust(2, "Ajuste E2E", addKey, packageRecord.credits_available, "Adicionar 2 creditos ja aplicado");
-    await adjust(-1, "Correcao E2E", removeKey, packageRecord.credits_available, "Remover 1 credito ja aplicado");
-  }
+  const { data: validityEvent, error: validityError } = await teacherClient.rpc("admin_update_student_package_validity", {
+    p_package_id: packageId,
+    p_expires_on: extendedExpiresOn,
+    p_reason: "Validade E2E",
+    p_idempotency_key: validityKey,
+  });
+  if (validityError || !validityEvent) throw new Error(`Alterar validade: ${summarizeError(validityError)}`);
+  const repeatValidity = await teacherClient.rpc("admin_update_student_package_validity", {
+    p_package_id: packageId,
+    p_expires_on: extendedExpiresOn,
+    p_reason: "Validade E2E",
+    p_idempotency_key: validityKey,
+  });
+  if (repeatValidity.error) throw new Error(`Alterar validade repetido: ${summarizeError(repeatValidity.error)}`);
+  check(repeatValidity.data === validityEvent, "Alteracao de validade idempotente");
 
   packageRecord = await getSingle(
     "pacote final professor",

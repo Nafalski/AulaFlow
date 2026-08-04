@@ -9,9 +9,8 @@
  *
  *   npm run db:verify:remote -- --confirm-development
  *
- * Limite deliberado: isto nao substitui o cenario ponta a ponta com contas
- * reais via Auth/PostgREST. Esse fluxo ainda exige utilizadores de teste e a
- * configuracao manual do Auth no painel Supabase.
+ * Limite deliberado: isto nao substitui `db:verify:auth` nem a validacao em
+ * browser com contas reais. Use esses passos para fechar um fluxo ponta a ponta.
  */
 
 import { spawnSync } from "node:child_process";
@@ -577,4 +576,4 @@ if (failures > 0) {
 }
 
 console.log("\nVerificacao remota estrutural concluida sem falhas.");
-console.log("Nota: Auth/PostgREST e cenario ponta a ponta com contas reais continuam manuais.");
+console.log("Nota: Auth/PostgREST com contas reais e validado por `npm run db:verify:auth -- --confirm-development`.");

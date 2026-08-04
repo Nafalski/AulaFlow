@@ -6,7 +6,7 @@
 
 **Documento vivo.** Atualizado no fim de cada fase com o que foi realmente construído.
 
-- **Estado atual:** Fases 1, 1.5, 2 e 3 concluídas. A Fase 4 está parcialmente concluída com a **Etapa 1A — modelos reutilizáveis de pacotes**, a **Etapa 1B — atribuição de pacotes aos alunos**, a **Etapa 1C — consulta de pacotes e saldos**, a **Etapa 1D — ajustes administrativos e histórico de pacotes** e a **Etapa 1E — revisão integrada**, já com migrações sincronizadas no Supabase remoto, verificação estrutural remota automatizada e scripts Auth/PostgREST reais preparados. A execução do cenário real com contas de teste e browser ainda está pendente de credenciais E2E locais, portanto a Fase 4 ainda não deve ser marcada como concluída.
+- **Estado atual:** Fases 1, 1.5, 2, 3 e 4 concluídas. A Fase 4 fechou modelos reutilizáveis de pacotes, atribuição aos alunos, consulta de saldos, ajustes administrativos, histórico e a **Etapa 1E — revisão integrada**, validada com Supabase remoto, Auth real, PostgREST real e navegador em desktop/mobile.
 - **Timezone do sistema:** `Europe/Lisbon`
 - **Idioma da interface:** Português (pt-PT)
 
@@ -161,7 +161,7 @@ A divisão entre as duas últimas linhas e as primeiras não é duplicação. O 
 | Base de dados | Supabase PostgreSQL | versão do projeto remoto por confirmar | RLS nativo |
 | Autenticação | Supabase Auth + `@supabase/ssr` | 0.12.x | Cookies e renovação geridos pela biblioteca |
 | Validação | Zod | 4.4.x | Um schema para cliente e servidor |
-| Testes (unidade/regressão) | Vitest | 4.1.x | 231 testes |
+| Testes (unidade/regressão) | Vitest | 4.1.x | 234 testes |
 | Testes (esquema) | PGlite | 0.5.x | PostgreSQL em WASM — ver D-14 |
 | Ícones | lucide-react | 1.28.x | |
 | Datas | date-fns + `@date-fns/tz` | 4.4.x | |
@@ -399,7 +399,7 @@ Contas bloqueadas conservam apenas a leitura da própria linha de `profiles`, ne
 | Conta bloqueada conservar acesso por RLS | Mitigado — helpers de identidade exigem `status = 'active'` e a RPC deixa auditoria |
 | Chave `service_role` no cliente | Mitigado — `import "server-only"` falha na compilação |
 | Página autenticada servida como estática | Mitigado — `dynamic = "force-dynamic"` nos layouts |
-| Isolamento por RLS | Verificado diretamente no PostgreSQL — `db:verify` troca para `authenticated`/`anon`. JWT/PostgREST reais continuam pendentes na Fase 9 |
+| Isolamento por RLS | Verificado diretamente no PostgreSQL — `db:verify` troca para `authenticated`/`anon`. A Etapa 1E também valida JWT/PostgREST reais no Supabase remoto |
 
 ---
 
@@ -445,12 +445,12 @@ A estrutura fica pronta para notificações push (Fase 8).
 | **1.5** | Fundação técnica de pacotes/créditos e PWA, sem interfaces de gestão | **Concluído** |
 | **2** | Perfis, definições e gestão administrativa básica de contas | **Concluído** |
 | **3** | Alunos, turmas, locais, política de cancelamento | **Concluído** |
-| **4** | Pacotes: modelos, atribuição, ajustes, painel de saldo | **Parcialmente concluído** — Etapas 1A, 1B, 1C e 1D |
+| **4** | Pacotes: modelos, atribuição, ajustes, painel de saldo | **Concluído** — Etapas 1A, 1B, 1C, 1D e 1E validadas |
 | **5** | Calendário e criação de aulas, com reserva de créditos | **Planeado** |
 | **6** | Cancelamento, reagendamento, presenças, histórico | **Planeado** |
 | **7** | Área do aluno: aulas, saldo, confirmação de presença | **Planeado** |
 | **8** | Notificações, lembretes e expiração agendada | **Planeado** |
-| **9** | Supabase real, concorrência, acessibilidade, deployment | **Parcialmente concluído** — RLS em PGlite e revisão estrutural de acessibilidade feitos; ambiente real e deployment pendentes |
+| **9** | Supabase real, concorrência, acessibilidade, deployment | **Parcialmente concluído** — Supabase/Auth reais validados para a Fase 4; concorrência real, acessibilidade completa e deployment pendentes |
 
 A ordem segue as prioridades pedidas: primeiro a área do professor ao computador, depois as regras seguras de créditos, depois o aluno no telemóvel.
 
@@ -461,7 +461,7 @@ A ordem segue as prioridades pedidas: primeiro a área do professor ao computado
 - 4 tabelas, 5 enums, 7 RPCs de mutação, 1 seletor e funções auxiliares
 - 7 colunas de cobrança em `lesson_participants`, `credit_cost` em `lessons`
 - `lib/domain/packages.ts` — usabilidade, seleção, alertas, decisão de cobrança
-- 57 testes de domínio de pacotes; mantidos na suite atual de 231 testes
+- 57 testes de domínio de pacotes; mantidos na suite atual de 234 testes
 - Garantias de créditos mantidas nas 294 verificações atuais; 27 migrações aplicadas do zero e reaplicadas
 - Larguras por função, navegação responsiva, rotas marcadoras de pacotes, manifesto e ícones PWA
 
@@ -511,11 +511,11 @@ A ordem segue as prioridades pedidas: primeiro a área do professor ao computado
 - Migração incremental `20260802001800_phase4_package_admin.sql`: `student_package_audit_events`, idempotência em movimentações administrativas, views `teacher_package_audit_records` e `teacher_package_history_records`, novas RPCs administrativas e correção de datas civis `Europe/Lisbon`
 - `/professor/pacotes/historico`: histórico global com filtros por aluno/pacote, origem, tipo, responsável e período
 - A área do aluno continua somente leitura: não recebe motivos administrativos, autoria privada, saldos antes/depois nem eventos internos
-- 20 testes Vitest novos de validação e 24 verificações PostgreSQL novas; suite atual com 231 testes e 294 verificações
+- 20 testes Vitest novos de validação e 24 verificações PostgreSQL novas; suite atual com 234 testes e 294 verificações
 
 ### Etapa 1E — Revisão integrada e validação real da gestão de pacotes
 
-Estado atual: **parcialmente concluída**.
+Estado atual: **concluída**.
 
 Concluído:
 
@@ -526,16 +526,13 @@ Concluído:
 - `scripts/verify-remote-supabase.mjs` valida o catálogo remoto sem escrever dados: migrações, tabelas, views, enums, índices, constraints, RLS, grants, assinaturas únicas de RPCs, `search_path` seguro, `EXECUTE` restrito e privacidade das views do aluno.
 - `scripts/setup-remote-test-users.mjs` prepara contas E2E reais no Auth usando service role apenas localmente, com confirmação explícita de desenvolvimento e sem imprimir credenciais.
 - `scripts/verify-remote-auth.mjs` valida login real, JWT, PostgREST, RPCs de pacotes, idempotência, isolamento, conta bloqueada, anónimo, imutabilidade e privacidade usando URL pública e anon key.
+- `.env.local` local preenchido com `SUPABASE_SERVICE_ROLE_KEY` e credenciais `E2E_*`, mantendo o ficheiro ignorado e sem valores reais no repositório.
+- `npm run db:setup:e2e -- --confirm-development` executado com sucesso, criando ou reutilizando professor, aluno, segundo professor, segundo aluno, administrador e conta bloqueada de desenvolvimento.
+- `npm run db:verify:auth -- --confirm-development` executado com sucesso: 65 verificações Auth/PostgREST reais passaram, incluindo idempotência, privacidade do aluno, isolamento entre contas, recusas para anónimo/bloqueado e imutabilidade do livro-razão.
+- Cenário em navegador real validado: professor em desktop autenticado abriu painel, alunos, pacotes, atribuição, histórico e detalhe de pacote; aluno em viewport mobile abriu `/aluno/pacotes`, viu apenas a projeção permitida e manteve sessão após refresh, sem overflow horizontal nem erros relevantes de console.
+- Verificações finais executadas com sucesso: `db:verify:remote`, `lint`, `typecheck`, `test`, `db:verify`, `build` e `check`.
 
-Ainda pendente para encerrar a Fase 4:
-
-- Configuração manual do Auth no painel Supabase: Site URL, Redirect URL de callback, provider de email, confirmação de email e recuperação de palavra-passe.
-- Preenchimento local de `SUPABASE_SERVICE_ROLE_KEY` e das credenciais `E2E_*` em `.env.local`, sem commit.
-- Execução real de `npm run db:setup:e2e -- --confirm-development` e `npm run db:verify:auth -- --confirm-development`.
-- Cenário ponta a ponta via aplicação/browser: professor cria modelo, atribui pacote, ajusta créditos, suspende/reativa/altera validade; aluno vê somente a projeção permitida.
-- Revisão visual em desktop e mobile com sessão real.
-
-Checklist manual de Auth para esta etapa:
+Checklist de configuração Auth a manter para repetir esta etapa:
 
 - Email provider ativo.
 - Confirmação de email ativa, obrigatória para claim seguro de aluno.
@@ -560,7 +557,7 @@ Checklist manual de Auth para esta etapa:
 | Preferências de notificação | **Concluído** | Persistência de canais/eventos; entrega automática continua planeada para a Fase 8 |
 | Diretório administrativo | **Concluído** | Pesquisa, filtros, professores, detalhe, estados vazios/erro/loading e resposta mobile/desktop |
 | Bloqueio e reativação | **Concluído** | RPC exclusiva de admin, sem auto-bloqueio, motivo, auditoria e revogação efetiva por RLS |
-| Validação num Supabase remoto | **Parcial** | Migrações e catálogo remoto validados; GoTrue, JWT/PostgREST, contas reais e browser continuam pendentes |
+| Validação num Supabase remoto | **Concluído para a Fase 4** | Migrações, catálogo remoto, GoTrue/Auth, JWT/PostgREST, contas reais e browser desktop/mobile validados |
 
 ### Concluído na Fase 2
 
@@ -587,11 +584,11 @@ Checklist manual de Auth para esta etapa:
 
 - **Não há upload de avatar.** Não existe bucket de Storage nem política de objetos; a interface usa iniciais e explica a limitação.
 - **Preferências de email não significam entrega automática.** Ficam persistidas, mas outbox/worker e lembretes agendados chegam na Fase 8.
-- **Preparar uma ligação não envia email.** A Fase 3 guarda apenas um estado auditável e sem segredo; entrega real e validação via GoTrue/PostgREST dependem de um Supabase remoto.
+- **Preparar uma ligação não envia email.** A Fase 3 guarda apenas um estado auditável e sem segredo; entrega real por email continua fora desta etapa, embora o claim/Auth real já esteja coberto pelos testes remotos de desenvolvimento.
 - **A interface de pacotes ainda é parcial.** `/professor/pacotes` gere modelos, atribuição, consulta, ajustes administrativos e histórico; `/aluno/pacotes` mostra os próprios pacotes. Transferências/fusões/divisões e integração com aulas reais continuam pendentes.
 - **A expiração de pacotes não é automática.** `refresh_package_status()` marca `expired` quando é chamada, mas nada corre à meia-noite. Precisa de uma tarefa agendada — Fase 8, com os lembretes.
-- **`credit_expired` e `credit_transferred_*` existem no enum mas não têm função.** Ficam para quando a expiração automática e a transferência entre pacotes forem implementadas (Fase 4).
-- **A validação remota ainda não cobre o fluxo inteiro.** O catálogo do Supabase remoto é verificado por `npm run db:verify:remote -- --confirm-development`, mas GoTrue, JWT, PostgREST e cenário com contas reais continuam a exigir teste manual ou um runner específico com credenciais de desenvolvimento.
+- **`credit_expired` e `credit_transferred_*` existem no enum mas não têm função.** Ficam para quando a expiração automática e a transferência entre pacotes forem implementadas numa fase futura.
+- **A validação remota da Fase 4 cobre Auth/PostgREST real, mas não concorrência simultânea.** O catálogo remoto é verificado por `db:verify:remote` e o cenário com contas reais por `db:verify:auth`; duas ligações concorrentes sobre o último crédito ainda pertencem à Fase 9.
 - **A concorrência real não é reproduzida.** O teste sequencial confirma o resultado e as funções usam `FOR UPDATE`; duas ligações simultâneas ainda têm de ser testadas na Fase 9.
 - **Não existem Server Actions do ciclo de créditos.** As RPCs e decisões de domínio estão prontas, mas criar/cancelar/concluir/reagendar pela interface pertence às Fases 5–6.
 

@@ -5,7 +5,7 @@ Professores marcam aulas, escolhem os alunos e registam presenças; os alunos ve
 
 A começar pelo **beach tennis**, com arquitetura preparada para outras modalidades.
 
-> **Estado:** Fases 1, 1.5, 2 e 3 concluídas; Fase 4 parcialmente concluída pelas **Etapas 1A, 1B, 1C e 1D**. A Etapa 1E já tem validação estrutural remota automatizada e scripts para Auth/PostgREST real; a execução final ainda depende de credenciais E2E locais no Supabase de desenvolvimento.
+> **Estado:** Fases 1, 1.5, 2, 3 e 4 concluídas. A Fase 4 está validada com migrações remotas, Auth/PostgREST real, contas E2E de desenvolvimento e browser desktop/mobile.
 > Transferência/fusão de pacotes, aulas e calendário continuam nas etapas seguintes.
 
 ---
@@ -49,7 +49,7 @@ Instruções completas — incluindo a configuração do Supabase — em [`AGENT
 - Esquema atual da base de dados: 23 tabelas, Row Level Security em todas
 - Pacotes, saldos disponíveis/reservados/utilizados e livro-razão append-only
 - RPCs PostgreSQL para atribuir, reservar, consumir, libertar, reagendar, ajustar e corrigir créditos
-- Regras e validação com 231 testes de unidade/regressão
+- Regras e validação com 234 testes de unidade/regressão
 - 294 verificações PostgreSQL sobre migrações, permissões, RLS, gestão, claim, modelos, atribuição, consulta, ajustes administrativos, grants de views e saldos
 - Estrutura responsiva das áreas de professor, aluno e administração, com manifesto e ícones PWA
 
@@ -75,7 +75,7 @@ npm run icons      # regenerar ícones PWA
 npm run db:push    # aplicar migrações
 ```
 
-Para o E2E real com Auth/PostgREST, preencha localmente `.env.local` com `SUPABASE_SERVICE_ROLE_KEY` e credenciais `E2E_*`, depois execute:
+Para repetir o E2E real com Auth/PostgREST, preencha localmente `.env.local` com `SUPABASE_SERVICE_ROLE_KEY` e credenciais `E2E_*`, depois execute:
 
 ```bash
 npm run db:setup:e2e -- --confirm-development

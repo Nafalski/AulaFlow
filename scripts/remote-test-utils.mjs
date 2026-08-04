@@ -104,9 +104,9 @@ export function deterministicUuid(input) {
 
   const hex = `${hash1.toString(16).padStart(8, "0")}${hash2
     .toString(16)
-    .padStart(8, "0")}${Math.imul(hash1 ^ hash2, 0xc2b2ae35)
+    .padStart(8, "0")}${(Math.imul(hash1 ^ hash2, 0xc2b2ae35) >>> 0)
     .toString(16)
-    .padStart(8, "0")}${Math.imul(hash2 ^ 0xa5a5a5a5, 0x27d4eb2f)
+    .padStart(8, "0")}${(Math.imul(hash2 ^ 0xa5a5a5a5, 0x27d4eb2f) >>> 0)
     .toString(16)
     .padStart(8, "0")}`.slice(0, 32);
 

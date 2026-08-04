@@ -322,7 +322,7 @@ npm run db:verify:remote -- --confirm-development
 
 Ele não cria utilizadores, não escreve dados de teste e não imprime credenciais. Verifica se as migrações locais estão aplicadas no remoto, se as tabelas/views/enums/índices/constraints de pacotes existem, se RLS e grants protegem escrita direta, se as RPCs têm assinatura única, `search_path` seguro e `EXECUTE` restrito, e se as views do aluno não expõem campos administrativos.
 
-**O que não substitui:** login real por GoTrue, payloads PostgREST com JWTs reais, confirmação de email, teste visual no browser, concorrência entre ligações e o cenário ponta a ponta professor → aluno. Estes continuam a exigir contas de teste no projeto de desenvolvimento.
+**O que não substitui:** login real por GoTrue, payloads PostgREST com JWTs reais, confirmação de email, teste visual no browser, concorrência entre ligações e o cenário ponta a ponta professor → aluno. Estes exigem contas de teste no projeto de desenvolvimento; a Fase 4 inclui essa validação real via `db:setup:e2e`, `db:verify:auth` e browser.
 
 ### E2E remoto com Auth real
 
@@ -359,7 +359,7 @@ E2E_BLOCKED_PASSWORD=...
 
 ### Checklist manual do Auth no Supabase
 
-A CLI usada no projeto valida banco e migrações, mas não confirma todas as definições do painel Auth. Antes de marcar a Fase 4 como concluída, confirmar manualmente no Supabase de desenvolvimento:
+A CLI usada no projeto valida banco, migrações e sessões reais, mas não substitui a configuração do painel Auth. Ao repetir a validação noutro ambiente de desenvolvimento, confirmar no Supabase:
 
 - **Authentication → Providers → Email:** provider Email ativo.
 - **Authentication → Providers → Email:** confirmação de email ativa.
@@ -484,7 +484,7 @@ As linhas são declaradas com `type`, **nunca com `interface`**. Um `interface` 
 
 Vitest, ambiente Node, `TZ=Europe/Lisbon` fixo para que um teste que passa localmente passe também no CI (que corre em UTC).
 
-Cobertura atual: **231 testes** em treze ficheiros — testes de domínio, regressões de respostas/autenticação do proxy, formulários da Fase 2, validação/normalização da gestão da Fase 3, modelos, atribuição, apresentação e ajustes administrativos de pacotes.
+Cobertura atual: **234 testes** em catorze ficheiros — testes de domínio, regressões de respostas/autenticação do proxy, formulários da Fase 2, validação/normalização da gestão da Fase 3, modelos, atribuição, apresentação, navegação e ajustes administrativos de pacotes.
 
 Os testes de domínio exercem funções puras, sem base de dados nem mocks. Os testes de validação garantem normalização, limites, identificadores, estados, valores monetários em cêntimos, datas civis e rejeição de campos extra/protegidos. A integração SQL fica separada em `db:verify`.
 
@@ -506,12 +506,12 @@ Não existe um comando de formatação separado. Use `npm run lint:fix` apenas p
 | 1.5 | Fundação técnica de pacotes/créditos e PWA, sem interfaces de gestão | **Concluído** |
 | 2 | Perfis, definições e gestão administrativa básica de contas | **Concluído** |
 | 3 | Alunos, turmas, locais, política de cancelamento | **Concluído** |
-| 4 | Interfaces de modelos, atribuição, ajustes e saldos | **Parcialmente concluído** — Etapas 1A, 1B, 1C e 1D; Etapa 1E com validação estrutural remota automatizada e scripts Auth/PostgREST prontos, execução real pendente de credenciais E2E locais |
+| 4 | Interfaces de modelos, atribuição, ajustes e saldos | **Concluído** — Etapas 1A, 1B, 1C, 1D e 1E validadas com Auth/PostgREST reais e browser desktop/mobile |
 | 5 | Calendário e criação de aulas com reserva | **Planeado** |
 | 6 | Cancelamento, reagendamento, presenças e histórico | **Planeado** |
 | 7 | Área do aluno: aulas, créditos e confirmação | **Planeado** |
 | 8 | Notificações, lembretes e expiração agendada | **Planeado** |
-| 9 | Supabase real, concorrência, acessibilidade e deployment | **Parcialmente concluído** — RLS em PGlite e revisão básica de acessibilidade feitos; validação real/deployment pendentes |
+| 9 | Supabase real, concorrência, acessibilidade e deployment | **Parcialmente concluído** — RLS em PGlite e validação real da Fase 4 feitos; concorrência real, acessibilidade completa e deployment pendentes |
 
 **Ao concluir uma fase ou etapa:** `npm run check`, corrigir tudo o que falhe, atualizar `implementation_plan.md`, e resumir o que foi criado e como testar manualmente.
 
