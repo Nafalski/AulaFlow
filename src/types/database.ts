@@ -138,6 +138,23 @@ export type StudentInvitationStatus = "prepared" | "claimed" | "revoked";
 
 export type PackageAssignmentOrigin = "purchased" | "gifted" | "manual";
 
+export type AvailabilityExceptionMode = "add" | "replace";
+
+export type ScheduleBlockCategory =
+  | "personal"
+  | "vacation"
+  | "tournament"
+  | "maintenance"
+  | "location_unavailable"
+  | "training"
+  | "other";
+
+export type ScheduleBlockStatus = "active" | "cancelled";
+
+export type AvailabilityPublicStatus = "available" | "unavailable";
+
+export type AvailabilitySource = "weekly_rule" | "date_exception" | "schedule_block";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Linhas
 // ─────────────────────────────────────────────────────────────────────────────
@@ -179,7 +196,61 @@ export type TeacherProfile = {
   default_sport_id: UUID | null;
   default_location_id: UUID | null;
   default_lesson_duration_minutes: number;
+  minimum_break_minutes: number;
   default_max_participants: number;
+  created_at: Timestamp;
+  updated_at: Timestamp;
+}
+
+export type TeacherAvailabilityRule = {
+  id: UUID;
+  organization_id: UUID;
+  teacher_id: UUID;
+  weekday: number;
+  starts_at: TimeOnly;
+  ends_at: TimeOnly;
+  location_id: UUID | null;
+  is_active: boolean;
+  created_by: UUID | null;
+  idempotency_key: UUID | null;
+  created_at: Timestamp;
+  updated_at: Timestamp;
+}
+
+export type TeacherAvailabilityException = {
+  id: UUID;
+  organization_id: UUID;
+  teacher_id: UUID;
+  exception_date: DateOnly;
+  mode: AvailabilityExceptionMode;
+  starts_at: TimeOnly;
+  ends_at: TimeOnly;
+  location_id: UUID | null;
+  notes: string | null;
+  is_active: boolean;
+  created_by: UUID | null;
+  idempotency_key: UUID | null;
+  created_at: Timestamp;
+  updated_at: Timestamp;
+}
+
+export type TeacherScheduleBlock = {
+  id: UUID;
+  organization_id: UUID;
+  teacher_id: UUID;
+  location_id: UUID | null;
+  starts_at: Timestamp;
+  ends_at: Timestamp;
+  all_day: boolean;
+  reason: string;
+  category: ScheduleBlockCategory;
+  status: ScheduleBlockStatus;
+  created_by: UUID | null;
+  cancelled_at: Timestamp | null;
+  cancelled_by: UUID | null;
+  cancellation_reason: string | null;
+  idempotency_key: UUID | null;
+  cancel_idempotency_key: UUID | null;
   created_at: Timestamp;
   updated_at: Timestamp;
 }
@@ -734,6 +805,84 @@ export type TeacherPackageHistoryRecord = {
   created_at: Timestamp;
 };
 
+export type TeacherAvailabilityRuleRecord = Pick<
+  TeacherAvailabilityRule,
+  | "id"
+  | "organization_id"
+  | "teacher_id"
+  | "weekday"
+  | "starts_at"
+  | "ends_at"
+  | "location_id"
+  | "is_active"
+  | "created_at"
+  | "updated_at"
+> & {
+  location_name: string | null;
+};
+
+export type TeacherAvailabilityExceptionRecord = Pick<
+  TeacherAvailabilityException,
+  | "id"
+  | "organization_id"
+  | "teacher_id"
+  | "exception_date"
+  | "mode"
+  | "starts_at"
+  | "ends_at"
+  | "location_id"
+  | "notes"
+  | "is_active"
+  | "created_at"
+  | "updated_at"
+> & {
+  location_name: string | null;
+};
+
+export type TeacherScheduleBlockRecord = Pick<
+  TeacherScheduleBlock,
+  | "id"
+  | "organization_id"
+  | "teacher_id"
+  | "location_id"
+  | "starts_at"
+  | "ends_at"
+  | "all_day"
+  | "reason"
+  | "category"
+  | "status"
+  | "created_by"
+  | "cancelled_at"
+  | "cancelled_by"
+  | "cancellation_reason"
+  | "created_at"
+  | "updated_at"
+> & {
+  location_name: string | null;
+};
+
+export type TeacherAvailabilityPublicRecord = {
+  source_id: UUID;
+  organization_id: UUID;
+  teacher_id: UUID;
+  source: AvailabilitySource;
+  specific_date: DateOnly | null;
+  weekday: number | null;
+  starts_at_local: TimeOnly | null;
+  ends_at_local: TimeOnly | null;
+  starts_at_utc: Timestamp | null;
+  ends_at_utc: Timestamp | null;
+  status: AvailabilityPublicStatus;
+};
+
+export type ResolvedTeacherAvailabilityRecord = {
+  source: "weekly_rule" | "date_exception" | "schedule_block" | "default";
+  source_id: UUID | null;
+  starts_at: TimeOnly | null;
+  ends_at: TimeOnly | null;
+  status: AvailabilityPublicStatus;
+};
+
 /** Aula completa do professor, incluindo as suas observações privadas. */
 export type TeacherLessonRecord = Lesson;
 
@@ -797,9 +946,31 @@ export type Database = {
           | "default_sport_id"
           | "default_location_id"
           | "default_lesson_duration_minutes"
+          | "minimum_break_minutes"
           | "default_max_participants"
         >;
         Update: Partial<TeacherProfile>;
+        Relationships: [];
+      };
+      teacher_availability_rules: {
+        Row: TeacherAvailabilityRule;
+        // Escrita funcional apenas por RPC.
+        Insert: never;
+        Update: never;
+        Relationships: [];
+      };
+      teacher_availability_exceptions: {
+        Row: TeacherAvailabilityException;
+        // Escrita funcional apenas por RPC.
+        Insert: never;
+        Update: never;
+        Relationships: [];
+      };
+      teacher_schedule_blocks: {
+        Row: TeacherScheduleBlock;
+        // Escrita funcional apenas por RPC.
+        Insert: never;
+        Update: never;
         Relationships: [];
       };
       student_profiles: {
@@ -1128,6 +1299,22 @@ export type Database = {
         Row: TeacherPackageHistoryRecord;
         Relationships: [];
       };
+      teacher_availability_rule_records: {
+        Row: TeacherAvailabilityRuleRecord;
+        Relationships: [];
+      };
+      teacher_availability_exception_records: {
+        Row: TeacherAvailabilityExceptionRecord;
+        Relationships: [];
+      };
+      teacher_schedule_block_records: {
+        Row: TeacherScheduleBlockRecord;
+        Relationships: [];
+      };
+      teacher_availability_public_records: {
+        Row: TeacherAvailabilityPublicRecord;
+        Relationships: [];
+      };
       teacher_lesson_records: {
         Row: TeacherLessonRecord;
         Relationships: [];
@@ -1310,6 +1497,72 @@ export type Database = {
         Args: { p_teacher_id: UUID };
         Returns: CancellationPolicy;
       };
+      save_teacher_availability_preferences: {
+        Args: {
+          p_default_lesson_duration_minutes: number;
+          p_minimum_break_minutes: number;
+        };
+        Returns: UUID;
+      };
+      upsert_teacher_availability_rule: {
+        Args: {
+          p_weekday: number;
+          p_starts_at: TimeOnly;
+          p_ends_at: TimeOnly;
+          p_idempotency_key: UUID;
+          p_rule_id?: UUID | null;
+          p_location_id?: UUID | null;
+          p_is_active?: boolean;
+        };
+        Returns: UUID;
+      };
+      deactivate_teacher_availability_rule: {
+        Args: { p_rule_id: UUID; p_idempotency_key: UUID };
+        Returns: boolean;
+      };
+      upsert_teacher_availability_exception: {
+        Args: {
+          p_exception_date: DateOnly;
+          p_starts_at: TimeOnly;
+          p_ends_at: TimeOnly;
+          p_mode: AvailabilityExceptionMode;
+          p_idempotency_key: UUID;
+          p_exception_id?: UUID | null;
+          p_location_id?: UUID | null;
+          p_notes?: string | null;
+          p_is_active?: boolean;
+        };
+        Returns: UUID;
+      };
+      deactivate_teacher_availability_exception: {
+        Args: { p_exception_id: UUID; p_idempotency_key: UUID };
+        Returns: boolean;
+      };
+      upsert_teacher_schedule_block: {
+        Args: {
+          p_starts_at: Timestamp;
+          p_ends_at: Timestamp;
+          p_all_day: boolean;
+          p_reason: string;
+          p_category: ScheduleBlockCategory;
+          p_idempotency_key: UUID;
+          p_block_id?: UUID | null;
+          p_location_id?: UUID | null;
+        };
+        Returns: UUID;
+      };
+      cancel_teacher_schedule_block: {
+        Args: {
+          p_block_id: UUID;
+          p_cancellation_reason?: string | null;
+          p_idempotency_key: UUID;
+        };
+        Returns: UUID;
+      };
+      resolve_teacher_availability_for_date: {
+        Args: { p_teacher_id: UUID; p_date: DateOnly };
+        Returns: ResolvedTeacherAvailabilityRecord[];
+      };
     };
     Enums: {
       user_role: UserRole;
@@ -1330,6 +1583,10 @@ export type Database = {
       credit_charge_rule: CreditChargeRule;
       student_invitation_status: StudentInvitationStatus;
       package_assignment_origin: PackageAssignmentOrigin;
+      availability_exception_mode: AvailabilityExceptionMode;
+      schedule_block_category: ScheduleBlockCategory;
+      schedule_block_status: ScheduleBlockStatus;
+      availability_public_status: AvailabilityPublicStatus;
     };
     CompositeTypes: Record<never, never>;
   };

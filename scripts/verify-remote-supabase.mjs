@@ -66,6 +66,9 @@ const expectedTables = [
   "student_package_audit_events",
   "lesson_participants",
   "cancellation_policies",
+  "teacher_availability_rules",
+  "teacher_availability_exceptions",
+  "teacher_schedule_blocks",
 ];
 
 const expectedViews = [
@@ -74,6 +77,10 @@ const expectedViews = [
   "student_package_transaction_records",
   "teacher_package_audit_records",
   "teacher_package_history_records",
+  "teacher_availability_rule_records",
+  "teacher_availability_exception_records",
+  "teacher_schedule_block_records",
+  "teacher_availability_public_records",
 ];
 
 const expectedEnums = [
@@ -82,6 +89,10 @@ const expectedEnums = [
   "package_status",
   "credit_transaction_type",
   "participation_billing_status",
+  "availability_exception_mode",
+  "schedule_block_category",
+  "schedule_block_status",
+  "availability_public_status",
 ];
 
 const expectedIndexes = [
@@ -94,6 +105,16 @@ const expectedIndexes = [
   "package_audit_events_package_idx",
   "package_audit_events_org_idx",
   "package_audit_events_idempotency_unique",
+  "teacher_availability_rules_teacher_day_idx",
+  "teacher_availability_rules_org_idx",
+  "teacher_availability_rules_idempotency_unique",
+  "teacher_availability_exceptions_teacher_date_idx",
+  "teacher_availability_exceptions_org_idx",
+  "teacher_availability_exceptions_idempotency_unique",
+  "teacher_schedule_blocks_teacher_time_idx",
+  "teacher_schedule_blocks_org_idx",
+  "teacher_schedule_blocks_idempotency_unique",
+  "teacher_schedule_blocks_cancel_idempotency_unique",
 ];
 
 const expectedConstraints = [
@@ -103,6 +124,17 @@ const expectedConstraints = [
   "student_packages_notes_length",
   "package_templates_description_length",
   "package_templates_currency_supported",
+  "teacher_profiles_minimum_break_minutes_allowed",
+  "teacher_availability_rules_time_order",
+  "teacher_availability_rules_minute_precision",
+  "teacher_availability_exceptions_time_order",
+  "teacher_availability_exceptions_minute_precision",
+  "teacher_availability_exceptions_notes_length",
+  "teacher_schedule_blocks_time_order",
+  "teacher_schedule_blocks_reason_length",
+  "teacher_schedule_blocks_cancel_reason_length",
+  "teacher_schedule_blocks_reasonable_length",
+  "teacher_schedule_blocks_cancel_state",
 ];
 
 const expectedFunctions = [
@@ -126,6 +158,18 @@ const expectedFunctions = [
   "teacher_can_manage_student_package",
   "log_credit_transaction_with_key",
   "log_package_audit_event",
+  "validate_availability_location_scope",
+  "validate_teacher_availability_rule",
+  "validate_teacher_availability_exception",
+  "validate_teacher_schedule_block",
+  "save_teacher_availability_preferences",
+  "upsert_teacher_availability_rule",
+  "deactivate_teacher_availability_rule",
+  "upsert_teacher_availability_exception",
+  "deactivate_teacher_availability_exception",
+  "upsert_teacher_schedule_block",
+  "cancel_teacher_schedule_block",
+  "resolve_teacher_availability_for_date",
 ];
 
 const authenticatedRpc = [
@@ -142,6 +186,14 @@ const authenticatedRpc = [
   "admin_cancel_student_package",
   "admin_update_student_package_validity",
   "admin_update_student_package_start",
+  "save_teacher_availability_preferences",
+  "upsert_teacher_availability_rule",
+  "deactivate_teacher_availability_rule",
+  "upsert_teacher_availability_exception",
+  "deactivate_teacher_availability_exception",
+  "upsert_teacher_schedule_block",
+  "cancel_teacher_schedule_block",
+  "resolve_teacher_availability_for_date",
 ];
 
 const internalFunctions = [
@@ -149,6 +201,10 @@ const internalFunctions = [
   "teacher_can_manage_student_package",
   "log_credit_transaction_with_key",
   "log_package_audit_event",
+  "validate_availability_location_scope",
+  "validate_teacher_availability_rule",
+  "validate_teacher_availability_exception",
+  "validate_teacher_schedule_block",
 ];
 
 const sql = `
@@ -322,7 +378,10 @@ checks as (
       from (values
         ('student_packages', 'INSERT'), ('student_packages', 'UPDATE'), ('student_packages', 'DELETE'),
         ('package_credit_transactions', 'INSERT'), ('package_credit_transactions', 'UPDATE'), ('package_credit_transactions', 'DELETE'),
-        ('student_package_audit_events', 'INSERT'), ('student_package_audit_events', 'UPDATE'), ('student_package_audit_events', 'DELETE')
+        ('student_package_audit_events', 'INSERT'), ('student_package_audit_events', 'UPDATE'), ('student_package_audit_events', 'DELETE'),
+        ('teacher_availability_rules', 'INSERT'), ('teacher_availability_rules', 'UPDATE'), ('teacher_availability_rules', 'DELETE'),
+        ('teacher_availability_exceptions', 'INSERT'), ('teacher_availability_exceptions', 'UPDATE'), ('teacher_availability_exceptions', 'DELETE'),
+        ('teacher_schedule_blocks', 'INSERT'), ('teacher_schedule_blocks', 'UPDATE'), ('teacher_schedule_blocks', 'DELETE')
       ) as forbidden(table_name, privilege_name)
       where has_table_privilege('authenticated', 'public.' || forbidden.table_name, forbidden.privilege_name)
     ),
@@ -331,7 +390,10 @@ checks as (
       from (values
         ('student_packages', 'INSERT'), ('student_packages', 'UPDATE'), ('student_packages', 'DELETE'),
         ('package_credit_transactions', 'INSERT'), ('package_credit_transactions', 'UPDATE'), ('package_credit_transactions', 'DELETE'),
-        ('student_package_audit_events', 'INSERT'), ('student_package_audit_events', 'UPDATE'), ('student_package_audit_events', 'DELETE')
+        ('student_package_audit_events', 'INSERT'), ('student_package_audit_events', 'UPDATE'), ('student_package_audit_events', 'DELETE'),
+        ('teacher_availability_rules', 'INSERT'), ('teacher_availability_rules', 'UPDATE'), ('teacher_availability_rules', 'DELETE'),
+        ('teacher_availability_exceptions', 'INSERT'), ('teacher_availability_exceptions', 'UPDATE'), ('teacher_availability_exceptions', 'DELETE'),
+        ('teacher_schedule_blocks', 'INSERT'), ('teacher_schedule_blocks', 'UPDATE'), ('teacher_schedule_blocks', 'DELETE')
       ) as forbidden(table_name, privilege_name)
       where has_table_privilege('authenticated', 'public.' || forbidden.table_name, forbidden.privilege_name)
     ), 'ok')
@@ -503,6 +565,31 @@ checks as (
           'available_before', 'reserved_before', 'used_before',
           'available_after', 'reserved_after', 'used_after',
           'reason', 'performed_by', 'performed_by_name', 'corrects_transaction_id'
+        )
+    ), 'ok')
+
+  union all
+  select
+    'privacidade',
+    'view publica de disponibilidade nao contem detalhes administrativos',
+    not exists (
+      select 1
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'teacher_availability_public_records'
+        and column_name in (
+          'reason', 'category', 'notes', 'created_by', 'cancelled_by',
+          'cancellation_reason', 'organization_name', 'teacher_email'
+        )
+    ),
+    coalesce((
+      select string_agg(column_name, ', ' order by column_name)
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'teacher_availability_public_records'
+        and column_name in (
+          'reason', 'category', 'notes', 'created_by', 'cancelled_by',
+          'cancellation_reason', 'organization_name', 'teacher_email'
         )
     ), 'ok')
 )

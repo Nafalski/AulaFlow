@@ -5,8 +5,8 @@ Professores marcam aulas, escolhem os alunos e registam presenças; os alunos ve
 
 A começar pelo **beach tennis**, com arquitetura preparada para outras modalidades.
 
-> **Estado:** Fases 1, 1.5, 2, 3 e 4 concluídas. A Fase 4 está validada com migrações remotas, Auth/PostgREST real, contas E2E de desenvolvimento e browser desktop/mobile.
-> Transferência/fusão de pacotes, aulas e calendário continuam nas etapas seguintes.
+> **Estado:** Fases 1, 1.5, 2, 3 e 4 concluídas. A Fase 5 começou pela Etapa 5A: disponibilidade, intervalos e bloqueios do professor, validada com Supabase remoto e Auth/PostgREST real.
+> Transferência/fusão de pacotes, calendário completo, aulas e reservas de créditos continuam nas etapas seguintes.
 
 ---
 
@@ -43,17 +43,21 @@ Instruções completas — incluindo a configuração do Supabase — em [`AGENT
 - Consulta de pacotes atribuídos e saldos: separador próprio em `/professor/pacotes`, detalhe administrativo e `/aluno/pacotes` mobile-first
 - Ajustes administrativos de pacotes: adicionar/remover créditos disponíveis, suspender, reativar, cancelar, corrigir datas e corrigir movimentações por operação compensatória
 - Histórico completo em `/professor/pacotes/historico`, unindo livro-razão de créditos e eventos administrativos sem expor detalhes privados ao aluno
+- Disponibilidade do professor em `/professor/definicoes/disponibilidade`: horários semanais, intervalos por separação de períodos, exceções por data, bloqueios privados, duração padrão e intervalo mínimo
 - Views seguras para a área do aluno, sem valor registado, origem administrativa, observações, autoria ou identificadores internos sensíveis
+- Projeção pública segura de disponibilidade para uso futuro do aluno, sem motivo, categoria, observações ou auditoria de bloqueios
 - Diretório administrativo com pesquisa, filtros, detalhe e bloqueio/reativação auditados
 - Proteção de rotas por tipo de conta e revogação de acesso para contas bloqueadas
-- Esquema atual da base de dados: 23 tabelas, Row Level Security em todas
+- Esquema atual da base de dados: 26 tabelas, Row Level Security em todas
 - Pacotes, saldos disponíveis/reservados/utilizados e livro-razão append-only
 - RPCs PostgreSQL para atribuir, reservar, consumir, libertar, reagendar, ajustar e corrigir créditos
-- Regras e validação com 234 testes de unidade/regressão
-- 294 verificações PostgreSQL sobre migrações, permissões, RLS, gestão, claim, modelos, atribuição, consulta, ajustes administrativos, grants de views e saldos
+- RPCs PostgreSQL para guardar preferências, horários semanais, exceções, bloqueios e resolução segura de disponibilidade
+- Regras e validação com 242 testes de unidade/regressão
+- 325 verificações PostgreSQL sobre migrações, permissões, RLS, gestão, claim, modelos, atribuição, consulta, ajustes administrativos, disponibilidade, grants de views e saldos
+- 84 verificações Auth/PostgREST reais no Supabase de desenvolvimento
 - Estrutura responsiva das áreas de professor, aluno e administração, com manifesto e ícones PWA
 
-`/professor/pacotes` gere modelos reutilizáveis, atribuição, consulta e ajustes administrativos dos pacotes atribuídos. `/professor/pacotes/historico` mostra a auditoria global. `/aluno/pacotes` mostra apenas os próprios pacotes e movimentos básicos.
+`/professor/pacotes` gere modelos reutilizáveis, atribuição, consulta e ajustes administrativos dos pacotes atribuídos. `/professor/pacotes/historico` mostra a auditoria global. `/professor/definicoes/disponibilidade` guarda a fonte de verdade da agenda do professor. `/aluno/pacotes` mostra apenas os próprios pacotes e movimentos básicos.
 
 Sem um bucket de Storage configurado, os avatares usam iniciais. Preparar a ligação de um aluno ainda não envia email sem um Supabase remoto; a interface identifica essa limitação. As preferências de email ficam guardadas, mas a entrega automática e os lembretes agendados pertencem à Fase 8.
 

@@ -531,6 +531,215 @@ try {
     }),
   );
 
+  section("Disponibilidade real");
+  const availabilityDate = isoDatePlusDays(120);
+  const availabilityReplaceDate = isoDatePlusDays(121);
+  const availabilityBlockDate = isoDatePlusDays(122);
+
+  const { error: preferencesError } = await teacherClient.rpc("save_teacher_availability_preferences", {
+    p_default_lesson_duration_minutes: 90,
+    p_minimum_break_minutes: 15,
+  });
+  if (preferencesError) {
+    throw new Error(`Guardar preferencias de disponibilidade: ${summarizeError(preferencesError)}`);
+  }
+  const availabilityPreferences = await getSingle(
+    "preferencias de disponibilidade",
+    teacherClient
+      .from("teacher_profiles")
+      .select("id, default_lesson_duration_minutes, minimum_break_minutes")
+      .eq("id", teacherRecord.id),
+  );
+  check(
+    availabilityPreferences.default_lesson_duration_minutes === 90 &&
+      availabilityPreferences.minimum_break_minutes === 15,
+    "Professor guarda duracao padrao e intervalo minimo",
+  );
+
+  const weeklyRuleKey = deterministicUuid(`availability-rule:${runId}`);
+  const weeklyRuleRepeat = await teacherClient.rpc("upsert_teacher_availability_rule", {
+    p_weekday: 6,
+    p_starts_at: "06:00",
+    p_ends_at: "07:00",
+    p_idempotency_key: weeklyRuleKey,
+    p_rule_id: null,
+    p_location_id: null,
+    p_is_active: true,
+  });
+  if (weeklyRuleRepeat.error || !weeklyRuleRepeat.data) {
+    throw new Error(`Criar horario semanal: ${summarizeError(weeklyRuleRepeat.error)}`);
+  }
+  const weeklyRuleAgain = await teacherClient.rpc("upsert_teacher_availability_rule", {
+    p_weekday: 6,
+    p_starts_at: "06:00",
+    p_ends_at: "07:00",
+    p_idempotency_key: weeklyRuleKey,
+    p_rule_id: null,
+    p_location_id: null,
+    p_is_active: true,
+  });
+  if (weeklyRuleAgain.error) {
+    throw new Error(`Repetir horario semanal: ${summarizeError(weeklyRuleAgain.error)}`);
+  }
+  check(weeklyRuleAgain.data === weeklyRuleRepeat.data, "Horario semanal e idempotente com JWT real");
+
+  await mustReject("Professor nao cria horario semanal sobreposto", async () =>
+    teacherClient.rpc("upsert_teacher_availability_rule", {
+      p_weekday: 6,
+      p_starts_at: "06:30",
+      p_ends_at: "07:30",
+      p_idempotency_key: deterministicUuid(`availability-rule-overlap:${runId}`),
+      p_rule_id: null,
+      p_location_id: null,
+      p_is_active: true,
+    }),
+  );
+
+  const replaceException = await teacherClient.rpc("upsert_teacher_availability_exception", {
+    p_exception_date: availabilityReplaceDate,
+    p_starts_at: "10:00",
+    p_ends_at: "12:00",
+    p_mode: "replace",
+    p_idempotency_key: deterministicUuid(`availability-exception-replace:${runId}`),
+    p_exception_id: null,
+    p_location_id: null,
+    p_notes: "e2e_disponibilidade_substituir",
+    p_is_active: true,
+  });
+  if (replaceException.error || !replaceException.data) {
+    throw new Error(`Criar excecao replace: ${summarizeError(replaceException.error)}`);
+  }
+
+  const addException = await teacherClient.rpc("upsert_teacher_availability_exception", {
+    p_exception_date: availabilityDate,
+    p_starts_at: "08:00",
+    p_ends_at: "09:00",
+    p_mode: "add",
+    p_idempotency_key: deterministicUuid(`availability-exception-add:${runId}`),
+    p_exception_id: null,
+    p_location_id: null,
+    p_notes: "e2e_disponibilidade_extra",
+    p_is_active: true,
+  });
+  if (addException.error || !addException.data) {
+    throw new Error(`Criar excecao add: ${summarizeError(addException.error)}`);
+  }
+
+  const activeBlock = await teacherClient.rpc("upsert_teacher_schedule_block", {
+    p_starts_at: `${availabilityBlockDate}T10:00:00.000Z`,
+    p_ends_at: `${availabilityBlockDate}T11:00:00.000Z`,
+    p_all_day: false,
+    p_reason: "e2e_compromisso_privado",
+    p_category: "personal",
+    p_idempotency_key: deterministicUuid(`availability-block-active:${runId}`),
+    p_block_id: null,
+    p_location_id: null,
+  });
+  if (activeBlock.error || !activeBlock.data) {
+    throw new Error(`Criar bloqueio ativo: ${summarizeError(activeBlock.error)}`);
+  }
+
+  const cancelableBlock = await teacherClient.rpc("upsert_teacher_schedule_block", {
+    p_starts_at: `${availabilityDate}T12:00:00.000Z`,
+    p_ends_at: `${availabilityDate}T13:00:00.000Z`,
+    p_all_day: false,
+    p_reason: "e2e_bloqueio_cancelavel",
+    p_category: "other",
+    p_idempotency_key: deterministicUuid(`availability-block-cancel:${runId}`),
+    p_block_id: null,
+    p_location_id: null,
+  });
+  if (cancelableBlock.error || !cancelableBlock.data) {
+    throw new Error(`Criar bloqueio cancelavel: ${summarizeError(cancelableBlock.error)}`);
+  }
+
+  const blockRecord = await getSingle(
+    "bloqueio do professor",
+    teacherClient
+      .from("teacher_schedule_block_records")
+      .select("id, reason, category, status")
+      .eq("id", activeBlock.data),
+  );
+  check(
+    blockRecord.reason === "e2e_compromisso_privado" &&
+      blockRecord.category === "personal" &&
+      blockRecord.status === "active",
+    "Professor ve motivo e categoria privados do bloqueio",
+  );
+
+  const publicAvailability = await studentClient
+    .from("teacher_availability_public_records")
+    .select("*")
+    .eq("teacher_id", teacherRecord.id);
+  if (publicAvailability.error) {
+    throw new Error(`Disponibilidade publica do aluno: ${summarizeError(publicAvailability.error)}`);
+  }
+  check(
+    publicAvailability.data.some((row) => row.source === "weekly_rule" && row.status === "available") &&
+      publicAvailability.data.some((row) => row.source === "schedule_block" && row.status === "unavailable"),
+    "Aluno A ve disponibilidade publica generica do proprio professor",
+  );
+  const privateAvailabilityFields = forbiddenColumns(publicAvailability.data[0] ?? {}, [
+    "reason",
+    "category",
+    "notes",
+    "created_by",
+    "cancelled_by",
+    "cancellation_reason",
+  ]);
+  check(
+    privateAvailabilityFields.length === 0,
+    "Disponibilidade publica nao inclui motivo, categoria nem auditoria",
+    `Disponibilidade publica vazou campos: ${privateAvailabilityFields.join(", ")}`,
+  );
+
+  await mustReturnNoRows("Aluno A nao le bloqueios administrativos", () =>
+    studentClient.from("teacher_schedule_block_records").select("id").eq("id", activeBlock.data),
+  );
+  await mustReturnNoRows("Professor B nao le horario do Professor A", () =>
+    teacherBClient.from("teacher_availability_rule_records").select("id").eq("id", weeklyRuleRepeat.data),
+  );
+  await mustReturnNoRows("Aluno B nao le disponibilidade publica do Professor A", () =>
+    studentBClient.from("teacher_availability_public_records").select("source").eq("teacher_id", teacherRecord.id),
+  );
+  await mustReject("Aluno A nao cria disponibilidade", async () =>
+    studentClient.rpc("upsert_teacher_availability_rule", {
+      p_weekday: 2,
+      p_starts_at: "09:00",
+      p_ends_at: "10:00",
+      p_idempotency_key: deterministicUuid(`student-availability-forbidden:${runId}`),
+      p_rule_id: null,
+      p_location_id: null,
+      p_is_active: true,
+    }),
+  );
+  await mustReject("Admin nao cria disponibilidade funcional", async () =>
+    adminClient.rpc("upsert_teacher_schedule_block", {
+      p_starts_at: `${availabilityDate}T14:00:00.000Z`,
+      p_ends_at: `${availabilityDate}T15:00:00.000Z`,
+      p_all_day: false,
+      p_reason: "admin_indevido",
+      p_category: "other",
+      p_idempotency_key: deterministicUuid(`admin-availability-forbidden:${runId}`),
+      p_block_id: null,
+      p_location_id: null,
+    }),
+  );
+
+  const cancelBlock = await teacherClient.rpc("cancel_teacher_schedule_block", {
+    p_block_id: cancelableBlock.data,
+    p_cancellation_reason: "e2e_cancelado",
+    p_idempotency_key: deterministicUuid(`availability-block-cancel-action:${runId}`),
+  });
+  if (cancelBlock.error) {
+    throw new Error(`Cancelar bloqueio: ${summarizeError(cancelBlock.error)}`);
+  }
+  const cancelledBlock = await getSingle(
+    "bloqueio cancelado",
+    teacherClient.from("teacher_schedule_block_records").select("id, status").eq("id", cancelableBlock.data),
+  );
+  check(cancelledBlock.status === "cancelled", "Professor cancela bloqueio preservando historico");
+
   section("Conta bloqueada e anonimo");
   await signIn(blockedClient, credentials.blocked.email, credentials.blocked.password, "Conta bloqueada");
   await mustReturnNoRows("Conta bloqueada nao le views de pacotes", () =>
@@ -542,6 +751,15 @@ try {
       p_delta: 1,
       p_reason: "indevido",
       p_idempotency_key: deterministicUuid(`blocked-forbidden:${runId}`),
+    }),
+  );
+  await mustReturnNoRows("Conta bloqueada nao le disponibilidade administrativa", () =>
+    blockedClient.from("teacher_availability_rule_records").select("id").limit(1),
+  );
+  await mustReject("Conta bloqueada nao gere disponibilidade", async () =>
+    blockedClient.rpc("save_teacher_availability_preferences", {
+      p_default_lesson_duration_minutes: 60,
+      p_minimum_break_minutes: 0,
     }),
   );
 
@@ -561,6 +779,15 @@ try {
       p_notes: null,
       p_origin: "manual",
       p_assignment_idempotency_key: deterministicUuid(`anon-forbidden:${runId}`),
+    }),
+  );
+  await mustReject("Anonimo nao le disponibilidade publica", async () =>
+    anonClient.from("teacher_availability_public_records").select("source").limit(1),
+  );
+  await mustReject("Anonimo nao resolve disponibilidade", async () =>
+    anonClient.rpc("resolve_teacher_availability_for_date", {
+      p_teacher_id: teacherRecord.id,
+      p_date: availabilityDate,
     }),
   );
 
@@ -609,6 +836,21 @@ try {
   );
   await mustReject("Professor nao apaga auditoria administrativa", async () =>
     teacherClient.from("student_package_audit_events").delete().eq("student_package_id", packageId),
+  );
+  await mustReject("Professor nao insere horario semanal diretamente", async () =>
+    teacherClient.from("teacher_availability_rules").insert({
+      organization_id: teacherRecord.organization_id,
+      teacher_id: teacherRecord.id,
+      weekday: 3,
+      starts_at: "09:00",
+      ends_at: "10:00",
+    }),
+  );
+  await mustReject("Professor nao altera bloqueio diretamente", async () =>
+    teacherClient.from("teacher_schedule_blocks").update({ reason: "indevido" }).eq("id", activeBlock.data),
+  );
+  await mustReject("Professor nao apaga excecao diretamente", async () =>
+    teacherClient.from("teacher_availability_exceptions").delete().eq("id", addException.data),
   );
 
   section("Datas");

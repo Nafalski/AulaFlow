@@ -1,4 +1,4 @@
-import { Building2, ChevronRight, Scale, Settings2 } from "lucide-react";
+import { Building2, CalendarClock, ChevronRight, Scale, Settings2 } from "lucide-react";
 import type { Metadata } from "next";
 import Link from "next/link";
 
@@ -137,6 +137,26 @@ export default async function TeacherSettingsPage() {
           className={buttonClasses({ variant: "outline", className: "shrink-0" })}
         >
           Gerir políticas <ChevronRight className="size-4" aria-hidden="true" />
+        </Link>
+      </Card>
+
+      <Card variant="plain" className="flex flex-col gap-4 p-4 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex items-start gap-3">
+          <span className="flex size-10 shrink-0 items-center justify-center rounded-full bg-brand-tint">
+            <CalendarClock className="size-5 text-brand" aria-hidden="true" />
+          </span>
+          <div>
+            <p className="font-bold text-ink">Disponibilidade e bloqueios</p>
+            <p className="mt-0.5 text-sm text-muted">
+              Defina horários semanais, exceções por data e indisponibilidades privadas.
+            </p>
+          </div>
+        </div>
+        <Link
+          href="/professor/definicoes/disponibilidade"
+          className={buttonClasses({ variant: "outline", className: "shrink-0" })}
+        >
+          Gerir disponibilidade <ChevronRight className="size-4" aria-hidden="true" />
         </Link>
       </Card>
 

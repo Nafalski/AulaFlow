@@ -142,7 +142,10 @@ update public.profiles set role = 'admin' where email = 'voce@exemplo.pt';
 │   ├── ..._phase4_package_templates.sql Etapa 1A: modelos reutilizáveis
 │   ├── ..._phase4_package_assignment.sql Etapa 1B: atribuição de pacotes
 │   ├── ..._phase4_package_read_views.sql Etapa 1C: consulta de pacotes e saldos
-│   └── ..._phase4_package_admin.sql Etapa 1D: ajustes administrativos e histórico
+│   ├── ..._phase4_package_admin.sql Etapa 1D: ajustes administrativos e histórico
+│   ├── ..._phase4_package_view_grants.sql grants explícitos das views da Fase 4
+│   ├── ..._phase5_teacher_availability.sql Etapa 5A: disponibilidade, exceções e bloqueios
+│   └── ..._phase5_availability_view_grants.sql grants explícitos das views da Etapa 5A
 │
 └── src/
     ├── proxy.ts             Renova a sessão e protege rotas (era middleware.ts)
@@ -161,6 +164,7 @@ update public.profiles set role = 'admin' where email = 'voce@exemplo.pt';
     │   ├── layout/          AppShell, navegação, placeholders de fase
     │   ├── auth/            Componentes de autenticação
     │   ├── settings/        Formulários de conta, perfil público, avisos e segurança
+    │   ├── availability/    Horários, exceções e bloqueios do professor
     │   ├── admin/           Diretório, filtros, detalhe e estado de contas
     │   └── brand/           Logótipo
     │
@@ -306,7 +310,7 @@ npm run typecheck
 
 ### `npm run db:verify`
 
-Executa **todas** as migrações, a partir de uma base vazia, contra PostgreSQL compilado para WebAssembly (PGlite), e volta a aplicá-las para confirmar idempotência. Depois exerce 294 garantias: RLS com papéis `authenticated`/`anon`, isolamento entre organizações e professores, privilégios das RPCs, perfis/claim/bloqueio, convites sem segredo, alunos, turmas, locais, modelos, atribuição, consulta e ajustes administrativos de pacotes, grants estritos das views, políticas, reserva, consumo, libertação, reagendamento, exceções, correções, imutabilidade do livro-razão e constraints herdadas das aulas.
+Executa **todas** as migrações, a partir de uma base vazia, contra PostgreSQL compilado para WebAssembly (PGlite), e volta a aplicá-las para confirmar idempotência. Depois exerce 325 garantias: RLS com papéis `authenticated`/`anon`, isolamento entre organizações e professores, privilégios das RPCs, perfis/claim/bloqueio, convites sem segredo, alunos, turmas, locais, modelos, atribuição, consulta e ajustes administrativos de pacotes, disponibilidade do professor, grants estritos das views, políticas, reserva, consumo, libertação, reagendamento, exceções, correções, imutabilidade do livro-razão e constraints herdadas das aulas.
 
 Corre em segundos, sem Docker e sem projeto na nuvem — serve para o CI.
 
@@ -320,7 +324,7 @@ Executa uma verificação estrutural no Supabase remoto atualmente ligado pela C
 npm run db:verify:remote -- --confirm-development
 ```
 
-Ele não cria utilizadores, não escreve dados de teste e não imprime credenciais. Verifica se as migrações locais estão aplicadas no remoto, se as tabelas/views/enums/índices/constraints de pacotes existem, se RLS e grants protegem escrita direta, se as RPCs têm assinatura única, `search_path` seguro e `EXECUTE` restrito, e se as views do aluno não expõem campos administrativos.
+Ele não cria utilizadores, não escreve dados de teste e não imprime credenciais. Verifica se as migrações locais estão aplicadas no remoto, se as tabelas/views/enums/índices/constraints de pacotes e disponibilidade existem, se RLS e grants protegem escrita direta, se as RPCs têm assinatura única, `search_path` seguro e `EXECUTE` restrito, e se as views do aluno/disponibilidade pública não expõem campos administrativos.
 
 **O que não substitui:** login real por GoTrue, payloads PostgREST com JWTs reais, confirmação de email, teste visual no browser, concorrência entre ligações e o cenário ponta a ponta professor → aluno. Estes exigem contas de teste no projeto de desenvolvimento; a Fase 4 inclui essa validação real via `db:setup:e2e`, `db:verify:auth` e browser.
 
@@ -335,7 +339,7 @@ npm run db:verify:auth -- --confirm-development
 
 `db:setup:e2e` usa `SUPABASE_SERVICE_ROLE_KEY` apenas localmente para criar ou reutilizar as contas de teste, confirmar emails, marcar uma conta bloqueada e ligar fichas de aluno aos professores certos. A chave não é impressa e não deve existir em `NEXT_PUBLIC_*`.
 
-`db:verify:auth` não usa service role para simular utilizadores. Entra com URL pública, anon key, email e senha E2E; obtém JWT real; executa PostgREST e RPCs como professor, aluno, segundo professor, segundo aluno, admin, conta bloqueada e anónimo.
+`db:verify:auth` não usa service role para simular utilizadores. Entra com URL pública, anon key, email e senha E2E; obtém JWT real; executa PostgREST e RPCs como professor, aluno, segundo professor, segundo aluno, admin, conta bloqueada e anónimo, cobrindo pacotes, disponibilidade, privacidade, isolamento e imutabilidade.
 
 Variáveis locais necessárias, sempre com valores de desenvolvimento e nunca commitadas:
 
@@ -474,6 +478,34 @@ Estas regras vivem em `lib/domain/package-display.ts` e são partilhadas entre p
 
 `resolveCreditOutcome()` em `lib/domain/packages.ts` decide cobrar/devolver conforme prazo e política; a Server Action futura aplica essa decisão chamando a RPC correspondente. As interfaces e essas orquestrações ainda pertencem às Fases 4–7.
 
+### Disponibilidade do professor (Etapa 5A)
+
+A fonte de verdade da agenda do professor fica separada de aulas, participantes e créditos:
+
+| Estrutura | Responsabilidade |
+|---|---|
+| `teacher_availability_rules` | Períodos semanais em hora civil local (`weekday`, `starts_at`, `ends_at`) |
+| `teacher_availability_exceptions` | Disponibilidade positiva numa data civil, em modo `add` ou `replace` |
+| `teacher_schedule_blocks` | Bloqueios específicos, parciais ou de dia inteiro, com motivo/categoria privados |
+| `teacher_profiles` | Preferências simples: `default_lesson_duration_minutes` e `minimum_break_minutes` |
+
+Rotina semanal usa hora civil local de `Europe/Lisbon` e não é convertida para UTC. Bloqueios específicos são instantes (`timestamptz`) e devem ser criados a partir de input local usando `lisbonInputToInstant()`. Bloqueios de dia inteiro usam fim exclusivo.
+
+Precedência, também implementada em `resolve_teacher_availability_for_date()`:
+
+1. bloqueio ativo;
+2. exceção da data;
+3. rotina semanal;
+4. indisponível por padrão.
+
+Intervalos simples são representados pelo espaço entre períodos do mesmo dia, por exemplo `09:00–13:00` e `15:00–20:00`. O intervalo mínimo entre marcações fica guardado, mas só será aplicado ao cálculo de conflitos quando existirem aulas.
+
+A interface vive em `/professor/definicoes/disponibilidade`. Server Actions chamam RPCs (`save_teacher_availability_preferences`, `upsert_teacher_availability_rule`, `upsert_teacher_availability_exception`, `upsert_teacher_schedule_block` e cancelamentos/desativações correspondentes). O browser nunca envia organização, professor, autor ou timestamps.
+
+A projeção `teacher_availability_public_records` é preparada para a área futura do aluno e expõe apenas início/fim e estado genérico `available`/`unavailable`; não inclui motivo, categoria, notas nem auditoria. Anónimo não tem acesso.
+
+**Ainda não implementado:** calendário gráfico, criação de aulas, recorrência, participantes, reservas/consumo de créditos, presenças, cancelamentos/reagendamentos de aulas, confirmação do aluno, lista de espera e notificações.
+
 ### `src/types/database.ts`
 
 As linhas são declaradas com `type`, **nunca com `interface`**. Um `interface` não é atribuível a `Record<string, unknown>` (pode ser aumentado por *declaration merging*), o esquema deixa de satisfazer `GenericSchema` do supabase-js, e **todas** as consultas passam a devolver `never` — com erros a aparecer em ficheiros longe da causa. A nota está no topo do próprio ficheiro.
@@ -484,7 +516,7 @@ As linhas são declaradas com `type`, **nunca com `interface`**. Um `interface` 
 
 Vitest, ambiente Node, `TZ=Europe/Lisbon` fixo para que um teste que passa localmente passe também no CI (que corre em UTC).
 
-Cobertura atual: **234 testes** em catorze ficheiros — testes de domínio, regressões de respostas/autenticação do proxy, formulários da Fase 2, validação/normalização da gestão da Fase 3, modelos, atribuição, apresentação, navegação e ajustes administrativos de pacotes.
+Cobertura atual: **242 testes** em dezasseis ficheiros — testes de domínio, regressões de respostas/autenticação do proxy, formulários da Fase 2, validação/normalização da gestão da Fase 3, modelos, atribuição, apresentação, navegação, ajustes administrativos de pacotes e disponibilidade do professor.
 
 Os testes de domínio exercem funções puras, sem base de dados nem mocks. Os testes de validação garantem normalização, limites, identificadores, estados, valores monetários em cêntimos, datas civis e rejeição de campos extra/protegidos. A integração SQL fica separada em `db:verify`.
 
@@ -507,11 +539,11 @@ Não existe um comando de formatação separado. Use `npm run lint:fix` apenas p
 | 2 | Perfis, definições e gestão administrativa básica de contas | **Concluído** |
 | 3 | Alunos, turmas, locais, política de cancelamento | **Concluído** |
 | 4 | Interfaces de modelos, atribuição, ajustes e saldos | **Concluído** — Etapas 1A, 1B, 1C, 1D e 1E validadas com Auth/PostgREST reais e browser desktop/mobile |
-| 5 | Calendário e criação de aulas com reserva | **Planeado** |
+| 5 | Calendário e criação de aulas com reserva | **Parcialmente concluído** — Etapa 5A: disponibilidade, intervalos e bloqueios do professor |
 | 6 | Cancelamento, reagendamento, presenças e histórico | **Planeado** |
 | 7 | Área do aluno: aulas, créditos e confirmação | **Planeado** |
 | 8 | Notificações, lembretes e expiração agendada | **Planeado** |
-| 9 | Supabase real, concorrência, acessibilidade e deployment | **Parcialmente concluído** — RLS em PGlite e validação real da Fase 4 feitos; concorrência real, acessibilidade completa e deployment pendentes |
+| 9 | Supabase real, concorrência, acessibilidade e deployment | **Parcialmente concluído** — RLS em PGlite e validação real da Fase 4/Etapa 5A feitos; concorrência real, acessibilidade completa e deployment pendentes |
 
 **Ao concluir uma fase ou etapa:** `npm run check`, corrigir tudo o que falhe, atualizar `implementation_plan.md`, e resumir o que foi criado e como testar manualmente.
 

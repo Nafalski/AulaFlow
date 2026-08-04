@@ -4227,6 +4227,513 @@ check(
   "reativação devolve ao professor os acessos funcionais da Fase 3",
 );
 
+// ── 14. Disponibilidade do professor (Fase 5A) ───────────────────────────────
+
+section("Disponibilidade do professor (Etapa 5A)");
+
+const PHASE5_AVAILABILITY_FUNCTIONS = [
+  "save_teacher_availability_preferences",
+  "upsert_teacher_availability_rule",
+  "deactivate_teacher_availability_rule",
+  "upsert_teacher_availability_exception",
+  "deactivate_teacher_availability_exception",
+  "upsert_teacher_schedule_block",
+  "cancel_teacher_schedule_block",
+  "resolve_teacher_availability_for_date",
+];
+
+const phase5FunctionSecurity = await rows(
+  `select p.proname, p.prosecdef,
+          coalesce(p.proconfig @> array['search_path=public, pg_temp'], false) as safe_search_path
+   from pg_proc p
+   join pg_namespace n on n.oid = p.pronamespace
+   where n.nspname='public' and p.proname = any($1)
+   order by p.proname`,
+  [PHASE5_AVAILABILITY_FUNCTIONS],
+);
+check(
+  phase5FunctionSecurity.length === PHASE5_AVAILABILITY_FUNCTIONS.length &&
+    phase5FunctionSecurity.every((fn) => fn.prosecdef && fn.safe_search_path),
+  "RPCs de disponibilidade existem e fixam search_path seguro",
+  `RPCs ausentes ou sem proteção: ${PHASE5_AVAILABILITY_FUNCTIONS.filter(
+    (name) =>
+      !phase5FunctionSecurity.some(
+        (fn) => fn.proname === name && fn.prosecdef && fn.safe_search_path,
+      ),
+  ).join(", ")}`,
+);
+
+const availabilityDirectWrites = await rows(
+  `select table_name, privilege_type
+   from information_schema.table_privileges
+   where table_schema='public'
+     and table_name = any($1)
+     and grantee='authenticated'
+     and privilege_type in ('INSERT','UPDATE','DELETE')`,
+  [[
+    "teacher_availability_rules",
+    "teacher_availability_exceptions",
+    "teacher_schedule_blocks",
+  ]],
+);
+check(
+  availabilityDirectWrites.length === 0,
+  "cliente autenticado não escreve disponibilidade diretamente",
+  `escrita direta indevida: ${availabilityDirectWrites
+    .map((privilege) => `${privilege.table_name}:${privilege.privilege_type}`)
+    .join(", ")}`,
+);
+
+const availabilityViews = await rows(
+  `select table_name
+   from information_schema.views
+   where table_schema='public' and table_name = any($1)`,
+  [[
+    "teacher_availability_rule_records",
+    "teacher_availability_exception_records",
+    "teacher_schedule_block_records",
+    "teacher_availability_public_records",
+  ]],
+);
+check(
+  availabilityViews.length === 4,
+  "projeções de disponibilidade existem",
+  `vistas em falta: ${[
+    "teacher_availability_rule_records",
+    "teacher_availability_exception_records",
+    "teacher_schedule_block_records",
+    "teacher_availability_public_records",
+  ]
+    .filter((name) => !availabilityViews.some((view) => view.table_name === name))
+    .join(", ")}`,
+);
+
+const publicAvailabilityPrivateColumns = await rows(
+  `select column_name
+   from information_schema.columns
+   where table_schema='public'
+     and table_name='teacher_availability_public_records'
+     and column_name = any($1)`,
+  [["reason", "category", "notes", "created_by", "cancelled_by", "cancellation_reason"]],
+);
+check(
+  publicAvailabilityPrivateColumns.length === 0,
+  "projeção pública não expõe motivo, categoria nem auditoria privada",
+  `colunas privadas na projeção pública: ${publicAvailabilityPrivateColumns
+    .map((column) => column.column_name)
+    .join(", ")}`,
+);
+
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(`select public.save_teacher_availability_preferences(90, 15)`),
+);
+const availabilityPrefs = await one(
+  `select default_lesson_duration_minutes, minimum_break_minutes
+   from public.teacher_profiles where id=$1`,
+  [teacher.id],
+);
+check(
+  availabilityPrefs.default_lesson_duration_minutes === 90 &&
+    availabilityPrefs.minimum_break_minutes === 15,
+  "preferências guardam duração padrão e intervalo mínimo",
+);
+
+await mustReject("duração padrão inválida é recusada", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.save_teacher_availability_preferences(10, 15)`),
+  ),
+);
+await mustReject("intervalo mínimo fora da lista é recusado", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.save_teacher_availability_preferences(60, 12)`),
+  ),
+);
+
+const availabilityLocation = await one(
+  `insert into public.locations (organization_id, teacher_id, name, is_active)
+   values ($1,$2,'Campo disponibilidade',true)
+   returning id, name`,
+  [org, teacher.id],
+);
+
+const mondayMorningKey = randomUUID();
+const mondayMorningRule = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.upsert_teacher_availability_rule(
+       1, '09:00'::time, '13:00'::time, $1, null, $2, true
+     ) as id`,
+    [mondayMorningKey, availabilityLocation.id],
+  ),
+);
+const repeatedMondayMorningRule = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.upsert_teacher_availability_rule(
+       1, '09:00'::time, '13:00'::time, $1, null, $2, true
+     ) as id`,
+    [mondayMorningKey, availabilityLocation.id],
+  ),
+);
+const mondayAfternoonRule = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.upsert_teacher_availability_rule(
+       1, '15:00'::time, '20:00'::time, $1, null, null, true
+     ) as id`,
+    [randomUUID()],
+  ),
+);
+check(
+  mondayMorningRule.id === repeatedMondayMorningRule.id && mondayAfternoonRule.id !== mondayMorningRule.id,
+  "horários semanais aceitam períodos separados e idempotência",
+);
+
+await mustReject("horário semanal sobreposto é recusado", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(
+      `select public.upsert_teacher_availability_rule(
+         1, '12:30'::time, '15:30'::time, $1, null, null, true
+       )`,
+      [randomUUID()],
+    ),
+  ),
+);
+await mustReject("horário semanal sem duração é recusado", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(
+      `select public.upsert_teacher_availability_rule(
+         2, '13:00'::time, '13:00'::time, $1, null, null, true
+       )`,
+      [randomUUID()],
+    ),
+  ),
+);
+
+const teacherRuleRecords = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  rows(
+    `select id, weekday, starts_at::text, ends_at::text, location_name
+     from public.teacher_availability_rule_records
+     where id = any($1::uuid[])
+     order by starts_at`,
+    [[mondayMorningRule.id, mondayAfternoonRule.id]],
+  ),
+);
+check(
+  teacherRuleRecords.length === 2 &&
+    teacherRuleRecords[0].starts_at === "09:00:00" &&
+    teacherRuleRecords[0].location_name === availabilityLocation.name,
+  "professor consulta os próprios horários com local opcional",
+);
+
+const colleagueAvailabilityRows = await asDatabaseRole("authenticated", SAME_ORG_TEACHER_UID, () =>
+  rows(`select id from public.teacher_availability_rule_records where id=$1`, [
+    mondayMorningRule.id,
+  ]),
+);
+check(
+  colleagueAvailabilityRows.length === 0,
+  "colega da organização não consulta disponibilidade privada de outro professor",
+);
+
+const sundayResolution = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  rows(
+    `select source, source_id, starts_at::text, ends_at::text, status::text
+     from public.resolve_teacher_availability_for_date($1, '2026-08-16')`,
+    [teacher.id],
+  ),
+);
+check(
+  sundayResolution.length === 1 &&
+    sundayResolution[0].source === "default" &&
+    sundayResolution[0].status === "unavailable",
+  "sem rotina nem exceção positiva, o professor fica indisponível por padrão",
+);
+
+const addException = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.upsert_teacher_availability_exception(
+       '2026-08-16'::date, '10:00'::time, '12:00'::time, 'add', $1, null, null,
+       'Sábado especial', true
+     ) as id`,
+    [randomUUID()],
+  ),
+);
+const replaceException = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.upsert_teacher_availability_exception(
+       '2026-08-17'::date, '10:00'::time, '12:00'::time, 'replace', $1, null, null,
+       'Começar mais tarde', true
+     ) as id`,
+    [randomUUID()],
+  ),
+);
+check(
+  addException.id && replaceException.id,
+  "exceções de acréscimo e substituição são criadas",
+);
+
+await mustReject("não mistura exceção replace e add no mesmo dia", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(
+      `select public.upsert_teacher_availability_exception(
+         '2026-08-17'::date, '13:00'::time, '14:00'::time, 'add', $1, null, null,
+         'Mistura inválida', true
+       )`,
+      [randomUUID()],
+    ),
+  ),
+);
+await mustReject("exceção sobreposta no mesmo dia é recusada", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(
+      `select public.upsert_teacher_availability_exception(
+         '2026-08-16'::date, '11:30'::time, '13:00'::time, 'add', $1, null, null,
+         'Sobreposição inválida', true
+       )`,
+      [randomUUID()],
+    ),
+  ),
+);
+
+const sundayWithException = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  rows(
+    `select source, starts_at::text, ends_at::text, status::text
+     from public.resolve_teacher_availability_for_date($1, '2026-08-16')`,
+    [teacher.id],
+  ),
+);
+const mondayWithReplace = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  rows(
+    `select source, starts_at::text, ends_at::text, status::text
+     from public.resolve_teacher_availability_for_date($1, '2026-08-17')`,
+    [teacher.id],
+  ),
+);
+check(
+  sundayWithException.length === 1 &&
+    sundayWithException[0].source === "date_exception" &&
+    sundayWithException[0].starts_at === "10:00:00" &&
+    mondayWithReplace.length === 1 &&
+    mondayWithReplace[0].source === "date_exception" &&
+    mondayWithReplace[0].starts_at === "10:00:00",
+  "exceções positivas substituem ou acrescentam disponibilidade conforme o modo",
+);
+
+const partialBlockKey = randomUUID();
+const partialBlock = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.upsert_teacher_schedule_block(
+       '2026-08-17 10:30+00'::timestamptz,
+       '2026-08-17 11:30+00'::timestamptz,
+       false,
+       'Compromisso pessoal',
+       'personal',
+       $1,
+       null,
+       null
+     ) as id`,
+    [partialBlockKey],
+  ),
+);
+const repeatedPartialBlock = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.upsert_teacher_schedule_block(
+       '2026-08-17 10:30+00'::timestamptz,
+       '2026-08-17 11:30+00'::timestamptz,
+       false,
+       'Compromisso pessoal',
+       'personal',
+       $1,
+       null,
+       null
+     ) as id`,
+    [partialBlockKey],
+  ),
+);
+check(partialBlock.id === repeatedPartialBlock.id, "bloqueio parcial é idempotente");
+
+const allDayBlock = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.upsert_teacher_schedule_block(
+       '2026-08-19 23:00+00'::timestamptz,
+       '2026-08-21 23:00+00'::timestamptz,
+       true,
+       'Férias curtas',
+       'vacation',
+       $1,
+       null,
+       null
+     ) as id`,
+    [randomUUID()],
+  ),
+);
+check(Boolean(allDayBlock.id), "bloqueio de dia inteiro multi-dia é aceite");
+
+await mustReject("bloqueio com fim antes do início é recusado", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(
+      `select public.upsert_teacher_schedule_block(
+         '2026-08-20 12:00+00'::timestamptz,
+         '2026-08-20 11:00+00'::timestamptz,
+         false,
+         'Período inválido',
+         'other',
+         $1,
+         null,
+         null
+       )`,
+      [randomUUID()],
+    ),
+  ),
+);
+
+const mondayBlocked = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  rows(
+    `select source, source_id, starts_at::text, ends_at::text, status::text
+     from public.resolve_teacher_availability_for_date($1, '2026-08-17')`,
+    [teacher.id],
+  ),
+);
+check(
+  mondayBlocked.length === 1 &&
+    mondayBlocked[0].source === "schedule_block" &&
+    mondayBlocked[0].status === "unavailable",
+  "bloqueio ativo tem prioridade sobre exceções e rotina semanal",
+);
+
+const blockPrivateRecord = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select id, reason, category::text, status::text
+     from public.teacher_schedule_block_records
+     where id=$1`,
+    [partialBlock.id],
+  ),
+);
+check(
+  blockPrivateRecord.reason === "Compromisso pessoal" &&
+    blockPrivateRecord.category === "personal" &&
+    blockPrivateRecord.status === "active",
+  "professor vê motivo e categoria privados do bloqueio",
+);
+
+const studentPrivateAvailabilityRows = await asDatabaseRole("authenticated", ANA_UID, async () => ({
+  rules: await rows(`select id from public.teacher_availability_rule_records`),
+  exceptions: await rows(`select id from public.teacher_availability_exception_records`),
+  blocks: await rows(`select id from public.teacher_schedule_block_records`),
+}));
+check(
+  Object.values(studentPrivateAvailabilityRows).every((entries) => entries.length === 0),
+  "aluno não consulta as projeções administrativas de disponibilidade",
+);
+
+const studentPublicAvailabilityRows = await asDatabaseRole("authenticated", ANA_UID, () =>
+  rows(
+    `select source, starts_at_local::text, ends_at_local::text, starts_at_utc, ends_at_utc, status::text
+     from public.teacher_availability_public_records
+     where teacher_id=$1
+     order by source, starts_at_local`,
+    [teacher.id],
+  ),
+);
+check(
+  studentPublicAvailabilityRows.some(
+    (row) =>
+      row.source === "weekly_rule" &&
+      row.starts_at_local === "09:00:00" &&
+      row.status === "available",
+  ) &&
+    studentPublicAvailabilityRows.some(
+      (row) => row.source === "schedule_block" && row.status === "unavailable",
+    ),
+  "aluno vê apenas disponibilidade pública genérica do próprio professor",
+);
+
+const externalStudentPublicAvailabilityRows = await asDatabaseRole(
+  "authenticated",
+  PRESET_ORG_UID,
+  () =>
+    rows(`select source from public.teacher_availability_public_records where teacher_id=$1`, [
+      teacher.id,
+    ]),
+);
+check(
+  externalStudentPublicAvailabilityRows.length === 0,
+  "aluno sem ficha deste professor não consulta disponibilidade pública alheia",
+);
+
+const cancelledBlock = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select public.cancel_teacher_schedule_block($1, 'Já não é necessário', $2) as id`, [
+    partialBlock.id,
+    randomUUID(),
+  ]),
+);
+const cancelledBlockRecord = await one(
+  `select status, cancellation_reason, cancelled_by
+   from public.teacher_schedule_blocks where id=$1`,
+  [partialBlock.id],
+);
+check(
+  cancelledBlock.id === partialBlock.id &&
+    cancelledBlockRecord.status === "cancelled" &&
+    cancelledBlockRecord.cancellation_reason === "Já não é necessário" &&
+    cancelledBlockRecord.cancelled_by === TEACHER_UID,
+  "cancelar bloqueio preserva histórico e autoria",
+);
+
+await mustReject("aluno não cria horário semanal", () =>
+  asDatabaseRole("authenticated", ANA_UID, () =>
+    db.query(
+      `select public.upsert_teacher_availability_rule(
+         2, '09:00'::time, '10:00'::time, $1, null, null, true
+       )`,
+      [randomUUID()],
+    ),
+  ),
+);
+await mustReject("administrador não cria disponibilidade funcional de professor", () =>
+  asDatabaseRole("authenticated", ADMIN_UID, () =>
+    db.query(
+      `select public.upsert_teacher_schedule_block(
+         '2026-09-01 10:00+00'::timestamptz,
+         '2026-09-01 11:00+00'::timestamptz,
+         false,
+         'Admin indevido',
+         'other',
+         $1,
+         null,
+         null
+       )`,
+      [randomUUID()],
+    ),
+  ),
+);
+await mustReject("anon não resolve disponibilidade", () =>
+  asDatabaseRole("anon", null, () =>
+    db.query(`select * from public.resolve_teacher_availability_for_date($1,'2026-08-17')`, [
+      teacher.id,
+    ]),
+  ),
+);
+
+await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  db.query(`select public.admin_set_account_status($1,'blocked','Teste disponibilidade')`, [
+    TEACHER_UID,
+  ]),
+);
+await mustReject("professor bloqueado não guarda disponibilidade", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.save_teacher_availability_preferences(60, 0)`),
+  ),
+);
+const blockedTeacherAvailabilityRows = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  rows(`select id from public.teacher_availability_rule_records`),
+);
+check(
+  blockedTeacherAvailabilityRows.length === 0,
+  "professor bloqueado não lê disponibilidade administrativa",
+);
+await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  db.query(`select public.admin_set_account_status($1,'active',null)`, [TEACHER_UID]),
+);
+
 section("Aulas (Fase 1)");
 
 const [generated] = await rows(
