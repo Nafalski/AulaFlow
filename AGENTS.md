@@ -47,6 +47,8 @@ Sem `.env.local`, a aplicação arranca na mesma e mostra um ecrã a explicar o 
 | `npm run test:watch` | Vitest em modo contínuo |
 | `npm run db:verify` | Executa as migrações num PostgreSQL local (WASM) e exercita RLS, gestão e créditos |
 | `npm run db:verify:remote -- --confirm-development` | Verifica catálogo, migrações, RLS, grants, views e RPCs no Supabase remoto ligado |
+| `npm run db:setup:e2e -- --confirm-development` | Cria/reutiliza contas e fichas E2E no Supabase de desenvolvimento usando service role local |
+| `npm run db:verify:auth -- --confirm-development` | Valida Auth, JWT, PostgREST, RPCs, privacidade, isolamento e imutabilidade com sessões reais |
 | `npm run icons` | Regenera os ícones PNG provisórios da PWA |
 | `npm run check` | **lint → typecheck → test → db:verify → build**, por esta ordem |
 | `npm run db:link` | Liga o projeto local ao projeto Supabase remoto |
@@ -322,6 +324,51 @@ Ele não cria utilizadores, não escreve dados de teste e não imprime credencia
 
 **O que não substitui:** login real por GoTrue, payloads PostgREST com JWTs reais, confirmação de email, teste visual no browser, concorrência entre ligações e o cenário ponta a ponta professor → aluno. Estes continuam a exigir contas de teste no projeto de desenvolvimento.
 
+### E2E remoto com Auth real
+
+Os scripts remotos de Auth recusam execução sem confirmação explícita de desenvolvimento:
+
+```bash
+npm run db:setup:e2e -- --confirm-development
+npm run db:verify:auth -- --confirm-development
+```
+
+`db:setup:e2e` usa `SUPABASE_SERVICE_ROLE_KEY` apenas localmente para criar ou reutilizar as contas de teste, confirmar emails, marcar uma conta bloqueada e ligar fichas de aluno aos professores certos. A chave não é impressa e não deve existir em `NEXT_PUBLIC_*`.
+
+`db:verify:auth` não usa service role para simular utilizadores. Entra com URL pública, anon key, email e senha E2E; obtém JWT real; executa PostgREST e RPCs como professor, aluno, segundo professor, segundo aluno, admin, conta bloqueada e anónimo.
+
+Variáveis locais necessárias, sempre com valores de desenvolvimento e nunca commitadas:
+
+```bash
+SUPABASE_SERVICE_ROLE_KEY=...
+E2E_TEACHER_EMAIL=...
+E2E_TEACHER_PASSWORD=...
+E2E_STUDENT_EMAIL=...
+E2E_STUDENT_PASSWORD=...
+E2E_TEACHER_B_EMAIL=...
+E2E_TEACHER_B_PASSWORD=...
+E2E_STUDENT_B_EMAIL=...
+E2E_STUDENT_B_PASSWORD=...
+E2E_ADMIN_EMAIL=...
+E2E_ADMIN_PASSWORD=...
+E2E_BLOCKED_EMAIL=...
+E2E_BLOCKED_PASSWORD=...
+```
+
+`E2E_RUN_ID` é opcional. O valor `default` reutiliza o mesmo pacote E2E; outro valor cria um fluxo identificado por esse sufixo. Não usar dados pessoais reais nem senhas reais.
+
+### Checklist manual do Auth no Supabase
+
+A CLI usada no projeto valida banco e migrações, mas não confirma todas as definições do painel Auth. Antes de marcar a Fase 4 como concluída, confirmar manualmente no Supabase de desenvolvimento:
+
+- **Authentication → Providers → Email:** provider Email ativo.
+- **Authentication → Providers → Email:** confirmação de email ativa.
+- **Authentication → URL Configuration:** Site URL `http://localhost:3000`.
+- **Authentication → URL Configuration:** Redirect URL `http://localhost:3000/auth/callback`.
+- **Authentication → URL Configuration:** acrescentar o domínio real quando existir deployment.
+- **Authentication → Email Templates / SMTP:** envio padrão do Supabase pode ter limite de desenvolvimento; não implementar serviço externo nesta etapa.
+- **Password recovery:** fluxo aponta para `NEXT_PUBLIC_SITE_URL` e volta para `/auth/callback` ou `/redefinir-senha` conforme o link.
+
 ### Pacotes e créditos
 
 Quatro tabelas formam este subsistema:
@@ -459,7 +506,7 @@ Não existe um comando de formatação separado. Use `npm run lint:fix` apenas p
 | 1.5 | Fundação técnica de pacotes/créditos e PWA, sem interfaces de gestão | **Concluído** |
 | 2 | Perfis, definições e gestão administrativa básica de contas | **Concluído** |
 | 3 | Alunos, turmas, locais, política de cancelamento | **Concluído** |
-| 4 | Interfaces de modelos, atribuição, ajustes e saldos | **Parcialmente concluído** — Etapas 1A, 1B, 1C e 1D; Etapa 1E com validação estrutural remota automatizada e cenário Auth/PostgREST real pendente |
+| 4 | Interfaces de modelos, atribuição, ajustes e saldos | **Parcialmente concluído** — Etapas 1A, 1B, 1C e 1D; Etapa 1E com validação estrutural remota automatizada e scripts Auth/PostgREST prontos, execução real pendente de credenciais E2E locais |
 | 5 | Calendário e criação de aulas com reserva | **Planeado** |
 | 6 | Cancelamento, reagendamento, presenças e histórico | **Planeado** |
 | 7 | Área do aluno: aulas, créditos e confirmação | **Planeado** |

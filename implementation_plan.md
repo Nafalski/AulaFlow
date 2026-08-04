@@ -6,7 +6,7 @@
 
 **Documento vivo.** Atualizado no fim de cada fase com o que foi realmente construído.
 
-- **Estado atual:** Fases 1, 1.5, 2 e 3 concluídas. A Fase 4 está parcialmente concluída com a **Etapa 1A — modelos reutilizáveis de pacotes**, a **Etapa 1B — atribuição de pacotes aos alunos**, a **Etapa 1C — consulta de pacotes e saldos**, a **Etapa 1D — ajustes administrativos e histórico de pacotes** e a **Etapa 1E — revisão integrada**, já com migrações sincronizadas no Supabase remoto e verificação estrutural remota automatizada. O cenário real com Auth/PostgREST, contas de teste e browser ainda está pendente, portanto a Fase 4 ainda não deve ser marcada como concluída.
+- **Estado atual:** Fases 1, 1.5, 2 e 3 concluídas. A Fase 4 está parcialmente concluída com a **Etapa 1A — modelos reutilizáveis de pacotes**, a **Etapa 1B — atribuição de pacotes aos alunos**, a **Etapa 1C — consulta de pacotes e saldos**, a **Etapa 1D — ajustes administrativos e histórico de pacotes** e a **Etapa 1E — revisão integrada**, já com migrações sincronizadas no Supabase remoto, verificação estrutural remota automatizada e scripts Auth/PostgREST reais preparados. A execução do cenário real com contas de teste e browser ainda está pendente de credenciais E2E locais, portanto a Fase 4 ainda não deve ser marcada como concluída.
 - **Timezone do sistema:** `Europe/Lisbon`
 - **Idioma da interface:** Português (pt-PT)
 
@@ -524,14 +524,25 @@ Concluído:
 - Dependências Supabase auditadas: `@supabase/server` não é usado nem mantido; sessão/cookies continuam concentrados em `@supabase/ssr`, e `@supabase/supabase-js` fica para cliente admin server-only e tipos.
 - Variáveis de ambiente auditadas: o código lê `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `NEXT_PUBLIC_SITE_URL` e `SUPABASE_SERVICE_ROLE_KEY`; o exemplo não inclui chaves reais nem variáveis duplicadas de `SUPABASE_PUBLISHABLE_KEY`, `SUPABASE_SECRET_KEY` ou `SUPABASE_JWKS_URL`.
 - `scripts/verify-remote-supabase.mjs` valida o catálogo remoto sem escrever dados: migrações, tabelas, views, enums, índices, constraints, RLS, grants, assinaturas únicas de RPCs, `search_path` seguro, `EXECUTE` restrito e privacidade das views do aluno.
+- `scripts/setup-remote-test-users.mjs` prepara contas E2E reais no Auth usando service role apenas localmente, com confirmação explícita de desenvolvimento e sem imprimir credenciais.
+- `scripts/verify-remote-auth.mjs` valida login real, JWT, PostgREST, RPCs de pacotes, idempotência, isolamento, conta bloqueada, anónimo, imutabilidade e privacidade usando URL pública e anon key.
 
 Ainda pendente para encerrar a Fase 4:
 
 - Configuração manual do Auth no painel Supabase: Site URL, Redirect URL de callback, provider de email, confirmação de email e recuperação de palavra-passe.
-- Criação de contas reais de teste: professor, segundo professor, aluno, segundo aluno, admin e conta bloqueada.
+- Preenchimento local de `SUPABASE_SERVICE_ROLE_KEY` e das credenciais `E2E_*` em `.env.local`, sem commit.
+- Execução real de `npm run db:setup:e2e -- --confirm-development` e `npm run db:verify:auth -- --confirm-development`.
 - Cenário ponta a ponta via aplicação/browser: professor cria modelo, atribui pacote, ajusta créditos, suspende/reativa/altera validade; aluno vê somente a projeção permitida.
-- Validação real por GoTrue/PostgREST com JWTs: isolamento entre professor/aluno/outra organização/anónimo/conta bloqueada, idempotência por repetição real, imutabilidade por papéis da aplicação e payloads de rede.
 - Revisão visual em desktop e mobile com sessão real.
+
+Checklist manual de Auth para esta etapa:
+
+- Email provider ativo.
+- Confirmação de email ativa, obrigatória para claim seguro de aluno.
+- Site URL de desenvolvimento: `http://localhost:3000`.
+- Redirect URL de callback: `http://localhost:3000/auth/callback`.
+- Recuperação de palavra-passe apontando para o mesmo domínio local durante desenvolvimento.
+- Limitações do email padrão do Supabase documentadas; serviço externo de email permanece fora desta etapa.
 
 **Não concluído na Fase 4:** transferência/fusão/divisão entre pacotes, expiração automática e integração do ciclo de aulas com reserva/consumo pela interface.
 

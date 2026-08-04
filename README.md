@@ -5,7 +5,7 @@ Professores marcam aulas, escolhem os alunos e registam presenças; os alunos ve
 
 A começar pelo **beach tennis**, com arquitetura preparada para outras modalidades.
 
-> **Estado:** Fases 1, 1.5, 2 e 3 concluídas; Fase 4 parcialmente concluída pelas **Etapas 1A, 1B, 1C e 1D**. A Etapa 1E já tem validação estrutural remota automatizada; o cenário real com Auth/PostgREST e contas de teste ainda precisa ser executado no Supabase de desenvolvimento.
+> **Estado:** Fases 1, 1.5, 2 e 3 concluídas; Fase 4 parcialmente concluída pelas **Etapas 1A, 1B, 1C e 1D**. A Etapa 1E já tem validação estrutural remota automatizada e scripts para Auth/PostgREST real; a execução final ainda depende de credenciais E2E locais no Supabase de desenvolvimento.
 > Transferência/fusão de pacotes, aulas e calendário continuam nas etapas seguintes.
 
 ---
@@ -69,9 +69,20 @@ npm run check      # lint + typecheck + testes + db:verify + build
 npm run test       # testes
 npm run db:verify  # migrações limpas + integração PostgreSQL/RLS
 npm run db:verify:remote -- --confirm-development
+npm run db:setup:e2e -- --confirm-development
+npm run db:verify:auth -- --confirm-development
 npm run icons      # regenerar ícones PWA
 npm run db:push    # aplicar migrações
 ```
+
+Para o E2E real com Auth/PostgREST, preencha localmente `.env.local` com `SUPABASE_SERVICE_ROLE_KEY` e credenciais `E2E_*`, depois execute:
+
+```bash
+npm run db:setup:e2e -- --confirm-development
+npm run db:verify:auth -- --confirm-development
+```
+
+Confirme também no painel Supabase que o provider Email está ativo, a confirmação de email está ligada, o Site URL é `http://localhost:3000` e a Redirect URL inclui `http://localhost:3000/auth/callback`.
 
 ## Documentação
 
