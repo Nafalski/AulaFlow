@@ -170,6 +170,9 @@ const expectedFunctions = [
   "upsert_teacher_schedule_block",
   "cancel_teacher_schedule_block",
   "resolve_teacher_availability_for_date",
+  "resolve_teacher_availability_calendar_core",
+  "get_teacher_availability_calendar",
+  "get_student_availability_calendar",
 ];
 
 const authenticatedRpc = [
@@ -194,6 +197,8 @@ const authenticatedRpc = [
   "upsert_teacher_schedule_block",
   "cancel_teacher_schedule_block",
   "resolve_teacher_availability_for_date",
+  "get_teacher_availability_calendar",
+  "get_student_availability_calendar",
 ];
 
 const internalFunctions = [
@@ -205,6 +210,7 @@ const internalFunctions = [
   "validate_teacher_availability_rule",
   "validate_teacher_availability_exception",
   "validate_teacher_schedule_block",
+  "resolve_teacher_availability_calendar_core",
 ];
 
 const sql = `
@@ -590,6 +596,52 @@ checks as (
         and column_name in (
           'reason', 'category', 'notes', 'created_by', 'cancelled_by',
           'cancellation_reason', 'organization_name', 'teacher_email'
+        )
+    ), 'ok')
+
+  union all
+  select
+    'privacidade',
+    'authenticated nao consulta diretamente a view legada de disponibilidade',
+    not has_table_privilege(
+      'authenticated',
+      'public.teacher_availability_public_records',
+      'SELECT'
+    ),
+    case
+      when has_table_privilege('authenticated', 'public.teacher_availability_public_records', 'SELECT')
+        then 'SELECT concedido'
+      else 'ok'
+    end
+
+  union all
+  select
+    'privacidade',
+    'RPC de calendario do aluno nao devolve campos administrativos',
+    not exists (
+      select 1
+      from pg_proc proc
+      join pg_namespace namespace on namespace.oid = proc.pronamespace
+      cross join lateral unnest(proc.proargnames, proc.proargmodes) as output(arg_name, arg_mode)
+      where namespace.nspname = 'public'
+        and proc.proname = 'get_student_availability_calendar'
+        and output.arg_mode = 't'
+        and output.arg_name in (
+          'source', 'source_id', 'reason', 'category', 'all_day',
+          'teacher_id', 'organization_id', 'location_id'
+        )
+    ),
+    coalesce((
+      select string_agg(output.arg_name, ', ' order by output.arg_name)
+      from pg_proc proc
+      join pg_namespace namespace on namespace.oid = proc.pronamespace
+      cross join lateral unnest(proc.proargnames, proc.proargmodes) as output(arg_name, arg_mode)
+      where namespace.nspname = 'public'
+        and proc.proname = 'get_student_availability_calendar'
+        and output.arg_mode = 't'
+        and output.arg_name in (
+          'source', 'source_id', 'reason', 'category', 'all_day',
+          'teacher_id', 'organization_id', 'location_id'
         )
     ), 'ok')
 )

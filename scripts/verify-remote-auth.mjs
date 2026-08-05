@@ -124,6 +124,7 @@ try {
   const url = requireEnv("NEXT_PUBLIC_SUPABASE_URL");
   const anonKey = requireEnv("NEXT_PUBLIC_SUPABASE_ANON_KEY", { secret: true });
   const runId = optionalEnv("E2E_RUN_ID", "default").replace(/[^a-zA-Z0-9_-]/g, "_");
+  const fixtureBaseDate = optionalEnv("E2E_BASE_DATE", "2026-08-04");
 
   const credentials = {
     teacherA: {
@@ -232,9 +233,9 @@ try {
   const suspendKey = deterministicUuid(`suspend:${runId}`);
   const reactivateKey = deterministicUuid(`reactivate:${runId}`);
   const validityKey = deterministicUuid(`validity:${runId}`);
-  const startsOn = isoDatePlusDays(0);
-  const expiresOn = isoDatePlusDays(45);
-  const extendedExpiresOn = isoDatePlusDays(75);
+  const startsOn = isoDatePlusDays(0, fixtureBaseDate);
+  const expiresOn = isoDatePlusDays(45, fixtureBaseDate);
+  const extendedExpiresOn = isoDatePlusDays(75, fixtureBaseDate);
 
   const existingPackage = await maybeSingle(
     "pacote E2E existente",
@@ -532,9 +533,9 @@ try {
   );
 
   section("Disponibilidade real");
-  const availabilityDate = isoDatePlusDays(120);
-  const availabilityReplaceDate = isoDatePlusDays(121);
-  const availabilityBlockDate = isoDatePlusDays(122);
+  const availabilityDate = isoDatePlusDays(120, fixtureBaseDate);
+  const availabilityReplaceDate = isoDatePlusDays(121, fixtureBaseDate);
+  const availabilityBlockDate = isoDatePlusDays(122, fixtureBaseDate);
 
   const { error: preferencesError } = await teacherClient.rpc("save_teacher_availability_preferences", {
     p_default_lesson_duration_minutes: 90,
@@ -657,7 +658,7 @@ try {
     "bloqueio do professor",
     teacherClient
       .from("teacher_schedule_block_records")
-      .select("id, reason, category, status")
+      .select("id, starts_at, ends_at, all_day, reason, category, status")
       .eq("id", activeBlock.data),
   );
   check(
@@ -667,21 +668,87 @@ try {
     "Professor ve motivo e categoria privados do bloqueio",
   );
 
-  const publicAvailability = await studentClient
-    .from("teacher_availability_public_records")
-    .select("*")
-    .eq("teacher_id", teacherRecord.id);
-  if (publicAvailability.error) {
-    throw new Error(`Disponibilidade publica do aluno: ${summarizeError(publicAvailability.error)}`);
+  const addExceptionRecord = await getSingle(
+    "excecao add do professor",
+    teacherClient
+      .from("teacher_availability_exception_records")
+      .select("id, exception_date, mode, starts_at, ends_at")
+      .eq("id", addException.data),
+  );
+  const replaceExceptionRecord = await getSingle(
+    "excecao replace do professor",
+    teacherClient
+      .from("teacher_availability_exception_records")
+      .select("id, exception_date, mode, starts_at, ends_at")
+      .eq("id", replaceException.data),
+  );
+  const blockDate = blockRecord.starts_at.slice(0, 10);
+  const calendarDates = [
+    addExceptionRecord.exception_date,
+    replaceExceptionRecord.exception_date,
+    blockDate,
+  ].sort();
+  const calendarStartDate = calendarDates[0];
+  const calendarEndDate = calendarDates.at(-1);
+
+  const teacherCalendar = await teacherClient.rpc("get_teacher_availability_calendar", {
+    p_start_date: calendarStartDate,
+    p_end_date: calendarEndDate,
+  });
+  if (teacherCalendar.error) {
+    throw new Error(`Calendario privado do professor: ${summarizeError(teacherCalendar.error)}`);
   }
   check(
-    publicAvailability.data.some((row) => row.source === "weekly_rule" && row.status === "available") &&
-      publicAvailability.data.some((row) => row.source === "schedule_block" && row.status === "unavailable"),
-    "Aluno A ve disponibilidade publica generica do proprio professor",
+    teacherCalendar.data.some(
+      (row) =>
+        row.date === addExceptionRecord.exception_date &&
+        row.starts_at?.startsWith("08:00") &&
+        row.ends_at?.startsWith("09:00") &&
+        row.status === "available",
+    ) &&
+      teacherCalendar.data.some(
+        (row) =>
+          row.date === blockDate &&
+          row.source === "schedule_block" &&
+          row.status === "unavailable" &&
+          row.reason === "e2e_compromisso_privado" &&
+          row.category === "personal",
+      ),
+    "Professor ve calendario privado com disponibilidade e detalhes do proprio bloqueio",
   );
-  const privateAvailabilityFields = forbiddenColumns(publicAvailability.data[0] ?? {}, [
+
+  await mustReject("Aluno A nao consulta diretamente a view legada de disponibilidade", async () =>
+    studentClient.from("teacher_availability_public_records").select("source").limit(1),
+  );
+
+  const studentAvailability = await studentClient.rpc("get_student_availability_calendar", {
+    p_start_date: calendarStartDate,
+    p_end_date: calendarEndDate,
+  });
+  if (studentAvailability.error) {
+    throw new Error(`Calendario seguro do aluno: ${summarizeError(studentAvailability.error)}`);
+  }
+  check(
+    studentAvailability.data.some(
+      (row) =>
+        row.date === addExceptionRecord.exception_date &&
+        row.starts_at?.startsWith("08:00") &&
+        row.ends_at?.startsWith("09:00") &&
+        row.status === "available",
+    ) &&
+      !studentAvailability.data.some(
+        (row) => row.date === blockDate && row.starts_at?.startsWith("10:00"),
+      ),
+    "Aluno A ve disponibilidade segura do proprio professor sem receber bloqueio como horario livre",
+  );
+  const privateAvailabilityFields = forbiddenColumns(studentAvailability.data[0] ?? {}, [
+    "source",
+    "source_id",
     "reason",
     "category",
+    "all_day",
+    "teacher_id",
+    "organization_id",
     "notes",
     "created_by",
     "cancelled_by",
@@ -689,8 +756,8 @@ try {
   ]);
   check(
     privateAvailabilityFields.length === 0,
-    "Disponibilidade publica nao inclui motivo, categoria nem auditoria",
-    `Disponibilidade publica vazou campos: ${privateAvailabilityFields.join(", ")}`,
+    "Calendario do aluno nao inclui IDs internos, motivo, categoria nem auditoria",
+    `Calendario do aluno vazou campos: ${privateAvailabilityFields.join(", ")}`,
   );
 
   await mustReturnNoRows("Aluno A nao le bloqueios administrativos", () =>
@@ -699,8 +766,33 @@ try {
   await mustReturnNoRows("Professor B nao le horario do Professor A", () =>
     teacherBClient.from("teacher_availability_rule_records").select("id").eq("id", weeklyRuleRepeat.data),
   );
-  await mustReturnNoRows("Aluno B nao le disponibilidade publica do Professor A", () =>
-    studentBClient.from("teacher_availability_public_records").select("source").eq("teacher_id", teacherRecord.id),
+  const studentBAvailability = await studentBClient.rpc("get_student_availability_calendar", {
+    p_start_date: calendarStartDate,
+    p_end_date: calendarEndDate,
+  });
+  if (studentBAvailability.error) {
+    throw new Error(`Calendario seguro do Aluno B: ${summarizeError(studentBAvailability.error)}`);
+  }
+  check(
+    !studentBAvailability.data.some(
+      (row) =>
+        row.date === addExceptionRecord.exception_date &&
+        row.starts_at?.startsWith("08:00") &&
+        row.ends_at?.startsWith("09:00"),
+    ),
+    "Aluno B consulta apenas o calendario do proprio professor",
+  );
+  await mustReject("Calendario privado recusa intervalo invertido", async () =>
+    teacherClient.rpc("get_teacher_availability_calendar", {
+      p_start_date: calendarEndDate,
+      p_end_date: calendarStartDate,
+    }),
+  );
+  await mustReject("Calendario privado recusa mais de 42 dias", async () =>
+    teacherClient.rpc("get_teacher_availability_calendar", {
+      p_start_date: calendarStartDate,
+      p_end_date: isoDatePlusDays(43, calendarStartDate),
+    }),
   );
   await mustReject("Aluno A nao cria disponibilidade", async () =>
     studentClient.rpc("upsert_teacher_availability_rule", {
@@ -762,6 +854,12 @@ try {
       p_minimum_break_minutes: 0,
     }),
   );
+  await mustReject("Conta bloqueada nao consulta calendario privado", async () =>
+    blockedClient.rpc("get_teacher_availability_calendar", {
+      p_start_date: availabilityDate,
+      p_end_date: availabilityDate,
+    }),
+  );
 
   await mustReject("Anonimo nao le view de pacotes", async () =>
     anonClient.from("student_package_records").select("id").limit(1),
@@ -783,6 +881,12 @@ try {
   );
   await mustReject("Anonimo nao le disponibilidade publica", async () =>
     anonClient.from("teacher_availability_public_records").select("source").limit(1),
+  );
+  await mustReject("Anonimo nao consulta calendario de disponibilidade", async () =>
+    anonClient.rpc("get_student_availability_calendar", {
+      p_start_date: availabilityDate,
+      p_end_date: availabilityDate,
+    }),
   );
   await mustReject("Anonimo nao resolve disponibilidade", async () =>
     anonClient.rpc("resolve_teacher_availability_for_date", {

@@ -155,6 +155,12 @@ export type AvailabilityPublicStatus = "available" | "unavailable";
 
 export type AvailabilitySource = "weekly_rule" | "date_exception" | "schedule_block";
 
+export type AvailabilityCalendarSource =
+  | "weekly_rule"
+  | "date_exception"
+  | "schedule_block"
+  | "default";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Linhas
 // ─────────────────────────────────────────────────────────────────────────────
@@ -876,8 +882,22 @@ export type TeacherAvailabilityPublicRecord = {
 };
 
 export type ResolvedTeacherAvailabilityRecord = {
-  source: "weekly_rule" | "date_exception" | "schedule_block" | "default";
+  source: AvailabilityCalendarSource;
   source_id: UUID | null;
+  starts_at: TimeOnly | null;
+  ends_at: TimeOnly | null;
+  status: AvailabilityPublicStatus;
+};
+
+export type TeacherAvailabilityCalendarRecord = ResolvedTeacherAvailabilityRecord & {
+  date: DateOnly;
+  reason: string | null;
+  category: ScheduleBlockCategory | null;
+  all_day: boolean;
+};
+
+export type StudentAvailabilityCalendarRecord = {
+  date: DateOnly;
   starts_at: TimeOnly | null;
   ends_at: TimeOnly | null;
   status: AvailabilityPublicStatus;
@@ -1562,6 +1582,14 @@ export type Database = {
       resolve_teacher_availability_for_date: {
         Args: { p_teacher_id: UUID; p_date: DateOnly };
         Returns: ResolvedTeacherAvailabilityRecord[];
+      };
+      get_teacher_availability_calendar: {
+        Args: { p_start_date: DateOnly; p_end_date: DateOnly };
+        Returns: TeacherAvailabilityCalendarRecord[];
+      };
+      get_student_availability_calendar: {
+        Args: { p_start_date: DateOnly; p_end_date: DateOnly };
+        Returns: StudentAvailabilityCalendarRecord[];
       };
     };
     Enums: {

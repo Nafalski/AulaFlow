@@ -52,6 +52,10 @@ function check(condition, okMessage, failMessage) {
 
 const section = (name) => console.log(`\n${name}`);
 
+function forbiddenColumns(row, columns) {
+  return columns.filter((column) => Object.hasOwn(row, column));
+}
+
 const db = await new PGlite();
 const rows = async (sql, params) => (await db.query(sql, params)).rows;
 const one = async (sql, params) => (await rows(sql, params))[0];
@@ -4229,7 +4233,7 @@ check(
 
 // ── 14. Disponibilidade do professor (Fase 5A) ───────────────────────────────
 
-section("Disponibilidade do professor (Etapa 5A)");
+section("Disponibilidade do professor (Etapas 5A e 5B)");
 
 const PHASE5_AVAILABILITY_FUNCTIONS = [
   "save_teacher_availability_preferences",
@@ -4240,6 +4244,9 @@ const PHASE5_AVAILABILITY_FUNCTIONS = [
   "upsert_teacher_schedule_block",
   "cancel_teacher_schedule_block",
   "resolve_teacher_availability_for_date",
+  "resolve_teacher_availability_calendar_core",
+  "get_teacher_availability_calendar",
+  "get_student_availability_calendar",
 ];
 
 const phase5FunctionSecurity = await rows(
@@ -4521,8 +4528,8 @@ const partialBlockKey = randomUUID();
 const partialBlock = await asDatabaseRole("authenticated", TEACHER_UID, () =>
   one(
     `select public.upsert_teacher_schedule_block(
+       '2026-08-17 09:30+00'::timestamptz,
        '2026-08-17 10:30+00'::timestamptz,
-       '2026-08-17 11:30+00'::timestamptz,
        false,
        'Compromisso pessoal',
        'personal',
@@ -4536,8 +4543,8 @@ const partialBlock = await asDatabaseRole("authenticated", TEACHER_UID, () =>
 const repeatedPartialBlock = await asDatabaseRole("authenticated", TEACHER_UID, () =>
   one(
     `select public.upsert_teacher_schedule_block(
+       '2026-08-17 09:30+00'::timestamptz,
        '2026-08-17 10:30+00'::timestamptz,
-       '2026-08-17 11:30+00'::timestamptz,
        false,
        'Compromisso pessoal',
        'personal',
@@ -4624,39 +4631,197 @@ check(
   "aluno não consulta as projeções administrativas de disponibilidade",
 );
 
-const studentPublicAvailabilityRows = await asDatabaseRole("authenticated", ANA_UID, () =>
+await mustReject("aluno não consulta diretamente a view legada de disponibilidade", () =>
+  asDatabaseRole("authenticated", ANA_UID, () =>
+    db.query(`select source from public.teacher_availability_public_records limit 1`),
+  ),
+);
+
+const teacherCalendarRows = await asDatabaseRole("authenticated", TEACHER_UID, () =>
   rows(
-    `select source, starts_at_local::text, ends_at_local::text, starts_at_utc, ends_at_utc, status::text
-     from public.teacher_availability_public_records
-     where teacher_id=$1
-     order by source, starts_at_local`,
-    [teacher.id],
+    `select calendar.date::text as date, calendar.source, calendar.source_id,
+            calendar.starts_at::text, calendar.ends_at::text, calendar.status::text,
+            calendar.reason, calendar.category::text, calendar.all_day
+       from public.get_teacher_availability_calendar('2026-08-16', '2026-08-17') calendar
+      order by calendar.date, calendar.starts_at nulls last, calendar.source`,
   ),
 );
 check(
-  studentPublicAvailabilityRows.some(
+  teacherCalendarRows.some(
     (row) =>
-      row.source === "weekly_rule" &&
-      row.starts_at_local === "09:00:00" &&
+      row.date === "2026-08-16" &&
+      row.source === "date_exception" &&
+      row.starts_at === "10:00:00" &&
+      row.ends_at === "12:00:00" &&
       row.status === "available",
   ) &&
-    studentPublicAvailabilityRows.some(
-      (row) => row.source === "schedule_block" && row.status === "unavailable",
+    teacherCalendarRows.some(
+      (row) =>
+        row.date === "2026-08-17" &&
+        row.source === "date_exception" &&
+        row.starts_at === "10:00:00" &&
+        row.ends_at === "10:30:00" &&
+        row.status === "available",
+    ) &&
+    teacherCalendarRows.some(
+      (row) =>
+        row.date === "2026-08-17" &&
+        row.source === "schedule_block" &&
+        row.starts_at === "10:30:00" &&
+        row.ends_at === "11:30:00" &&
+        row.status === "unavailable" &&
+        row.reason === "Compromisso pessoal" &&
+        row.category === "personal",
+    ) &&
+    teacherCalendarRows.some(
+      (row) =>
+        row.date === "2026-08-17" &&
+        row.source === "date_exception" &&
+        row.starts_at === "11:30:00" &&
+        row.ends_at === "12:00:00" &&
+        row.status === "available",
     ),
-  "aluno vê apenas disponibilidade pública genérica do próprio professor",
+  "calendário privado do professor divide disponibilidade e mantém detalhes dos bloqueios",
 );
 
-const externalStudentPublicAvailabilityRows = await asDatabaseRole(
-  "authenticated",
-  PRESET_ORG_UID,
-  () =>
-    rows(`select source from public.teacher_availability_public_records where teacher_id=$1`, [
-      teacher.id,
-    ]),
+const studentCalendarRows = await asDatabaseRole("authenticated", ANA_UID, () =>
+  rows(
+    `select calendar.date::text as date, calendar.starts_at::text, calendar.ends_at::text,
+            calendar.status::text
+       from public.get_student_availability_calendar('2026-08-16', '2026-08-17') calendar
+      order by calendar.date, calendar.starts_at nulls last`,
+  ),
 );
 check(
-  externalStudentPublicAvailabilityRows.length === 0,
-  "aluno sem ficha deste professor não consulta disponibilidade pública alheia",
+  studentCalendarRows.some(
+    (row) =>
+      row.date === "2026-08-16" &&
+      row.starts_at === "10:00:00" &&
+      row.ends_at === "12:00:00" &&
+      row.status === "available",
+  ) &&
+    studentCalendarRows.some(
+      (row) =>
+        row.date === "2026-08-17" &&
+        row.starts_at === "10:00:00" &&
+        row.ends_at === "10:30:00" &&
+        row.status === "available",
+    ) &&
+    studentCalendarRows.some(
+      (row) =>
+        row.date === "2026-08-17" &&
+        row.starts_at === "11:30:00" &&
+        row.ends_at === "12:00:00" &&
+        row.status === "available",
+    ) &&
+    !studentCalendarRows.some(
+      (row) => row.date === "2026-08-17" && row.starts_at === "10:30:00",
+    ),
+  "aluno vê só disponibilidade segura do próprio professor e não vê o período bloqueado como disponível",
+);
+check(
+  forbiddenColumns(studentCalendarRows[0] ?? {}, [
+    "source",
+    "source_id",
+    "reason",
+    "category",
+    "all_day",
+    "teacher_id",
+    "organization_id",
+  ]).length === 0,
+  "calendário do aluno não expõe IDs internos nem detalhes administrativos",
+);
+
+const colleagueCalendarRows = await asDatabaseRole("authenticated", SAME_ORG_TEACHER_UID, () =>
+  rows(
+    `select calendar.source, calendar.source_id
+       from public.get_teacher_availability_calendar('2026-08-16', '2026-08-17') calendar`,
+  ),
+);
+check(
+  colleagueCalendarRows.every(
+    (row) => row.source_id !== mondayMorningRule.id && row.source !== "schedule_block",
+  ),
+  "professor da mesma organização consulta apenas o próprio calendário",
+);
+
+await mustReject("aluno sem ficha ligada não consulta calendário de disponibilidade", () =>
+  asDatabaseRole("authenticated", PRESET_ORG_UID, () =>
+    db.query(`select * from public.get_student_availability_calendar('2026-08-16', '2026-08-17')`),
+  ),
+);
+await mustReject("calendário recusa intervalo invertido", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select * from public.get_teacher_availability_calendar('2026-08-18', '2026-08-17')`),
+  ),
+);
+await mustReject("calendário recusa intervalos superiores a 42 dias", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select * from public.get_teacher_availability_calendar('2026-08-01', '2026-09-12')`),
+  ),
+);
+
+const legacyAvailabilityGrant = await rows(
+  `select privilege_type
+     from information_schema.table_privileges
+    where table_schema='public'
+      and table_name='teacher_availability_public_records'
+      and grantee='authenticated'
+      and privilege_type='SELECT'`,
+);
+check(
+  legacyAvailabilityGrant.length === 0,
+  "view legada de disponibilidade não tem SELECT direto para authenticated",
+);
+
+const studentCalendarDefaultRows = await asDatabaseRole("authenticated", ANA_UID, () =>
+  rows(
+    `select calendar.date::text as date, calendar.starts_at, calendar.ends_at, calendar.status::text
+       from public.get_student_availability_calendar('2026-08-18', '2026-08-18') calendar`,
+  ),
+);
+check(
+  studentCalendarDefaultRows.length === 1 &&
+    studentCalendarDefaultRows[0].date === "2026-08-18" &&
+    studentCalendarDefaultRows[0].starts_at === null &&
+    studentCalendarDefaultRows[0].ends_at === null &&
+    studentCalendarDefaultRows[0].status === "unavailable",
+  "aluno recebe indisponibilidade genérica quando não há períodos disponíveis",
+);
+
+const teacherCalendarDefaultRows = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  rows(
+    `select calendar.date::text as date, calendar.source, calendar.status::text
+       from public.get_teacher_availability_calendar('2026-08-18', '2026-08-18') calendar`,
+  ),
+);
+check(
+  teacherCalendarDefaultRows.length === 1 &&
+    teacherCalendarDefaultRows[0].source === "default" &&
+    teacherCalendarDefaultRows[0].status === "unavailable",
+  "professor recebe origem default em dias sem disponibilidade nem bloqueios",
+);
+
+const teacherCalendarHasNoBlockedSlot = teacherCalendarRows.some(
+  (row) =>
+    row.date === "2026-08-17" &&
+    row.starts_at === "10:30:00" &&
+    row.ends_at === "11:30:00" &&
+    row.status === "available",
+);
+check(
+  !teacherCalendarHasNoBlockedSlot,
+  "calendário nunca devolve como disponível um intervalo coberto por bloqueio",
+);
+
+check(
+  teacherCalendarRows.some(
+    (row) =>
+      row.source === "schedule_block" &&
+      row.reason === "Compromisso pessoal" &&
+      row.category === "personal",
+  ),
+  "motivo e categoria aparecem apenas no calendário privado do professor",
 );
 
 const cancelledBlock = await asDatabaseRole("authenticated", TEACHER_UID, () =>

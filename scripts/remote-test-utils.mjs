@@ -84,8 +84,8 @@ export function maskId(id) {
   return `${id.slice(0, 8)}...`;
 }
 
-export function isoDatePlusDays(days) {
-  const date = new Date();
+export function isoDatePlusDays(days, baseDate = new Date()) {
+  const date = baseDate instanceof Date ? new Date(baseDate) : new Date(`${baseDate}T00:00:00.000Z`);
   date.setUTCDate(date.getUTCDate() + days);
   return date.toISOString().slice(0, 10);
 }

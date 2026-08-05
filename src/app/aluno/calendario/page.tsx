@@ -1,15 +1,123 @@
+import { Link2 } from "lucide-react";
 import type { Metadata } from "next";
 
-import { PhasePlaceholder } from "@/components/layout/phase-placeholder";
+import {
+  AvailabilityCalendar,
+  type AvailabilityCalendarItem,
+} from "@/components/calendar/availability-calendar";
+import { Alert } from "@/components/ui/alert";
+import { Card } from "@/components/ui/card";
+import { requireRole } from "@/lib/auth/session";
+import { lisbonDateKey } from "@/lib/datetime";
+import { createSupabaseServerClient } from "@/lib/supabase/server";
+import {
+  readCalendarSearchParams,
+  type CalendarSearchParams,
+} from "@/lib/validation/calendar";
+import type { StudentAvailabilityCalendarRecord } from "@/types/database";
 
 export const metadata: Metadata = { title: "Calendário" };
+export const dynamic = "force-dynamic";
 
-export default function StudentCalendarPage() {
+type StudentCalendarPageProps = {
+  searchParams: Promise<CalendarSearchParams>;
+};
+
+function throwCalendarReadError(context: string, error: unknown): never {
+  console.error(`[AulaFlow] Falha ao consultar ${context} do calendário do aluno.`, error);
+  throw new Error("Não foi possível carregar o calendário.");
+}
+
+function studentCalendarItem(row: StudentAvailabilityCalendarRecord): AvailabilityCalendarItem {
+  return {
+    date: row.date,
+    startsAt: row.starts_at,
+    endsAt: row.ends_at,
+    status: row.status,
+  };
+}
+
+function UnlinkedStudentCard({ email }: { email: string }) {
   return (
-    <PhasePlaceholder
-      phase={7}
-      title="O seu calendário"
-      description="As suas aulas organizadas por dia, com horário, local e professor."
-    />
+    <Card className="p-5">
+      <div className="mb-3 flex size-11 items-center justify-center rounded-[var(--radius-field)] bg-sun-soft">
+        <Link2 className="size-5.5 text-sun-deep" aria-hidden="true" />
+      </div>
+      <h1 className="text-xl font-extrabold tracking-tight text-ink">
+        Conta ainda não ligada
+      </h1>
+      <p className="mt-1.5 text-sm leading-relaxed text-muted">
+        O calendário aparece quando o professor registar a sua ficha com este email:{" "}
+        <strong className="font-semibold text-ink">{email}</strong>.
+      </p>
+    </Card>
+  );
+}
+
+export default async function StudentCalendarPage({
+  searchParams,
+}: StudentCalendarPageProps) {
+  const user = await requireRole("student", "/aluno/calendario");
+  const now = new Date();
+  const today = lisbonDateKey(now);
+  const window = readCalendarSearchParams(await searchParams, now);
+
+  if (!user.studentId) {
+    return <UnlinkedStudentCard email={user.email} />;
+  }
+
+  const supabase = await createSupabaseServerClient();
+  const studentResult = await supabase
+    .from("student_self_profile")
+    .select("id, created_by_teacher_id, is_active")
+    .eq("id", user.studentId)
+    .maybeSingle();
+
+  if (studentResult.error) throwCalendarReadError("a ficha do aluno", studentResult.error);
+  if (!studentResult.data?.is_active || !studentResult.data.created_by_teacher_id) {
+    return (
+      <div className="flex flex-col gap-5">
+        <UnlinkedStudentCard email={user.email} />
+        <Alert tone="warning">
+          A ficha ainda não tem um professor responsável ativo.
+        </Alert>
+      </div>
+    );
+  }
+
+  const [teacherResult, calendarResult] = await Promise.all([
+    supabase
+      .from("teacher_public_profiles")
+      .select("public_name")
+      .eq("id", studentResult.data.created_by_teacher_id)
+      .maybeSingle(),
+    supabase.rpc("get_student_availability_calendar", {
+      p_start_date: window.startDate,
+      p_end_date: window.endDate,
+    }),
+  ]);
+
+  if (teacherResult.error) throwCalendarReadError("o professor responsável", teacherResult.error);
+  if (calendarResult.error) throwCalendarReadError("a disponibilidade", calendarResult.error);
+
+  const items = (calendarResult.data ?? []).map(studentCalendarItem);
+
+  return (
+    <div className="flex flex-col gap-5">
+      <AvailabilityCalendar
+        audience="student"
+        basePath="/aluno/calendario"
+        window={window}
+        today={today}
+        items={items}
+        title="Calendário"
+        subtitle="Horários disponíveis do seu professor."
+        teacherName={teacherResult.data?.public_name ?? null}
+      />
+
+      <Alert tone="info">
+        Marcações e confirmações chegam numa etapa seguinte.
+      </Alert>
+    </div>
   );
 }

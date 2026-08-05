@@ -145,7 +145,8 @@ update public.profiles set role = 'admin' where email = 'voce@exemplo.pt';
 │   ├── ..._phase4_package_admin.sql Etapa 1D: ajustes administrativos e histórico
 │   ├── ..._phase4_package_view_grants.sql grants explícitos das views da Fase 4
 │   ├── ..._phase5_teacher_availability.sql Etapa 5A: disponibilidade, exceções e bloqueios
-│   └── ..._phase5_availability_view_grants.sql grants explícitos das views da Etapa 5A
+│   ├── ..._phase5_availability_view_grants.sql grants explícitos das views da Etapa 5A
+│   └── ..._phase5_calendar_projection.sql Etapa 5B: calendário visual e RPC segura do aluno
 │
 └── src/
     ├── proxy.ts             Renova a sessão e protege rotas (era middleware.ts)
@@ -310,7 +311,7 @@ npm run typecheck
 
 ### `npm run db:verify`
 
-Executa **todas** as migrações, a partir de uma base vazia, contra PostgreSQL compilado para WebAssembly (PGlite), e volta a aplicá-las para confirmar idempotência. Depois exerce 325 garantias: RLS com papéis `authenticated`/`anon`, isolamento entre organizações e professores, privilégios das RPCs, perfis/claim/bloqueio, convites sem segredo, alunos, turmas, locais, modelos, atribuição, consulta e ajustes administrativos de pacotes, disponibilidade do professor, grants estritos das views, políticas, reserva, consumo, libertação, reagendamento, exceções, correções, imutabilidade do livro-razão e constraints herdadas das aulas.
+Executa **todas** as migrações, a partir de uma base vazia, contra PostgreSQL compilado para WebAssembly (PGlite), e volta a aplicá-las para confirmar idempotência. Depois exerce 336 garantias: RLS com papéis `authenticated`/`anon`, isolamento entre organizações e professores, privilégios das RPCs, perfis/claim/bloqueio, convites sem segredo, alunos, turmas, locais, modelos, atribuição, consulta e ajustes administrativos de pacotes, disponibilidade do professor, calendário seguro, grants estritos das views, políticas, reserva, consumo, libertação, reagendamento, exceções, correções, imutabilidade do livro-razão e constraints herdadas das aulas.
 
 Corre em segundos, sem Docker e sem projeto na nuvem — serve para o CI.
 
@@ -478,7 +479,7 @@ Estas regras vivem em `lib/domain/package-display.ts` e são partilhadas entre p
 
 `resolveCreditOutcome()` em `lib/domain/packages.ts` decide cobrar/devolver conforme prazo e política; a Server Action futura aplica essa decisão chamando a RPC correspondente. As interfaces e essas orquestrações ainda pertencem às Fases 4–7.
 
-### Disponibilidade do professor (Etapa 5A)
+### Disponibilidade e calendário (Etapas 5A e 5B)
 
 A fonte de verdade da agenda do professor fica separada de aulas, participantes e créditos:
 
@@ -502,9 +503,18 @@ Intervalos simples são representados pelo espaço entre períodos do mesmo dia,
 
 A interface vive em `/professor/definicoes/disponibilidade`. Server Actions chamam RPCs (`save_teacher_availability_preferences`, `upsert_teacher_availability_rule`, `upsert_teacher_availability_exception`, `upsert_teacher_schedule_block` e cancelamentos/desativações correspondentes). O browser nunca envia organização, professor, autor ou timestamps.
 
-A projeção `teacher_availability_public_records` é preparada para a área futura do aluno e expõe apenas início/fim e estado genérico `available`/`unavailable`; não inclui motivo, categoria, notas nem auditoria. Anónimo não tem acesso.
+A view legada `teacher_availability_public_records` ficou sem `SELECT` direto para `authenticated` na Etapa 5B. A interface de calendário usa RPCs:
 
-**Ainda não implementado:** calendário gráfico, criação de aulas, recorrência, participantes, reservas/consumo de créditos, presenças, cancelamentos/reagendamentos de aulas, confirmação do aluno, lista de espera e notificações.
+| RPC | Público | Campos |
+|---|---|---|
+| `get_teacher_availability_calendar(p_start_date, p_end_date)` | Professor ativo | Data, origem, `source_id`, períodos, estado, motivo/categoria dos próprios bloqueios |
+| `get_student_availability_calendar(p_start_date, p_end_date)` | Aluno ativo com ficha ligada | Data, início, fim e estado |
+
+Ambas recusam intervalos vazios, invertidos ou superiores a 42 dias. A RPC do aluno deriva o professor de `current_student_id()` e da ficha ligada; o browser do aluno nunca envia `teacher_id` e nunca recebe `source`, `source_id`, motivo, categoria, organização, professor ou auditoria. Bloqueios ativos cortam os intervalos disponíveis para que um período bloqueado nunca apareça como livre.
+
+A interface vive em `/professor/calendario` e `/aluno/calendario`, com vistas por dia, semana e mês via query params `data` e `vista`. O calendário do professor mostra detalhes privados e prévia de inícios possíveis com a duração/intervalo das preferências; o do aluno mostra apenas disponibilidade segura.
+
+**Ainda não implementado:** criação de aulas, calendário de aulas reais, recorrência, participantes, reservas/consumo de créditos, presenças, cancelamentos/reagendamentos de aulas, confirmação do aluno, lista de espera e notificações.
 
 ### `src/types/database.ts`
 
@@ -516,7 +526,7 @@ As linhas são declaradas com `type`, **nunca com `interface`**. Um `interface` 
 
 Vitest, ambiente Node, `TZ=Europe/Lisbon` fixo para que um teste que passa localmente passe também no CI (que corre em UTC).
 
-Cobertura atual: **242 testes** em dezasseis ficheiros — testes de domínio, regressões de respostas/autenticação do proxy, formulários da Fase 2, validação/normalização da gestão da Fase 3, modelos, atribuição, apresentação, navegação, ajustes administrativos de pacotes e disponibilidade do professor.
+Cobertura atual: **254 testes** em dezoito ficheiros — testes de domínio, regressões de respostas/autenticação do proxy, formulários da Fase 2, validação/normalização da gestão da Fase 3, modelos, atribuição, apresentação, navegação, ajustes administrativos de pacotes, disponibilidade do professor e calendário.
 
 Os testes de domínio exercem funções puras, sem base de dados nem mocks. Os testes de validação garantem normalização, limites, identificadores, estados, valores monetários em cêntimos, datas civis e rejeição de campos extra/protegidos. A integração SQL fica separada em `db:verify`.
 
@@ -539,11 +549,11 @@ Não existe um comando de formatação separado. Use `npm run lint:fix` apenas p
 | 2 | Perfis, definições e gestão administrativa básica de contas | **Concluído** |
 | 3 | Alunos, turmas, locais, política de cancelamento | **Concluído** |
 | 4 | Interfaces de modelos, atribuição, ajustes e saldos | **Concluído** — Etapas 1A, 1B, 1C, 1D e 1E validadas com Auth/PostgREST reais e browser desktop/mobile |
-| 5 | Calendário e criação de aulas com reserva | **Parcialmente concluído** — Etapa 5A: disponibilidade, intervalos e bloqueios do professor |
+| 5 | Calendário e criação de aulas com reserva | **Parcialmente concluído** — Etapas 5A e 5B: disponibilidade, intervalos, bloqueios e calendário visual seguro |
 | 6 | Cancelamento, reagendamento, presenças e histórico | **Planeado** |
 | 7 | Área do aluno: aulas, créditos e confirmação | **Planeado** |
 | 8 | Notificações, lembretes e expiração agendada | **Planeado** |
-| 9 | Supabase real, concorrência, acessibilidade e deployment | **Parcialmente concluído** — RLS em PGlite e validação real da Fase 4/Etapa 5A feitos; concorrência real, acessibilidade completa e deployment pendentes |
+| 9 | Supabase real, concorrência, acessibilidade e deployment | **Parcialmente concluído** — RLS em PGlite e validação real da Fase 4/Etapas 5A-5B feitos; concorrência real, acessibilidade completa e deployment pendentes |
 
 **Ao concluir uma fase ou etapa:** `npm run check`, corrigir tudo o que falhe, atualizar `implementation_plan.md`, e resumir o que foi criado e como testar manualmente.
 
