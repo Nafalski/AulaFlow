@@ -2,11 +2,13 @@ import { describe, expect, it } from "vitest";
 
 import {
   ACTIVE_WORKSPACE_FIELDS,
+  CLUB_CALENDAR_SHARING_FIELDS,
   CLUB_FORM_FIELDS,
   WORKSPACE_INVITATION_FIELDS,
   WORKSPACE_MEMBER_ROLE_FIELDS,
   WORKSPACE_STATUS_FIELDS,
   activeWorkspaceSchema,
+  clubCalendarSharingSchema,
   clubFormSchema,
   unexpectedWorkspaceFields,
   workspaceInvitationSchema,
@@ -248,6 +250,64 @@ describe("activeWorkspaceSchema", () => {
     expect(
       activeWorkspaceSchema.parse({ organizationId: ORG.toUpperCase() }).organizationId,
     ).toBe(ORG);
+  });
+});
+
+describe("clubCalendarSharingSchema", () => {
+  it("aceita ativar e desativar", () => {
+    expect(clubCalendarSharingSchema.parse({ organizationId: ORG, enabled: "true" }).enabled).toBe(
+      true,
+    );
+    expect(clubCalendarSharingSchema.parse({ organizationId: ORG, enabled: "false" }).enabled).toBe(
+      false,
+    );
+  });
+
+  it("recusa um clube que não seja UUID", () => {
+    expect(
+      clubCalendarSharingSchema.safeParse({ organizationId: "clube", enabled: "true" }).success,
+    ).toBe(false);
+  });
+
+  it("recusa um estado que não seja booleano", () => {
+    expect(
+      clubCalendarSharingSchema.safeParse({ organizationId: ORG, enabled: "talvez" }).success,
+    ).toBe(false);
+    expect(clubCalendarSharingSchema.safeParse({ organizationId: ORG, enabled: "" }).success).toBe(
+      false,
+    );
+  });
+
+  // O alvo nunca vem do formulário: a RPC deriva a membership da sessão.
+  it("recusa qualquer tentativa de indicar outro membro ou forjar autoria", () => {
+    for (const extra of [
+      { membershipId: MEMBERSHIP },
+      { profileId: MEMBERSHIP },
+      { teacherId: MEMBERSHIP },
+      { updatedBy: MEMBERSHIP },
+      { role: "owner" },
+    ]) {
+      expect(
+        clubCalendarSharingSchema.safeParse({ organizationId: ORG, enabled: "true", ...extra })
+          .success,
+      ).toBe(false);
+    }
+  });
+
+  it("o contrato do formulário tem apenas o clube e o estado", () => {
+    expect([...CLUB_CALENDAR_SHARING_FIELDS]).toEqual(["organizationId", "enabled"]);
+    expect(
+      unexpectedWorkspaceFields(
+        formDataFrom({ organizationId: ORG, enabled: "true" }),
+        CLUB_CALENDAR_SHARING_FIELDS,
+      ),
+    ).toEqual([]);
+    expect(
+      unexpectedWorkspaceFields(
+        formDataFrom({ organizationId: ORG, enabled: "true", membershipId: MEMBERSHIP }),
+        CLUB_CALENDAR_SHARING_FIELDS,
+      ),
+    ).toEqual(["membershipId"]);
   });
 });
 

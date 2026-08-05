@@ -207,6 +207,12 @@ export type OrganizationMember = {
   profile_id: UUID;
   role: WorkspaceMemberRole;
   status: WorkspaceMemberStatus;
+  /**
+   * Consentimento do próprio membro para partilhar disponibilidade genérica
+   * com ESTE clube. `false` por omissão; escrito só por
+   * `set_workspace_calendar_sharing()`, que não aceita alvo.
+   */
+  calendar_sharing_enabled: boolean;
   invited_by: UUID | null;
   invited_at: Timestamp | null;
   accepted_at: Timestamp | null;
@@ -1036,6 +1042,40 @@ export type WorkspaceReceivedInvitationRecord = {
   invited_by_name: string | null;
 }
 
+/**
+ * Professores de um clube ativo e o seu consentimento de partilha.
+ *
+ * É este contrato que permite distinguir "indisponível" de "disponibilidade
+ * não partilhada": um colega sem consentimento continua na lista, apenas sem
+ * períodos. Sem email, telefone, avatar, `profile_id`, `teacher_id` ou
+ * organização pessoal.
+ */
+export type ClubCalendarMemberDirectoryEntry = {
+  membership_id: UUID;
+  organization_id: UUID;
+  teacher_name: string;
+  role: WorkspaceMemberRole;
+  calendar_sharing_enabled: boolean;
+  is_self: boolean;
+}
+
+/**
+ * Linha do calendário partilhado do clube.
+ *
+ * Contrato deliberadamente estreito. Não existe — e não deve passar a existir —
+ * `source`, `source_id`, `reason`, `category`, `all_day`, `teacher_id`,
+ * `profile_id` ou `organization_id`. Um bloqueio pessoal de um colega chega
+ * aqui como ausência de disponibilidade, nunca como período identificável.
+ */
+export type ClubAvailabilityCalendarRecord = {
+  membership_id: UUID;
+  teacher_name: string;
+  date: DateOnly;
+  starts_at: string | null;
+  ends_at: string | null;
+  status: AvailabilityPublicStatus;
+}
+
 /** Moderação de clubes. Não dá acesso a alunos, pacotes nem agendas. */
 export type AdminWorkspaceDirectoryEntry = {
   id: UUID;
@@ -1523,6 +1563,10 @@ export type Database = {
         Row: AdminWorkspaceDirectoryEntry;
         Relationships: [];
       };
+      club_calendar_member_directory: {
+        Row: ClubCalendarMemberDirectoryEntry;
+        Relationships: [];
+      };
     };
     Functions: {
       claim_student_profile: {
@@ -1815,6 +1859,19 @@ export type Database = {
       set_active_workspace: {
         Args: { p_organization_id: UUID | null };
         Returns: UUID;
+      };
+      set_workspace_calendar_sharing: {
+        Args: { p_organization_id: UUID; p_enabled: boolean };
+        Returns: boolean;
+      };
+      get_club_availability_calendar: {
+        Args: {
+          p_organization_id: UUID;
+          p_start_date: DateOnly;
+          p_end_date: DateOnly;
+          p_membership_id?: UUID | null;
+        };
+        Returns: ClubAvailabilityCalendarRecord[];
       };
     };
     Enums: {

@@ -5,8 +5,8 @@ Professores marcam aulas, escolhem os alunos e registam presenças; os alunos ve
 
 A começar pelo **beach tennis**, com arquitetura preparada para outras modalidades.
 
-> **Estado:** Fases 1, 1.5, 2, 3 e 4 concluídas. A Fase 5 tem as Etapas 5A, 5B, 5B.1 e 5B.2A: fonte de verdade da disponibilidade, projeção segura, calendário visual refinado em dia/semana/mês e fundação de clubes, workspaces e membros.
-> O calendário compartilhado do clube, a criação de aulas, a transferência/fusão de pacotes e as reservas de créditos continuam nas etapas seguintes.
+> **Estado:** Fases 1, 1.5, 2, 3 e 4 concluídas. A Fase 5 tem as Etapas 5A, 5B, 5B.1, 5B.2A e 5B.2B: fonte de verdade da disponibilidade, projeção segura, calendário visual refinado em dia/semana/mês, fundação de clubes/workspaces/membros e calendário partilhado do clube com consentimento por membership.
+> Locais e campos, a criação de aulas, a transferência/fusão de pacotes e as reservas de créditos continuam nas etapas seguintes.
 
 ---
 
@@ -47,6 +47,8 @@ Instruções completas — incluindo a configuração do Supabase — em [`AGENT
 - Calendários de disponibilidade em `/professor/calendario` e `/aluno/calendario`, com vistas Dia/Semana/Mês, semana em linha temporal no desktop, mês sem coluna de horas e mobile adaptado; o aluno recebe só data, hora e estado do próprio professor
 - Clubes como workspaces partilhados em `/professor/clubes`: criação, papéis internos (proprietário, gestor, professor), convites por email confirmado, gestão de membros e seletor de contexto no shell
 - Convites recebidos em `/professor/convites`, com aceitar e recusar; moderação de clubes em `/admin/clubes`, com suspender/reativar auditado que não apaga dados
+- Calendário partilhado do clube em `/professor/clubes/[id]/calendario`, com Dia/Semana/Mês e filtro por professor: cada professor decide, clube a clube, se partilha a disponibilidade, e quem não partilha aparece como «Disponibilidade não partilhada»
+- A projeção partilhada mostra apenas disponível ou indisponível — um bloqueio pessoal de um colega nunca revela motivo, categoria nem identificadores internos
 - Views seguras para a área do aluno, sem valor registado, origem administrativa, observações, autoria ou identificadores internos sensíveis
 - RPCs seguras de disponibilidade: professor vê detalhes dos próprios bloqueios; aluno não recebe motivo, categoria, fonte interna, organização nem `teacher_id`
 - Diretório administrativo com pesquisa, filtros, detalhe e bloqueio/reativação auditados
@@ -55,16 +57,16 @@ Instruções completas — incluindo a configuração do Supabase — em [`AGENT
 - Pacotes, saldos disponíveis/reservados/utilizados e livro-razão append-only
 - RPCs PostgreSQL para atribuir, reservar, consumir, libertar, reagendar, ajustar e corrigir créditos
 - RPCs PostgreSQL para guardar preferências, horários semanais, exceções, bloqueios e resolução segura de disponibilidade
-- Regras e validação com 313 testes de unidade/regressão
-- 434 verificações PostgreSQL sobre migrações, permissões, RLS, gestão, claim, modelos, atribuição, consulta, ajustes administrativos, disponibilidade, calendário seguro, clubes, memberships, convites, contexto ativo, grants de views e saldos
-- 147 verificações Auth/PostgREST reais no Supabase de desenvolvimento
+- Regras e validação com 340 testes de unidade/regressão
+- 479 verificações PostgreSQL sobre migrações, permissões, RLS, gestão, claim, modelos, atribuição, consulta, ajustes administrativos, disponibilidade, calendário seguro, clubes, memberships, convites, contexto ativo, consentimento de partilha, calendário partilhado, grants de views e saldos
+- 179 verificações Auth/PostgREST reais no Supabase de desenvolvimento
 - Estrutura responsiva das áreas de professor, aluno e administração, com manifesto e ícones PWA
 
-`/professor/clubes` gere contextos, clubes e membros; `/professor/convites` mostra os convites recebidos. `/professor/pacotes` gere modelos reutilizáveis, atribuição, consulta e ajustes administrativos dos pacotes atribuídos. `/professor/pacotes/historico` mostra a auditoria global. `/professor/definicoes/disponibilidade` guarda a fonte de verdade da agenda do professor. `/professor/calendario` e `/aluno/calendario` mostram disponibilidade calculada em Dia/Semana/Mês; ainda não criam aulas. `/aluno/pacotes` mostra apenas os próprios pacotes e movimentos básicos.
+`/professor/clubes` gere contextos, clubes e membros; `/professor/clubes/[id]/calendario` mostra a disponibilidade partilhada do clube; `/professor/convites` mostra os convites recebidos. `/professor/pacotes` gere modelos reutilizáveis, atribuição, consulta e ajustes administrativos dos pacotes atribuídos. `/professor/pacotes/historico` mostra a auditoria global. `/professor/definicoes/disponibilidade` guarda a fonte de verdade da agenda do professor. `/professor/calendario` e `/aluno/calendario` mostram disponibilidade calculada em Dia/Semana/Mês; ainda não criam aulas. `/aluno/pacotes` mostra apenas os próprios pacotes e movimentos básicos.
 
-O próximo passo planeado da Fase 5 é a **Etapa 5B.2B — calendário compartilhado do clube**. A 5B.2A criou clubes, memberships e convites, mas **nenhum professor vê a agenda de outro**: pertencer ao mesmo clube dá acesso apenas ao nome e ao papel dos colegas. O professor independente continua totalmente suportado, com workspace pessoal privado e agenda própria, e não precisa criar clube nenhum.
+O próximo passo planeado da Fase 5 é a **Etapa 5B.3 — locais, campos e Google Places**. O professor independente continua totalmente suportado, com workspace pessoal privado e agenda própria, e não precisa criar clube nenhum.
 
-Mudar de contexto ainda **não** torna alunos, pacotes, turmas, locais, disponibilidade e calendário multi-clube — esses módulos continuam ligados ao workspace pessoal, e a interface diz isso explicitamente em vez de o esconder.
+Entrar num clube **não** partilha a agenda: `calendar_sharing_enabled` nasce desativado e só o próprio membro o altera — proprietários, gestores e a administração da plataforma não têm caminho para forçar a partilha de outra pessoa. Mudar de contexto também ainda **não** torna alunos, pacotes, turmas, locais e disponibilidade multi-clube; esses módulos continuam ligados ao workspace pessoal, e a interface diz isso explicitamente em vez de o esconder. Não existem aulas, participantes, reservas nem conflitos nesta etapa.
 
 Sem um bucket de Storage configurado, os avatares usam iniciais. Preparar a ligação de um aluno ainda não envia email sem um Supabase remoto; a interface identifica essa limitação. As preferências de email ficam guardadas, mas a entrega automática e os lembretes agendados pertencem à Fase 8.
 

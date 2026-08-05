@@ -897,6 +897,25 @@ try {
     "Professor A mantem o workspace pessoal e o clube em simultaneo",
   );
 
+  // Uma execucao interrompida a meio pode deixar o Professor B como membro
+  // ativo, e convidar um membro existente e — corretamente — recusado. O
+  // cenario repoe o estado inicial em vez de exigir limpeza manual.
+  const leftoverMembership = await teacherBClient
+    .from("workspace_membership_records")
+    .select("membership_id, organization_id")
+    .eq("organization_id", clubId)
+    .maybeSingle();
+
+  if (leftoverMembership.data) {
+    const { error: leftoverError } = await teacherClient.rpc("remove_workspace_member", {
+      p_membership_id: leftoverMembership.data.membership_id,
+    });
+    if (leftoverError) {
+      throw new Error(`Repor estado do clube E2E: ${summarizeError(leftoverError)}`);
+    }
+    ok("Estado do clube reposto: membership residual de uma execucao anterior removida");
+  }
+
   const { data: invitationId, error: inviteError } = await teacherClient.rpc(
     "invite_workspace_member",
     {
@@ -1219,6 +1238,296 @@ try {
     teacherClient.from("admin_workspace_directory").select("id").limit(1),
   );
 
+  section("Calendario partilhado do clube");
+
+  // O Professor B voltou a sair do clube na seccao anterior. Cada execucao usa
+  // um convite novo: um convite e consumido ao ser aceite, e reutilizar a chave
+  // devolveria o convite ja aceite da execucao anterior.
+  const calendarInviteKey = deterministicUuid(`club-calendar-invite:${runId}:${new Date().toISOString()}`);
+  const { data: calendarInvitationId, error: calendarInviteError } = await teacherClient.rpc(
+    "invite_workspace_member",
+    {
+      p_organization_id: clubId,
+      p_email: credentials.teacherB.email,
+      p_role: "teacher",
+      p_idempotency_key: calendarInviteKey,
+    },
+  );
+  if (calendarInviteError) {
+    throw new Error(`Reconvidar Professor B: ${summarizeError(calendarInviteError)}`);
+  }
+  const { data: calendarMembershipId, error: calendarAcceptError } = await teacherBClient.rpc(
+    "accept_workspace_invitation",
+    { p_invitation_id: calendarInvitationId },
+  );
+  if (calendarAcceptError) {
+    throw new Error(`Professor B reentrar no clube: ${summarizeError(calendarAcceptError)}`);
+  }
+  ok("Professor B voltou a ser membro do clube E2E");
+
+  // Disponibilidade propria do Professor B, criada pela sua propria sessao.
+  const clubCalendarDate = isoDatePlusDays(14, fixtureBaseDate);
+  const clubCalendarWeekday = new Date(`${clubCalendarDate}T12:00:00Z`).getUTCDay();
+  const { error: teacherBRuleError } = await teacherBClient.rpc(
+    "upsert_teacher_availability_rule",
+    {
+      p_weekday: clubCalendarWeekday,
+      p_starts_at: "09:00",
+      p_ends_at: "12:00",
+      p_idempotency_key: deterministicUuid(`club-calendar-rule:${runId}`),
+      p_rule_id: null,
+      p_location_id: null,
+      p_is_active: true,
+    },
+  );
+  if (teacherBRuleError) {
+    throw new Error(`Disponibilidade do Professor B: ${summarizeError(teacherBRuleError)}`);
+  }
+
+  const directoryBefore = await teacherClient
+    .from("club_calendar_member_directory")
+    .select("membership_id, teacher_name, calendar_sharing_enabled, is_self")
+    .eq("organization_id", clubId);
+  const teacherBEntry = (directoryBefore.data ?? []).find(
+    (row) => row.membership_id === calendarMembershipId,
+  );
+  check(
+    teacherBEntry !== undefined && teacherBEntry.calendar_sharing_enabled === false,
+    "Entrar no clube nao partilha a agenda: o consentimento nasce desativado",
+  );
+  check(
+    forbiddenColumns((directoryBefore.data ?? [])[0] ?? {}, [
+      "email",
+      "phone",
+      "avatar_url",
+      "profile_id",
+      "teacher_id",
+      "blocked_reason",
+    ]).length === 0,
+    "Diretorio do calendario nao expoe contactos nem identidades internas",
+  );
+
+  const calendarWithoutSharing = await teacherClient.rpc("get_club_availability_calendar", {
+    p_organization_id: clubId,
+    p_start_date: clubCalendarDate,
+    p_end_date: clubCalendarDate,
+    p_membership_id: null,
+  });
+  check(
+    !calendarWithoutSharing.error &&
+      !(calendarWithoutSharing.data ?? []).some(
+        (row) => row.membership_id === calendarMembershipId,
+      ),
+    "Professor A nao recebe periodos de quem nao partilha",
+  );
+
+  // A RPC nao aceita alvo: nao existe parametro por onde indicar outro membro.
+  // A recusa do PostgREST e, aqui, a propria prova.
+  await mustReject(
+    "A RPC de partilha nao aceita alvo: ninguem altera a preferencia de outro membro",
+    async () =>
+      teacherClient.rpc("set_workspace_calendar_sharing", {
+        p_organization_id: clubId,
+        p_enabled: true,
+        p_membership_id: calendarMembershipId,
+      }),
+  );
+
+  const { data: sharingEnabled, error: sharingError } = await teacherBClient.rpc(
+    "set_workspace_calendar_sharing",
+    { p_organization_id: clubId, p_enabled: true },
+  );
+  if (sharingError) throw new Error(`Ativar partilha: ${summarizeError(sharingError)}`);
+  const { data: sharingRepeat } = await teacherBClient.rpc("set_workspace_calendar_sharing", {
+    p_organization_id: clubId,
+    p_enabled: true,
+  });
+  check(
+    sharingEnabled === true && sharingRepeat === false,
+    "Professor B ativa a propria partilha e repetir e idempotente",
+  );
+
+  const sharedCalendar = await teacherClient.rpc("get_club_availability_calendar", {
+    p_organization_id: clubId,
+    p_start_date: clubCalendarDate,
+    p_end_date: clubCalendarDate,
+    p_membership_id: null,
+  });
+  const teacherBPeriods = (sharedCalendar.data ?? []).filter(
+    (row) => row.membership_id === calendarMembershipId && row.status === "available",
+  );
+  check(
+    !sharedCalendar.error && teacherBPeriods.length > 0,
+    "Professor A passa a ver a disponibilidade generica do Professor B",
+  );
+  check(
+    forbiddenColumns(teacherBPeriods[0] ?? {}, [
+      "reason",
+      "category",
+      "source",
+      "source_id",
+      "all_day",
+      "rule_id",
+      "exception_id",
+      "block_id",
+      "teacher_id",
+      "profile_id",
+      "organization_id",
+    ]).length === 0,
+    "Calendario do clube nao expoe motivo, categoria, origem nem IDs internos",
+  );
+  check(
+    (sharedCalendar.data ?? []).every((row) => ["available", "unavailable"].includes(row.status)),
+    "Calendario do clube devolve apenas disponivel ou indisponivel",
+  );
+
+  const filteredCalendar = await teacherClient.rpc("get_club_availability_calendar", {
+    p_organization_id: clubId,
+    p_start_date: clubCalendarDate,
+    p_end_date: clubCalendarDate,
+    p_membership_id: calendarMembershipId,
+  });
+  check(
+    !filteredCalendar.error &&
+      (filteredCalendar.data ?? []).every((row) => row.membership_id === calendarMembershipId),
+    "Filtro por professor devolve apenas o membro pedido",
+  );
+
+  await mustReject(
+    "Filtro com identificador que nao e membro deste clube e recusado",
+    async () =>
+      teacherClient.rpc("get_club_availability_calendar", {
+        p_organization_id: clubId,
+        p_start_date: clubCalendarDate,
+        p_end_date: clubCalendarDate,
+        p_membership_id: clubBId,
+      }),
+  );
+
+  await mustReject("Workspace pessoal nao tem calendario partilhado", async () =>
+    teacherClient.rpc("get_club_availability_calendar", {
+      p_organization_id: teacherRecord.organization_id,
+      p_start_date: clubCalendarDate,
+      p_end_date: clubCalendarDate,
+      p_membership_id: null,
+    }),
+  );
+  await mustReject("Calendario do clube recusa intervalos superiores a 42 dias", async () =>
+    teacherClient.rpc("get_club_availability_calendar", {
+      p_organization_id: clubId,
+      p_start_date: clubCalendarDate,
+      p_end_date: isoDatePlusDays(56, fixtureBaseDate),
+      p_membership_id: null,
+    }),
+  );
+  await mustReject("Calendario do clube recusa intervalo invertido", async () =>
+    teacherClient.rpc("get_club_availability_calendar", {
+      p_organization_id: clubId,
+      p_start_date: clubCalendarDate,
+      p_end_date: isoDatePlusDays(13, fixtureBaseDate),
+      p_membership_id: null,
+    }),
+  );
+  await mustReject("Professor A nao consulta o calendario do Clube B", async () =>
+    teacherClient.rpc("get_club_availability_calendar", {
+      p_organization_id: clubBId,
+      p_start_date: clubCalendarDate,
+      p_end_date: clubCalendarDate,
+      p_membership_id: null,
+    }),
+  );
+  await mustReject("Professor A nao altera a partilha num clube de que nao e membro", async () =>
+    teacherClient.rpc("set_workspace_calendar_sharing", {
+      p_organization_id: clubBId,
+      p_enabled: true,
+    }),
+  );
+  await mustReject("Aluno nao consulta o calendario do clube", async () =>
+    studentClient.rpc("get_club_availability_calendar", {
+      p_organization_id: clubId,
+      p_start_date: clubCalendarDate,
+      p_end_date: clubCalendarDate,
+      p_membership_id: null,
+    }),
+  );
+  await mustReject("Aluno nao altera partilha de calendario", async () =>
+    studentClient.rpc("set_workspace_calendar_sharing", {
+      p_organization_id: clubId,
+      p_enabled: true,
+    }),
+  );
+
+  await mustReturnNoRows("Membro do clube continua sem ler alunos do colega", () =>
+    teacherBClient
+      .from("teacher_student_management_records")
+      .select("id")
+      .eq("organization_id", teacherRecord.organization_id),
+  );
+  await mustReturnNoRows("Membro do clube continua sem ler a agenda administrativa do colega", () =>
+    teacherBClient
+      .from("teacher_schedule_block_records")
+      .select("id")
+      .eq("organization_id", teacherRecord.organization_id),
+  );
+
+  const { data: sharingDisabled } = await teacherBClient.rpc("set_workspace_calendar_sharing", {
+    p_organization_id: clubId,
+    p_enabled: false,
+  });
+  const calendarAfterDisable = await teacherClient.rpc("get_club_availability_calendar", {
+    p_organization_id: clubId,
+    p_start_date: clubCalendarDate,
+    p_end_date: clubCalendarDate,
+    p_membership_id: null,
+  });
+  check(
+    sharingDisabled === true &&
+      !(calendarAfterDisable.data ?? []).some(
+        (row) => row.membership_id === calendarMembershipId,
+      ),
+    "Desativar a partilha remove imediatamente os periodos do colega",
+  );
+
+  const directoryAfterDisable = await teacherClient
+    .from("club_calendar_member_directory")
+    .select("membership_id, calendar_sharing_enabled")
+    .eq("organization_id", clubId);
+  check(
+    (directoryAfterDisable.data ?? []).some(
+      (row) => row.membership_id === calendarMembershipId && row.calendar_sharing_enabled === false,
+    ),
+    "Quem nao partilha continua listado, com o estado de partilha",
+  );
+
+  // Repor o estado inicial. Sem isto, a seccao "Clubes e membros" da execucao
+  // seguinte tentaria convidar alguem que ja e membro — foi assim que a segunda
+  // passagem falhou antes desta limpeza existir.
+  const { error: calendarRemovalError } = await teacherClient.rpc("remove_workspace_member", {
+    p_membership_id: calendarMembershipId,
+  });
+  check(!calendarRemovalError, "Professor A remove o Professor B e repoe o estado inicial");
+
+  await mustReject("Membership removida nao consulta o calendario do clube", async () =>
+    teacherBClient.rpc("get_club_availability_calendar", {
+      p_organization_id: clubId,
+      p_start_date: clubCalendarDate,
+      p_end_date: clubCalendarDate,
+      p_membership_id: null,
+    }),
+  );
+  await mustReject("Membership removida nao altera a partilha", async () =>
+    teacherBClient.rpc("set_workspace_calendar_sharing", {
+      p_organization_id: clubId,
+      p_enabled: true,
+    }),
+  );
+  await mustReturnNoRows("Membership removida desaparece do diretorio do calendario", () =>
+    teacherBClient
+      .from("club_calendar_member_directory")
+      .select("membership_id")
+      .eq("organization_id", clubId),
+  );
+
   section("Conta bloqueada e anonimo");
   await signIn(blockedClient, credentials.blocked.email, credentials.blocked.password, "Conta bloqueada");
   await mustReturnNoRows("Conta bloqueada nao le views de pacotes", () =>
@@ -1264,6 +1573,23 @@ try {
   await mustReject("Conta bloqueada nao aceita convite", async () =>
     blockedClient.rpc("accept_workspace_invitation", { p_invitation_id: invitationId }),
   );
+  await mustReject("Conta bloqueada nao consulta o calendario do clube", async () =>
+    blockedClient.rpc("get_club_availability_calendar", {
+      p_organization_id: clubId,
+      p_start_date: clubCalendarDate,
+      p_end_date: clubCalendarDate,
+      p_membership_id: null,
+    }),
+  );
+  await mustReject("Conta bloqueada nao altera a partilha", async () =>
+    blockedClient.rpc("set_workspace_calendar_sharing", {
+      p_organization_id: clubId,
+      p_enabled: true,
+    }),
+  );
+  await mustReturnNoRows("Conta bloqueada nao le o diretorio do calendario do clube", () =>
+    blockedClient.from("club_calendar_member_directory").select("membership_id").limit(1),
+  );
 
   await mustReject("Anonimo nao le view de pacotes", async () =>
     anonClient.from("student_package_records").select("id").limit(1),
@@ -1283,6 +1609,23 @@ try {
   );
   await mustReject("Anonimo nao muda de contexto", async () =>
     anonClient.rpc("set_active_workspace", { p_organization_id: null }),
+  );
+  await mustReject("Anonimo nao consulta o calendario do clube", async () =>
+    anonClient.rpc("get_club_availability_calendar", {
+      p_organization_id: clubId,
+      p_start_date: clubCalendarDate,
+      p_end_date: clubCalendarDate,
+      p_membership_id: null,
+    }),
+  );
+  await mustReject("Anonimo nao altera a partilha de calendario", async () =>
+    anonClient.rpc("set_workspace_calendar_sharing", {
+      p_organization_id: clubId,
+      p_enabled: true,
+    }),
+  );
+  await mustReject("Anonimo nao le o diretorio do calendario do clube", async () =>
+    anonClient.from("club_calendar_member_directory").select("membership_id").limit(1),
   );
   await mustReject("Anonimo nao executa RPC", async () =>
     anonClient.rpc("assign_student_package", {

@@ -6,7 +6,7 @@
 
 **Documento vivo.** Atualizado no fim de cada fase com o que foi realmente construído.
 
-- **Estado atual:** Fases 1, 1.5, 2, 3 e 4 concluídas. A Fase 5 tem as **Etapas 5A, 5B, 5B.1 e 5B.2A** concluídas — disponibilidade, projeção segura, calendário visual refinado e fundação de clubes/workspaces/membros. O **calendário compartilhado (5B.2B)** e a criação de aulas continuam pendentes.
+- **Estado atual:** Fases 1, 1.5, 2, 3 e 4 concluídas. A Fase 5 tem as **Etapas 5A, 5B, 5B.1, 5B.2A e 5B.2B** concluídas — disponibilidade, projeção segura, calendário visual refinado, fundação de clubes/workspaces/membros e calendário partilhado com consentimento. **Locais/campos (5B.3)** e a criação de aulas continuam pendentes.
 - **Timezone do sistema:** `Europe/Lisbon`
 - **Idioma da interface:** Português (pt-PT)
 
@@ -718,11 +718,49 @@ Mudar de contexto **não** torna alunos, pacotes, turmas, locais, disponibilidad
 
 Calendário compartilhado, agenda de colegas, aulas, participantes, recorrência, créditos, presenças, conflitos, locais/campos/recursos, Google Places/Maps/Calendar, Apple Calendar, ICS, notificações, pagamentos, diretório público de clubes, pesquisa pública de professores, transferência de propriedade e edição das definições do clube.
 
-### Planeado para a Fase 5 — Etapa 5B.2B: calendário compartilhado do clube
+### Concluído na Fase 5 — Etapa 5B.2B: calendário partilhado do clube
 
-Esta subetapa ainda **não está implementada**. Vai usar a fundação da 5B.2A. O professor independente continua totalmente suportado e não precisa criar clube para usar o AulaFlow.
+Estado: **concluída**. Abre exatamente uma porta a mais do que a 5B.2A — disponibilidade genérica — e só com consentimento explícito, clube a clube. Não implementa aulas, locais, campos, recursos, conflitos nem créditos.
 
-Decisões a preservar:
+#### Decisão: o consentimento vive na membership
+
+`organization_members.calendar_sharing_enabled boolean not null default false`.
+
+Na membership, e não em `teacher_profiles`, porque uma preferência global obrigaria a escolher entre partilhar com todos os clubes ou com nenhum. Quem dá aulas num clube de bairro e noutro de competição tem boas razões para partilhar num e não no outro. Ativar no Clube A não ativa no Clube B, e sair de um clube leva o consentimento consigo.
+
+**Só o próprio altera.** `set_workspace_calendar_sharing(p_organization_id, p_enabled)` **não aceita alvo**: deriva a membership de `auth.uid()` e do clube. Proprietário, gestor e administrador da plataforma não têm sequer um parâmetro por onde tentar. A ausência do parâmetro é a garantia — não uma verificação que alguém possa remover por distração.
+
+Gravar o mesmo valor devolve `false` e não repete a auditoria, que regista apenas ator, clube e transição — nunca períodos, motivos, categorias ou notas.
+
+#### Projeção segura
+
+`get_club_availability_calendar(p_organization_id, p_start_date, p_end_date, p_membership_id)` devolve exatamente seis colunas: `membership_id`, `teacher_name`, `date`, `starts_at`, `ends_at`, `status`.
+
+Reaproveita o motor `resolve_teacher_availability_calendar_core()` da 5A/5B, mas só sobrevivem as linhas `available`. **Um bloqueio pessoal chega ao colega como ausência de disponibilidade** — indistinguível de não ter horário nesse período. Nunca são devolvidos `source`, `source_id`, `reason`, `category`, `all_day`, IDs de regra/exceção/bloqueio, `teacher_id`, `profile_id`, organização pessoal, autoria, email ou telefone.
+
+O contrato é próprio e não herda o contrato privado do professor, que transporta motivo e categoria: reaproveitá-lo seria arriscar que uma coluna futura passasse a ser partilhada por acidente.
+
+Quem não consentiu não produz linha nenhuma. `club_calendar_member_directory` é que distingue "indisponível" de "disponibilidade não partilhada".
+
+#### Autorização
+
+Professor global ativo + membership `active` + `kind = 'club'` + `status = 'active'`. `active_workspace_id` **não** participa da decisão em momento nenhum. O filtro `p_membership_id` é revalidado — tem de ser uma membership ativa **deste** clube — e é recusado em vez de devolver vazio, para não parecer que o colega simplesmente não tem disponibilidade.
+
+#### Interface
+
+`/professor/clubes/[id]/calendario`, com Dia/Semana/Mês, "Hoje", navegação e filtro por professor. O filtro vive no URL e é feito de links, sem JavaScript: sobrevive a partilhar o endereço, recarregar e voltar atrás.
+
+Reutiliza `AvailabilityCalendar` em vez de duplicar o calendário: o componente ganhou a audiência `club` e as verificações de privacidade passaram de `audience === "student"` para `audience !== "teacher"`, para que uma audiência futura nasça segura. `calendarHref()` passou a preservar a query já presente no `basePath` — uma alteração num único ponto, em vez de arrastar o filtro por seis subcomponentes de um ficheiro de 1229 linhas.
+
+#### Uma correção que a idempotência apanhou
+
+A primeira versão alargava `workspace_member_directory` com a coluna de partilha. A verificação de reaplicação falhou: a migração da 5B.2A recria essa view com `create or replace`, que recusa perder colunas. A view do calendário passou a ser própria — o que também é melhor desenho, porque o contrato do calendário deixa de herdar um contrato pensado para outra coisa.
+
+#### Não implementado nesta etapa
+
+Aulas, participantes, locais, campos, recursos, Google Places/Maps/Calendar, Apple Calendar, ICS, recorrência, conflitos, reservas, consumo de créditos, presenças, cancelamentos, notificações, pagamentos, drag-and-drop, transferência de propriedade e diretório público. Os únicos estados são disponível e indisponível: não existe "ocupado", "reservado", "lotado", "vagas" nem "conflito", porque nada disso existe ainda para ser verdade.
+
+Decisões preservadas da 5B.2A:
 
 - Professor independente mantém um workspace pessoal privado, vê somente a própria agenda e nenhum outro professor acessa sua agenda.
 - Clube funcionará como workspace compartilhado, com vários professores e possíveis administradores/gestores.
@@ -755,8 +793,8 @@ Ordem da Fase 5:
 
 1. 5B.1 — Refinamento visual. **Concluída.**
 2. 5B.2A — Clubes, workspaces e membros. **Concluída.**
-3. 5B.2B — Calendário compartilhado do clube.
-4. 5B.3 — Locais, campos e Google Places.
+3. 5B.2B — Calendário partilhado do clube. **Concluída.**
+4. 5B.3 — Locais, campos e Google Places. **Próxima.**
 5. 5C — Criação e edição de aulas.
 6. 5D — Recorrência, conflitos e reservas de créditos.
 7. 5E — Revisão integrada.
@@ -880,6 +918,10 @@ Ver secção 1.4. Preservar o que funciona; a separação por área é a pedida.
 **Alternativa:** tabela `clubs` ligada a `organizations`, ou clube a substituir o `organization_id` do professor.
 **Porquê:** `organizations` já tinha nome, slug, timezone, timestamps e era o eixo de isolamento de todas as tabelas — uma tabela `clubs` duplicaria o conceito de workspace. E fazer do clube o `organization_id` do professor impossibilitaria pertencer a vários clubes e migraria à força os dados existentes. Mantendo `profiles.organization_id` sempre pessoal, `auth_org_id()` nunca devolve um clube, e portanto entrar num clube não abre nenhuma das policies existentes: a privacidade entre colegas passa a ser uma propriedade da estrutura, não de uma policy que alguém tenha de se lembrar de escrever.
 
+### D-21 — Partilha de agenda por consentimento, não por membership
+**Alternativa:** membros de um clube veem automaticamente a agenda uns dos outros.
+**Porquê:** a agenda de um professor revela quando trabalha, quando descansa e quando tem compromissos pessoais — mesmo reduzida a "disponível/indisponível". Entrar num clube para coordenar horários não é consentir na exposição da própria rotina. O consentimento fica na membership, e não no professor, porque a decisão é razoável clube a clube. O custo é um clube parecer vazio até alguém ativar a partilha; a interface explica isso em vez de o esconder.
+
 ### D-20 — Convite de clube sem token
 **Alternativa:** token assinado numa URL de convite.
 **Porquê:** a mesma razão de `student_invitations`. Um token é um segredo portador que aparece em logs, históricos de browser e cabeçalhos `Referer`, e obriga a gerir entropia, hashing, expiração e uso único. Exigir que quem aceita esteja autenticado com o email **confirmado** do convite dá a mesma garantia sem criar nada que possa vazar. O custo é não poder convidar alguém que nunca confirme o email — que é precisamente quem não deveria entrar.
@@ -892,7 +934,7 @@ Preparados, **não implementados**. Assinalados no código com `// EXTENSÃO:`.
 
 | Funcionalidade | O que já está preparado | O que falta |
 |---|---|---|
-| Clubes com vários professores | `organizations` tipada, `organization_members`, convites, papéis internos e contexto ativo (5B.2A) | Calendário compartilhado (5B.2B); locais/campos (5B.3); transferência de propriedade |
+| Clubes com vários professores | `organizations` tipada, `organization_members`, convites, papéis internos, contexto ativo e calendário partilhado com consentimento (5B.2A + 5B.2B) | Locais/campos (5B.3); aulas (5C); transferência de propriedade |
 | Outras modalidades | Tabela `sports`; pacotes com `sport_id` opcional | Seed; campos por desporto |
 | Pagamentos | `paid_amount_cents`, `reference_price_cents` | Stripe; tabela `payments` |
 | Expiração automática de créditos | `credit_expired` no enum; `refresh_package_status()` | Tarefa agendada noturna |

@@ -150,7 +150,8 @@ update public.profiles set role = 'admin' where email = 'voce@exemplo.pt';
 │   ├── ..._phase5_workspace_foundation.sql Etapa 5B.2A: workspaces tipados, membros e convites
 │   ├── ..._phase5_workspace_security.sql Etapa 5B.2A: RLS, grants e projeções de workspace
 │   ├── ..._phase5_workspace_functions.sql Etapa 5B.2A: RPCs atómicas de clubes e membros
-│   └── ..._phase5_workspace_grants.sql grants explícitos das views e funções da Etapa 5B.2A
+│   ├── ..._phase5_workspace_grants.sql grants explícitos das views e funções da Etapa 5B.2A
+│   └── ..._phase5_club_calendar.sql Etapa 5B.2B: consentimento por membership e calendário do clube
 │
 └── src/
     ├── proxy.ts             Renova a sessão e protege rotas (era middleware.ts)
@@ -266,8 +267,9 @@ Alvo: WCAG 2.1 AA. Os componentes de `components/ui/` já resolvem o essencial �
 8. **Contas bloqueadas perdem identidades funcionais.** `auth_org_id()`, `current_teacher_id()` e `current_student_id()` só devolvem valores para perfis ativos; o layout encaminha a conta para `/conta-bloqueada`.
 9. **Estado de conta só pela RPC administrativa.** `admin_set_account_status()` exige admin ativo, recusa auto-bloqueio e deixa o estado anterior/novo e o motivo em `audit_log`.
 10. **`profiles.organization_id` é sempre pessoal.** Nunca apontar para um clube. É o que faz `auth_org_id()` nunca devolver um clube — e é por isso que uma membership não abre, sozinha, nenhuma policy de alunos, pacotes, locais ou disponibilidade.
-11. **Membership de clube não é autorização operacional.** Dá acesso a nome e papel dos colegas. Não acrescentar `SELECT` a tabelas existentes por causa de um clube; o calendário partilhado da 5B.2B terá a sua própria projeção restrita.
-12. **Uma view nova não é privada por acidente.** No Supabase, views e funções herdam privilégios de `PUBLIC`/`anon` por omissão. Cada uma tem de ter `revoke all ... from public, anon` e um `grant` explícito — como em `..._workspace_grants.sql`. Não confiar na cláusula `WHERE` para fazer o trabalho de uma permissão.
+11. **Membership de clube não é autorização operacional.** Dá acesso a nome e papel dos colegas e, com consentimento explícito, a disponibilidade genérica. Não acrescentar `SELECT` a tabelas existentes por causa de um clube: o calendário partilhado tem projeção própria e restrita.
+12. **Partilhar a agenda é sempre uma decisão do próprio.** `calendar_sharing_enabled` nasce `false` e só muda por `set_workspace_calendar_sharing()`, que não aceita alvo. Não criar caminho para owner, manager ou admin forçarem a partilha de outra pessoa.
+13. **Uma view nova não é privada por acidente.** No Supabase, views e funções herdam privilégios de `PUBLIC`/`anon` por omissão. Cada uma tem de ter `revoke all ... from public, anon` e um `grant` explícito — como em `..._workspace_grants.sql`. Não confiar na cláusula `WHERE` para fazer o trabalho de uma permissão.
 
 ### Perfis e definições (Fase 2)
 
@@ -319,7 +321,7 @@ npm run typecheck
 
 ### `npm run db:verify`
 
-Executa **todas** as migrações, a partir de uma base vazia, contra PostgreSQL compilado para WebAssembly (PGlite), e volta a aplicá-las para confirmar idempotência. Depois exerce 434 garantias: RLS com papéis `authenticated`/`anon`, isolamento entre organizações e professores, privilégios das RPCs, perfis/claim/bloqueio, convites sem segredo, alunos, turmas, locais, modelos, atribuição, consulta e ajustes administrativos de pacotes, disponibilidade do professor, calendário seguro, clubes, memberships, convites de workspace, papéis internos, contexto ativo, suspensão, grants estritos das views, políticas, reserva, consumo, libertação, reagendamento, exceções, correções, imutabilidade do livro-razão e constraints herdadas das aulas.
+Executa **todas** as migrações, a partir de uma base vazia, contra PostgreSQL compilado para WebAssembly (PGlite), e volta a aplicá-las para confirmar idempotência. Depois exerce 479 garantias: RLS com papéis `authenticated`/`anon`, isolamento entre organizações e professores, privilégios das RPCs, perfis/claim/bloqueio, convites sem segredo, alunos, turmas, locais, modelos, atribuição, consulta e ajustes administrativos de pacotes, disponibilidade do professor, calendário seguro, clubes, memberships, convites de workspace, papéis internos, contexto ativo, suspensão, consentimento de partilha por clube, projeção do calendário partilhado, grants estritos das views, políticas, reserva, consumo, libertação, reagendamento, exceções, correções, imutabilidade do livro-razão e constraints herdadas das aulas.
 
 Corre em segundos, sem Docker e sem projeto na nuvem — serve para o CI.
 
@@ -569,16 +571,34 @@ Interface: `/professor/clubes`, `/professor/clubes/[id]`, `/professor/convites`,
 
 **Limite honesto:** mudar de contexto **não** torna alunos, pacotes, turmas, locais, disponibilidade ou calendário multi-clube. `PERSONAL_ONLY_MODULES` em `lib/domain/workspaces.ts` é mostrado ao utilizador em vez de fingir o contrário. Não anunciar módulos como multi-clube antes de o serem.
 
-### Calendário compartilhado do clube (Etapa 5B.2B futura)
+### Calendário partilhado do clube (Etapa 5B.2B)
 
-Ainda **não implementada**. A 5B.2A não abriu nenhuma leitura de agenda entre membros: a 5B.2B terá de trazer uma projeção própria e restrita.
+**Entrar num clube não partilha a agenda.** O consentimento vive na membership:
 
-- Bloqueio privado de colega aparece apenas como `Indisponível`, sem motivo nem categoria.
-- Filtro por professor e, mais tarde, por local/campo/recurso.
-- Um professor de clube continua a não ver alunos, pacotes, saldos, pagamentos, telefones, notas privadas ou dados administrativos de outro professor.
-- Conflitos futuros: professor, recurso, e ausência de conflito quando professores diferentes usam recursos diferentes.
+```sql
+organization_members.calendar_sharing_enabled boolean not null default false
+```
 
-Ordem: 5B.2B calendário compartilhado → 5B.3 locais, campos e Google Places → 5C criação/edição de aulas → 5D recorrência, conflitos e reservas de créditos → 5E revisão integrada.
+Está na membership, e não em `teacher_profiles`, porque uma preferência global obrigaria a escolher entre partilhar com todos os clubes ou com nenhum. Ativar no Clube A não ativa no Clube B, e sair de um clube leva o consentimento consigo.
+
+**Só o próprio altera.** `set_workspace_calendar_sharing(p_organization_id, p_enabled)` **não aceita alvo** — deriva a membership de `auth.uid()` e do clube. Proprietário, gestor e administrador da plataforma não têm sequer um parâmetro por onde tentar forçar a partilha de um colega. Não acrescentar esse parâmetro.
+
+| Contrato | Público | Campos |
+|---|---|---|
+| `get_club_availability_calendar(p_organization_id, p_start_date, p_end_date, p_membership_id)` | Membro ativo de clube ativo | `membership_id`, `teacher_name`, `date`, `starts_at`, `ends_at`, `status` |
+| `club_calendar_member_directory` | Membro ativo de clube ativo | `membership_id`, `organization_id`, `teacher_name`, `role`, `calendar_sharing_enabled`, `is_self` |
+
+O calendário do clube **nunca** devolve `source`, `source_id`, `reason`, `category`, `all_day`, IDs de regra/exceção/bloqueio, `teacher_id`, `profile_id`, organização pessoal, autoria, email ou telefone. Reaproveita o motor `resolve_teacher_availability_calendar_core()`, mas só sobrevivem as linhas `available`: **um bloqueio pessoal chega ao colega como ausência de disponibilidade**, indistinguível de não ter horário.
+
+Quem não consentiu não produz linha nenhuma. A interface distingue "indisponível" de "não partilhada" pelo diretório, não pelo calendário.
+
+**Autorização:** professor global ativo + membership `active` + `kind = 'club'` + `status = 'active'`. `active_workspace_id` **não** participa da decisão. O filtro `p_membership_id` é revalidado: tem de ser uma membership ativa **deste** clube, caso contrário é recusado em vez de devolver vazio.
+
+Interface em `/professor/clubes/[id]/calendario`, com filtro por professor no URL. O componente `AvailabilityCalendar` ganhou a audiência `club`: as verificações de privacidade passaram a perguntar `audience !== "teacher"`, para que uma audiência futura nasça segura. `calendarHref()` preserva a query já presente no `basePath` — é assim que o filtro sobrevive a Dia/Semana/Mês, anterior, seguinte e "Hoje".
+
+**Não implementado:** aulas, participantes, locais, campos, recursos, conflitos, reservas e créditos. Os únicos estados são disponível e indisponível — não escrever "ocupado", "reservado", "lotado", "vagas" ou "conflito", porque nada disso existe ainda para ser verdade.
+
+Ordem: 5B.3 locais, campos e Google Places → 5C criação/edição de aulas → 5D recorrência, conflitos e reservas de créditos → 5E revisão integrada.
 
 ### `src/types/database.ts`
 
@@ -590,7 +610,7 @@ As linhas são declaradas com `type`, **nunca com `interface`**. Um `interface` 
 
 Vitest, ambiente Node, `TZ=Europe/Lisbon` fixo para que um teste que passa localmente passe também no CI (que corre em UTC).
 
-Cobertura atual: **313 testes** em vinte ficheiros — testes de domínio, regressões de respostas/autenticação do proxy, formulários da Fase 2, validação/normalização da gestão da Fase 3, modelos, atribuição, apresentação, navegação, ajustes administrativos de pacotes, disponibilidade do professor, calendário, permissões de clube e validação de workspaces.
+Cobertura atual: **340 testes** em vinte e um ficheiros — testes de domínio, regressões de respostas/autenticação do proxy, formulários da Fase 2, validação/normalização da gestão da Fase 3, modelos, atribuição, apresentação, navegação, ajustes administrativos de pacotes, disponibilidade do professor, calendário, permissões de clube, validação de workspaces e regras do calendário partilhado.
 
 Os testes de domínio exercem funções puras, sem base de dados nem mocks. Os testes de validação garantem normalização, limites, identificadores, estados, valores monetários em cêntimos, datas civis e rejeição de campos extra/protegidos. A integração SQL fica separada em `db:verify`.
 
@@ -613,7 +633,7 @@ Não existe um comando de formatação separado. Use `npm run lint:fix` apenas p
 | 2 | Perfis, definições e gestão administrativa básica de contas | **Concluído** |
 | 3 | Alunos, turmas, locais, política de cancelamento | **Concluído** |
 | 4 | Interfaces de modelos, atribuição, ajustes e saldos | **Concluído** — Etapas 1A, 1B, 1C, 1D e 1E validadas com Auth/PostgREST reais e browser desktop/mobile |
-| 5 | Calendário e criação de aulas com reserva | **Parcialmente concluído** — Etapas 5A, 5B, 5B.1 e 5B.2A: disponibilidade, projeção segura, refinamento visual e fundação de clubes/membros |
+| 5 | Calendário e criação de aulas com reserva | **Parcialmente concluído** — Etapas 5A, 5B, 5B.1, 5B.2A e 5B.2B: disponibilidade, projeção segura, refinamento visual, fundação de clubes/membros e calendário partilhado com consentimento |
 | 6 | Cancelamento, reagendamento, presenças e histórico | **Planeado** |
 | 7 | Área do aluno: aulas, créditos e confirmação | **Planeado** |
 | 8 | Notificações, lembretes e expiração agendada | **Planeado** |

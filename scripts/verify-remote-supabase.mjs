@@ -88,6 +88,7 @@ const expectedViews = [
   "workspace_invitation_records",
   "workspace_received_invitation_records",
   "admin_workspace_directory",
+  "club_calendar_member_directory",
 ];
 
 const expectedEnums = [
@@ -136,6 +137,7 @@ const expectedIndexes = [
   "organization_invitations_idempotency_unique",
   "organization_invitations_email_idx",
   "organization_invitations_organization_idx",
+  "organization_members_calendar_sharing_idx",
 ];
 
 const expectedConstraints = [
@@ -218,6 +220,8 @@ const expectedFunctions = [
   "remove_workspace_member",
   "admin_set_workspace_status",
   "set_active_workspace",
+  "set_workspace_calendar_sharing",
+  "get_club_availability_calendar",
 ];
 
 const authenticatedRpc = [
@@ -255,6 +259,8 @@ const authenticatedRpc = [
   "set_active_workspace",
   "resolve_active_workspace_id",
   "auth_confirmed_email",
+  "set_workspace_calendar_sharing",
+  "get_club_availability_calendar",
 ];
 
 const internalFunctions = [
@@ -525,6 +531,108 @@ checks as (
           'token', 'invite_code', 'secret', 'idempotency_key', 'invited_by',
           'responded_by', 'revoked_by', 'suspension_reason'
         )
+    ),
+    'ok'
+
+  union all
+  select
+    'privacidade',
+    'calendario do clube devolve apenas as seis colunas publicas',
+    not exists (
+      select 1
+      from pg_proc proc
+      join pg_namespace ns on ns.oid = proc.pronamespace
+      cross join lateral unnest(proc.proargnames, proc.proargmodes) as output(arg_name, arg_mode)
+      where ns.nspname = 'public'
+        and proc.proname = 'get_club_availability_calendar'
+        and output.arg_mode = 't'
+        and output.arg_name not in (
+          'membership_id', 'teacher_name', 'date', 'starts_at', 'ends_at', 'status'
+        )
+    ),
+    coalesce((
+      select string_agg(output.arg_name, ', ')
+      from pg_proc proc
+      join pg_namespace ns on ns.oid = proc.pronamespace
+      cross join lateral unnest(proc.proargnames, proc.proargmodes) as output(arg_name, arg_mode)
+      where ns.nspname = 'public'
+        and proc.proname = 'get_club_availability_calendar'
+        and output.arg_mode = 't'
+        and output.arg_name not in (
+          'membership_id', 'teacher_name', 'date', 'starts_at', 'ends_at', 'status'
+        )
+    ), 'ok')
+
+  union all
+  select
+    'privacidade',
+    'diretorio do calendario do clube nao expoe contactos nem identidades internas',
+    not exists (
+      select 1
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'club_calendar_member_directory'
+        and column_name in (
+          'email', 'phone', 'avatar_url', 'profile_id', 'teacher_id',
+          'blocked_reason', 'suspension_reason', 'notes'
+        )
+    ),
+    'ok'
+
+  union all
+  select
+    'seguranca',
+    'membership nao abriu SELECT direto nas tabelas de disponibilidade',
+    not exists (
+      select 1
+      from information_schema.table_privileges
+      where table_schema = 'public'
+        and table_name in (
+          'teacher_availability_rules', 'teacher_availability_exceptions',
+          'teacher_schedule_blocks'
+        )
+        and grantee in ('authenticated', 'anon')
+    ),
+    coalesce((
+      select string_agg(table_name || '.' || privilege_type, ', ')
+      from information_schema.table_privileges
+      where table_schema = 'public'
+        and table_name in (
+          'teacher_availability_rules', 'teacher_availability_exceptions',
+          'teacher_schedule_blocks'
+        )
+        and grantee in ('authenticated', 'anon')
+    ), 'ok')
+
+  union all
+  select
+    'seguranca',
+    'consentimento de partilha nao e escrito diretamente pelo cliente',
+    not exists (
+      select 1
+      from information_schema.column_privileges
+      where table_schema = 'public'
+        and table_name = 'organization_members'
+        and column_name = 'calendar_sharing_enabled'
+        and (
+          (grantee = 'authenticated' and privilege_type in ('INSERT', 'UPDATE', 'REFERENCES'))
+          or grantee = 'anon'
+        )
+    ),
+    'ok'
+
+  union all
+  select
+    'estrutura',
+    'consentimento de partilha nasce desativado',
+    exists (
+      select 1
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'organization_members'
+        and column_name = 'calendar_sharing_enabled'
+        and is_nullable = 'NO'
+        and column_default like '%false%'
     ),
     'ok'
 

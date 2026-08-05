@@ -71,19 +71,40 @@ export function readCalendarSearchParamsResult(
   };
 }
 
+/**
+ * Endereço de uma vista de calendário.
+ *
+ * `basePath` pode trazer já uma query — é assim que o calendário do clube faz
+ * o filtro por professor sobreviver a cada navegação de dia, semana, mês,
+ * anterior, seguinte e "Hoje". Esses parâmetros são preservados; `data` e
+ * `vista` são sempre reescritos, porque são o destino do link.
+ *
+ * A alternativa seria passar os parâmetros extra por todos os subcomponentes
+ * do calendário. Resolver aqui mantém intacto o componente partilhado pelos
+ * calendários do professor e do aluno — que não têm filtro nenhum.
+ */
 export function calendarHref({
   basePath,
   date,
   view,
+  extraParams,
 }: {
   basePath: string;
   date: string;
   view: CalendarView;
+  /** Valores vazios são descartados: "todos os professores" não vai no URL. */
+  extraParams?: Record<string, string | null | undefined>;
 }): string {
-  const params = new URLSearchParams({
-    data: date,
-    vista: viewParamFor(view),
-  });
+  const [path = "", existingQuery = ""] = basePath.split("?");
+  const params = new URLSearchParams(existingQuery);
 
-  return `${basePath}?${params.toString()}`;
+  params.set("data", date);
+  params.set("vista", viewParamFor(view));
+
+  for (const [key, value] of Object.entries(extraParams ?? {})) {
+    if (typeof value === "string" && value.length > 0) params.set(key, value);
+    else params.delete(key);
+  }
+
+  return `${path}?${params.toString()}`;
 }

@@ -1,10 +1,11 @@
-import { ArrowLeft } from "lucide-react";
+import { ArrowLeft, CalendarRange } from "lucide-react";
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { randomUUID } from "node:crypto";
 
 import { Alert } from "@/components/ui/alert";
+import { buttonClasses } from "@/components/ui/button";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import {
   ClubMemberManager,
@@ -126,6 +127,16 @@ export default async function TeacherClubDetailPage({
               <dd className="font-bold text-ink">{club.activeMemberCount}</dd>
             </div>
           </dl>
+
+          {isWorkspaceOperational(club.workspaceStatus) && (
+            <Link
+              href={`/professor/clubes/${club.organizationId}/calendario`}
+              className={buttonClasses({ variant: "outline", className: "self-start" })}
+            >
+              <CalendarRange className="size-4.5" aria-hidden="true" />
+              Calendário do clube
+            </Link>
+          )}
 
           {!isWorkspaceOperational(club.workspaceStatus) && (
             <Alert tone="warning" title="Clube suspenso">

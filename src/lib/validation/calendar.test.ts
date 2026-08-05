@@ -61,4 +61,47 @@ describe("calendar search params", () => {
       calendarHref({ basePath: "/professor/calendario", date: "2026-08-17", view: "week" }),
     ).toBe("/professor/calendario?data=2026-08-17&vista=semana");
   });
+
+  // O filtro por professor do calendário do clube vive no `basePath`. Sem esta
+  // preservação, cada clique em Dia/Semana/Mês, anterior, seguinte ou "Hoje"
+  // perderia o professor escolhido.
+  it("preserva os parâmetros já presentes no basePath", () => {
+    expect(
+      calendarHref({
+        basePath: "/professor/clubes/c1/calendario?professor=m1",
+        date: "2026-09-07",
+        view: "day",
+      }),
+    ).toBe("/professor/clubes/c1/calendario?professor=m1&data=2026-09-07&vista=dia");
+  });
+
+  it("reescreve data e vista sem duplicar parâmetros", () => {
+    expect(
+      calendarHref({
+        basePath: "/professor/clubes/c1/calendario?data=2020-01-01&vista=mes&professor=m1",
+        date: "2026-09-07",
+        view: "week",
+      }),
+    ).toBe("/professor/clubes/c1/calendario?data=2026-09-07&vista=semana&professor=m1");
+  });
+
+  it("acrescenta e remove parâmetros extra conforme o filtro", () => {
+    expect(
+      calendarHref({
+        basePath: "/professor/clubes/c1/calendario",
+        date: "2026-09-07",
+        view: "week",
+        extraParams: { professor: "m2" },
+      }),
+    ).toBe("/professor/clubes/c1/calendario?data=2026-09-07&vista=semana&professor=m2");
+
+    expect(
+      calendarHref({
+        basePath: "/professor/clubes/c1/calendario?professor=m1",
+        date: "2026-09-07",
+        view: "week",
+        extraParams: { professor: null },
+      }),
+    ).toBe("/professor/clubes/c1/calendario?data=2026-09-07&vista=semana");
+  });
 });

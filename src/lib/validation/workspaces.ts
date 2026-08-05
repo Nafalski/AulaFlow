@@ -5,6 +5,7 @@ import {
   formChecked,
   formString,
   normalizeOptionalUuid,
+  normalizeRequiredBoolean,
   normalizeRequiredUuid,
   normalizeSingleLine,
   unexpectedFormFields,
@@ -137,6 +138,33 @@ export const activeWorkspaceSchema = z.strictObject({
     z.uuid("O contexto selecionado é inválido.").nullable(),
   ),
 });
+
+/**
+ * Consentimento de partilha do calendário.
+ *
+ * Repare no que NÃO está aqui: `membershipId`, `teacherId`, `profileId`,
+ * autoria e timestamps. O alvo nunca vem do formulário — a RPC deriva a
+ * membership da sessão e do clube. Sem parâmetro de alvo, não há sequer uma
+ * superfície onde alguém pudesse tentar alterar a partilha de outra pessoa.
+ */
+export const clubCalendarSharingSchema = z.strictObject({
+  organizationId: requiredUuid("O clube selecionado é inválido."),
+  enabled: z.preprocess(
+    normalizeRequiredBoolean,
+    z.boolean({ error: "O estado da partilha é inválido." }),
+  ),
+});
+
+export type ClubCalendarSharingInput = z.infer<typeof clubCalendarSharingSchema>;
+
+export const CLUB_CALENDAR_SHARING_FIELDS = ["organizationId", "enabled"] as const;
+
+export function readClubCalendarSharingFormData(formData: FormData) {
+  return {
+    organizationId: formString(formData, "organizationId"),
+    enabled: formString(formData, "enabled"),
+  };
+}
 
 export type ClubFormInput = z.infer<typeof clubFormSchema>;
 export type WorkspaceInvitationInput = z.infer<typeof workspaceInvitationSchema>;

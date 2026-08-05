@@ -53,7 +53,15 @@ export type AvailabilityCalendarItem = {
   allDay?: boolean;
 };
 
-type CalendarAudience = "teacher" | "student";
+/**
+ * A audiência decide o que é seguro mostrar, não o aspeto.
+ *
+ * `teacher` vê a sua própria agenda com origem, motivo e categoria. `student`
+ * e `club` veem apenas disponível/indisponível — por isso as verificações
+ * abaixo perguntam "não é o professor?" em vez de listar audiências, para que
+ * uma audiência futura nasça segura em vez de nascer com fugas.
+ */
+type CalendarAudience = "teacher" | "student" | "club";
 
 type AvailabilityCalendarProps = {
   audience: CalendarAudience;
@@ -174,7 +182,7 @@ function displayKind(item: AvailabilityCalendarItem): CalendarDisplayKind {
 }
 
 function itemTitle(item: AvailabilityCalendarItem, audience: CalendarAudience): string {
-  if (audience === "student") {
+  if (audience !== "teacher") {
     return item.status === "available" ? "Disponível" : "Indisponível";
   }
 
@@ -198,7 +206,7 @@ function itemDescription(item: AvailabilityCalendarItem, audience: CalendarAudie
     ? "dia inteiro"
     : `das ${item.startsAt?.slice(0, 5)} às ${item.endsAt?.slice(0, 5)}`;
 
-  if (audience === "student") {
+  if (audience !== "teacher") {
     return `${item.status === "available" ? "Disponível" : "Indisponível"}, ${day}, ${timeLabel}.`;
   }
 
@@ -206,7 +214,7 @@ function itemDescription(item: AvailabilityCalendarItem, audience: CalendarAudie
 }
 
 function itemClasses(item: AvailabilityCalendarItem, audience: CalendarAudience) {
-  const kind = audience === "student" && item.status === "available" ? "availability" : displayKind(item);
+  const kind = audience !== "teacher" && item.status === "available" ? "availability" : displayKind(item);
 
   if (kind === "availability") {
     return "border-state-success/30 bg-state-success-soft text-state-success";
@@ -224,7 +232,7 @@ function itemClasses(item: AvailabilityCalendarItem, audience: CalendarAudience)
 }
 
 function ItemIcon({ item, audience }: { item: AvailabilityCalendarItem; audience: CalendarAudience }) {
-  const kind = audience === "student" && item.status === "available" ? "availability" : displayKind(item);
+  const kind = audience !== "teacher" && item.status === "available" ? "availability" : displayKind(item);
 
   if (kind === "block" || kind === "unavailable") {
     return <Ban className="size-4 shrink-0" aria-hidden="true" />;

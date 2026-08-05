@@ -13,6 +13,7 @@ import { getSessionUser } from "@/lib/auth/session";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import {
   ACTIVE_WORKSPACE_FIELDS,
+  CLUB_CALENDAR_SHARING_FIELDS,
   CLUB_FORM_FIELDS,
   WORKSPACE_INVITATION_FIELDS,
   WORKSPACE_INVITATION_ID_FIELDS,
@@ -21,8 +22,10 @@ import {
   WORKSPACE_MEMBER_ROLE_FIELDS,
   WORKSPACE_STATUS_FIELDS,
   activeWorkspaceSchema,
+  clubCalendarSharingSchema,
   clubFormSchema,
   readActiveWorkspaceFormData,
+  readClubCalendarSharingFormData,
   readClubFormData,
   readWorkspaceInvitationFormData,
   readWorkspaceInvitationIdFormData,
@@ -387,6 +390,59 @@ export async function setActiveWorkspaceAction(
     return { status: "success", message: "Contexto atualizado." };
   } catch (error) {
     return persistenceState("Erro inesperado ao alterar contexto ativo.", error);
+  }
+}
+
+// ── Calendário partilhado do clube ──────────────────────────────────────────
+
+/**
+ * Ativar ou desativar a partilha da própria disponibilidade com um clube.
+ *
+ * A Action não recebe — e não poderia usar — um identificador de membro: a RPC
+ * deriva a membership de `auth.uid()` e do clube. Um proprietário ou gestor que
+ * forjasse o formulário continuaria a alterar apenas a sua própria preferência.
+ */
+export async function setClubCalendarSharingAction(
+  _previousState: TeacherManagementActionState,
+  formData: FormData,
+): Promise<TeacherManagementActionState> {
+  void _previousState;
+
+  const extraFields = unexpectedWorkspaceFields(formData, CLUB_CALENDAR_SHARING_FIELDS);
+  if (extraFields.length > 0) return unexpectedFieldsState(extraFields);
+
+  const parsed = clubCalendarSharingSchema.safeParse(readClubCalendarSharingFormData(formData));
+  if (!parsed.success) return validationState(parsed.error);
+
+  const authorization = await authorizeActiveTeacher();
+  if (authorization.state) return authorization.state;
+
+  try {
+    const supabase = await createSupabaseServerClient();
+    const { error } = await supabase.rpc("set_workspace_calendar_sharing", {
+      p_organization_id: parsed.data.organizationId,
+      p_enabled: parsed.data.enabled,
+    });
+
+    if (error) {
+      return persistenceState(
+        "Falha ao alterar a partilha de disponibilidade.",
+        error,
+        workspaceMessage(error.message, "Não foi possível alterar a partilha. Tente novamente."),
+      );
+    }
+
+    revalidatePath(`${CLUBS_PATH}/${parsed.data.organizationId}/calendario`);
+    revalidatePath(`${CLUBS_PATH}/${parsed.data.organizationId}`);
+
+    return {
+      status: "success",
+      message: parsed.data.enabled
+        ? "A sua disponibilidade passou a ser visível para os membros deste clube."
+        : "A partilha foi desativada. Os colegas deixaram de ver a sua disponibilidade.",
+    };
+  } catch (error) {
+    return persistenceState("Erro inesperado ao alterar a partilha de disponibilidade.", error);
   }
 }
 

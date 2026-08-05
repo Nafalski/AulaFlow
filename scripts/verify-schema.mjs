@@ -5815,6 +5815,544 @@ const workspaceEnums = await rows(
 );
 check(workspaceEnums.length === 5, "os cinco tipos enumerados de workspace existem");
 
+// ── Calendário partilhado do clube (Etapa 5B.2B) ─────────────────────────────
+
+section("Calendário partilhado do clube");
+
+// O Professor B volta a entrar no Clube A: a secção anterior removeu-o de
+// propósito, e o calendário precisa de dois membros ativos.
+const rejoinInvite = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select public.invite_workspace_member($1,'outro.prof@exemplo.pt','teacher',$2) as id`, [
+    clubA.id,
+    randomUUID(),
+  ]),
+);
+const rejoinMembership = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  one(`select public.accept_workspace_invitation($1) as id`, [rejoinInvite.id]),
+);
+
+// Disponibilidade do Professor B: rotina semanal à segunda-feira e um bloqueio
+// pessoal no meio, para provar que o bloqueio nunca chega ao colega.
+const CLUB_MONDAY = "2026-09-07";
+await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  db.query(
+    `select public.upsert_teacher_availability_rule(
+       p_weekday => 1,
+       p_starts_at => '09:00'::time,
+       p_ends_at => '12:00'::time,
+       p_idempotency_key => $1::uuid,
+       p_is_active => true
+     )`,
+    [randomUUID()],
+  ),
+);
+const colleagueBlock = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  one(
+    `select public.upsert_teacher_schedule_block(
+       p_starts_at => '2026-09-07 09:00+00'::timestamptz,
+       p_ends_at => '2026-09-07 10:00+00'::timestamptz,
+       p_all_day => false,
+       p_reason => 'Consulta médica particular',
+       p_category => 'personal',
+       p_idempotency_key => $1::uuid
+     ) as id`,
+    [randomUUID()],
+  ),
+);
+
+const clubCalendarFor = (uid, membershipId = null, start = CLUB_MONDAY, end = CLUB_MONDAY) =>
+  asDatabaseRole("authenticated", uid, () =>
+    rows(
+      `select calendar.membership_id, calendar.teacher_name, calendar.date::text as date,
+              calendar.starts_at::text as starts_at, calendar.ends_at::text as ends_at,
+              calendar.status::text
+         from public.get_club_availability_calendar($1,$2,$3,$4) calendar
+        order by calendar.teacher_name, calendar.date, calendar.starts_at nulls last`,
+      [clubA.id, start, end, membershipId],
+    ),
+  );
+
+// ── Consentimento ───────────────────────────────────────────────────────────
+
+const defaultSharing = await one(
+  `select calendar_sharing_enabled from public.organization_members where id=$1`,
+  [rejoinMembership.id],
+);
+check(
+  defaultSharing.calendar_sharing_enabled === false,
+  "entrar num clube não partilha a agenda: o consentimento nasce desativado",
+);
+
+const sharingColumnDefault = await one(
+  `select column_default, is_nullable
+     from information_schema.columns
+    where table_schema='public' and table_name='organization_members'
+      and column_name='calendar_sharing_enabled'`,
+);
+check(
+  /false/.test(sharingColumnDefault.column_default ?? "") &&
+    sharingColumnDefault.is_nullable === "NO",
+  "a coluna de consentimento é obrigatória e tem default false",
+);
+
+const noSharingRows = await clubCalendarFor(TEACHER_UID);
+check(
+  noSharingRows.length === 0,
+  "sem consentimento de ninguém, o calendário do clube não devolve períodos",
+);
+
+const enabledSharing = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  one(`select public.set_workspace_calendar_sharing($1, true) as changed`, [clubA.id]),
+);
+const enabledRepeat = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  one(`select public.set_workspace_calendar_sharing($1, true) as changed`, [clubA.id]),
+);
+check(
+  enabledSharing.changed === true && enabledRepeat.changed === false,
+  "ativar a partilha funciona e repetir o mesmo valor é idempotente",
+);
+check(
+  (await auditCount("workspace.calendar_sharing_changed", clubA.id)) === 1,
+  "gravar o mesmo consentimento outra vez não duplica a auditoria",
+);
+
+// ── Independência entre clubes ──────────────────────────────────────────────
+
+const clubDInvite = await asDatabaseRole("authenticated", SAME_ORG_TEACHER_UID, () =>
+  one(`select public.invite_workspace_member($1,'outro.prof@exemplo.pt','teacher',$2) as id`, [
+    clubC.id,
+    randomUUID(),
+  ]),
+);
+const clubDMembership = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  one(`select public.accept_workspace_invitation($1) as id`, [clubDInvite.id]),
+);
+const clubDSharing = await one(
+  `select calendar_sharing_enabled from public.organization_members where id=$1`,
+  [clubDMembership.id],
+);
+check(
+  clubDSharing.calendar_sharing_enabled === false,
+  "ativar a partilha no Clube A não a ativa no Clube B",
+);
+
+const rivalCalendar = await asDatabaseRole("authenticated", SAME_ORG_TEACHER_UID, () =>
+  rows(
+    `select calendar.membership_id
+       from public.get_club_availability_calendar($1,$2,$3,null) calendar`,
+    [clubC.id, CLUB_MONDAY, CLUB_MONDAY],
+  ),
+);
+check(
+  rivalCalendar.length === 0,
+  "o mesmo professor, sem consentimento no outro clube, não produz períodos lá",
+);
+
+// ── Projeção segura ─────────────────────────────────────────────────────────
+
+const sharedCalendar = await clubCalendarFor(TEACHER_UID);
+const sharedAvailable = sharedCalendar.filter((row) => row.status === "available");
+check(
+  sharedAvailable.length === 2 &&
+    sharedAvailable[0].starts_at === "09:00:00" &&
+    sharedAvailable[0].ends_at === "10:00:00" &&
+    sharedAvailable[1].starts_at === "11:00:00" &&
+    sharedAvailable[1].ends_at === "12:00:00",
+  "com consentimento, o colega vê disponibilidade genérica já dividida pelo bloqueio",
+);
+check(
+  !sharedCalendar.some((row) => row.starts_at === "10:00:00" && row.status === "available"),
+  "o período bloqueado nunca aparece como disponível para o colega",
+);
+check(
+  forbiddenColumns(sharedCalendar[0] ?? {}, [
+    "reason",
+    "category",
+    "source",
+    "source_id",
+    "all_day",
+    "block_id",
+    "exception_id",
+    "rule_id",
+    "teacher_id",
+    "profile_id",
+    "organization_id",
+    "email",
+    "phone",
+    "created_by",
+  ]).length === 0,
+  "o calendário do clube não expõe motivo, categoria, origem nem IDs internos",
+);
+check(
+  !JSON.stringify(sharedCalendar).includes("Consulta médica particular"),
+  "o motivo privado do bloqueio não viaja no calendário do clube",
+);
+void colleagueBlock;
+
+const returnedColumns = await rows(
+  `select output.arg_name
+     from pg_proc proc
+     join pg_namespace ns on ns.oid = proc.pronamespace
+     cross join lateral unnest(proc.proargnames, proc.proargmodes) as output(arg_name, arg_mode)
+    where ns.nspname='public'
+      and proc.proname='get_club_availability_calendar'
+      and output.arg_mode = 't'`,
+);
+check(
+  returnedColumns.length === 6 &&
+    ["membership_id", "teacher_name", "date", "starts_at", "ends_at", "status"].every((name) =>
+      returnedColumns.some((row) => row.arg_name === name),
+    ),
+  "o tipo de retorno do calendário do clube tem exatamente as seis colunas públicas",
+);
+
+// ── Filtro por professor ────────────────────────────────────────────────────
+
+const filtered = await clubCalendarFor(TEACHER_UID, rejoinMembership.id);
+check(
+  filtered.length === sharedCalendar.length && filtered.every((row) => row.membership_id === rejoinMembership.id),
+  "o filtro por professor devolve apenas o membro pedido",
+);
+
+await mustReject("filtro com membership de outro clube é recusado", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select * from public.get_club_availability_calendar($1,$2,$3,$4)`, [
+      clubA.id,
+      CLUB_MONDAY,
+      CLUB_MONDAY,
+      clubDMembership.id,
+    ]),
+  ),
+);
+await mustReject("filtro com membership inexistente é recusado", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select * from public.get_club_availability_calendar($1,$2,$3,$4)`, [
+      clubA.id,
+      CLUB_MONDAY,
+      CLUB_MONDAY,
+      randomUUID(),
+    ]),
+  ),
+);
+
+// ── Só o próprio altera o consentimento ─────────────────────────────────────
+//
+// A RPC não aceita alvo: owner, manager e admin não têm sequer um parâmetro
+// por onde tentar. O que se prova aqui é que a preferência do colega não muda
+// quando outra pessoa chama a função para o mesmo clube.
+
+const ownerSelfToggle = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select public.set_workspace_calendar_sharing($1, true) as changed`, [clubA.id]),
+);
+const colleagueAfterOwnerToggle = await one(
+  `select calendar_sharing_enabled from public.organization_members where id=$1`,
+  [rejoinMembership.id],
+);
+const ownerAfterToggle = await one(
+  `select calendar_sharing_enabled from public.organization_members where id=$1`,
+  [ownerMembership.id],
+);
+check(
+  ownerSelfToggle.changed === true &&
+    ownerAfterToggle.calendar_sharing_enabled === true &&
+    colleagueAfterOwnerToggle.calendar_sharing_enabled === true,
+  "o proprietário altera apenas a sua própria partilha, nunca a do colega",
+);
+
+// Ler o consentimento é preciso — é o que distingue "indisponível" de
+// "não partilhada". Escrevê-lo é que tem de passar obrigatoriamente pela RPC.
+const sharingWriteGrants = await rows(
+  `select grantee, privilege_type
+     from information_schema.column_privileges
+    where table_schema='public'
+      and table_name='organization_members'
+      and column_name='calendar_sharing_enabled'
+      and grantee in ('authenticated','anon')
+      and privilege_type in ('INSERT','UPDATE','REFERENCES')`,
+);
+check(
+  sharingWriteGrants.length === 0,
+  "o cliente não tem privilégio de escrita sobre a coluna de consentimento",
+);
+
+const sharingAnonGrants = await rows(
+  `select privilege_type
+     from information_schema.column_privileges
+    where table_schema='public'
+      and table_name='organization_members'
+      and column_name='calendar_sharing_enabled'
+      and grantee = 'anon'`,
+);
+check(sharingAnonGrants.length === 0, "anon não tem privilégio nenhum sobre o consentimento");
+
+await mustReject("cliente não altera o consentimento por UPDATE direto", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`update public.organization_members set calendar_sharing_enabled=true where id=$1`, [
+      rejoinMembership.id,
+    ]),
+  ),
+);
+
+// ── Autorização ─────────────────────────────────────────────────────────────
+
+await mustReject("aluno não consulta o calendário do clube", () =>
+  asDatabaseRole("authenticated", ANA_UID, () =>
+    db.query(`select * from public.get_club_availability_calendar($1,$2,$3,null)`, [
+      clubA.id,
+      CLUB_MONDAY,
+      CLUB_MONDAY,
+    ]),
+  ),
+);
+await mustReject("anónimo não consulta o calendário do clube", () =>
+  asDatabaseRole("anon", null, () =>
+    db.query(`select * from public.get_club_availability_calendar($1,$2,$3,null)`, [
+      clubA.id,
+      CLUB_MONDAY,
+      CLUB_MONDAY,
+    ]),
+  ),
+);
+await mustReject("anónimo não altera consentimento de partilha", () =>
+  asDatabaseRole("anon", null, () =>
+    db.query(`select public.set_workspace_calendar_sharing($1, true)`, [clubA.id]),
+  ),
+);
+await mustReject("professor sem membership não consulta o calendário do clube", () =>
+  asDatabaseRole("authenticated", SAME_ORG_TEACHER_UID, () =>
+    db.query(`select * from public.get_club_availability_calendar($1,$2,$3,null)`, [
+      clubA.id,
+      CLUB_MONDAY,
+      CLUB_MONDAY,
+    ]),
+  ),
+);
+await mustReject("workspace pessoal não tem calendário partilhado", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select * from public.get_club_availability_calendar($1,$2,$3,null)`, [
+      org,
+      CLUB_MONDAY,
+      CLUB_MONDAY,
+    ]),
+  ),
+);
+await mustReject("clube inexistente é recusado", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select * from public.get_club_availability_calendar($1,$2,$3,null)`, [
+      randomUUID(),
+      CLUB_MONDAY,
+      CLUB_MONDAY,
+    ]),
+  ),
+);
+await mustReject("clube suspenso não devolve calendário", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select * from public.get_club_availability_calendar($1,$2,$3,null)`, [
+      clubB.id,
+      CLUB_MONDAY,
+      CLUB_MONDAY,
+    ]),
+  ),
+);
+await mustReject("clube suspenso não aceita alteração de partilha", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.set_workspace_calendar_sharing($1, true)`, [clubB.id]),
+  ),
+);
+await mustReject("calendário do clube recusa intervalo invertido", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select * from public.get_club_availability_calendar($1,'2026-09-08','2026-09-07',null)`, [
+      clubA.id,
+    ]),
+  ),
+);
+await mustReject("calendário do clube recusa intervalos superiores a 42 dias", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select * from public.get_club_availability_calendar($1,'2026-09-01','2026-10-13',null)`, [
+      clubA.id,
+    ]),
+  ),
+);
+
+const boundaryRows = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  rows(
+    `select count(*)::int as total
+       from public.get_club_availability_calendar($1,'2026-09-01','2026-10-12',null)`,
+    [clubA.id],
+  ),
+);
+check(Number(boundaryRows[0].total) >= 0, "exatamente 42 dias continua a ser aceite");
+
+// ── Conta bloqueada e membership revogada ───────────────────────────────────
+
+await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  db.query(`select public.admin_set_account_status($1,'blocked','Teste calendário de clube')`, [
+    OTHER_TEACHER_UID,
+  ]),
+);
+await mustReject("conta bloqueada não altera a partilha", () =>
+  asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+    db.query(`select public.set_workspace_calendar_sharing($1, false)`, [clubA.id]),
+  ),
+);
+await mustReject("conta bloqueada não consulta o calendário do clube", () =>
+  asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+    db.query(`select * from public.get_club_availability_calendar($1,$2,$3,null)`, [
+      clubA.id,
+      CLUB_MONDAY,
+      CLUB_MONDAY,
+    ]),
+  ),
+);
+const blockedTeacherPeriods = await clubCalendarFor(TEACHER_UID);
+check(
+  !blockedTeacherPeriods.some((row) => row.membership_id === rejoinMembership.id),
+  "a disponibilidade de uma conta bloqueada sai imediatamente do calendário do clube",
+);
+await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  db.query(`select public.admin_set_account_status($1,'active',null)`, [OTHER_TEACHER_UID]),
+);
+
+// ── Desativar a partilha ────────────────────────────────────────────────────
+
+const disabled = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  one(`select public.set_workspace_calendar_sharing($1, false) as changed`, [clubA.id]),
+);
+const afterDisable = await clubCalendarFor(TEACHER_UID);
+check(
+  disabled.changed === true &&
+    !afterDisable.some((row) => row.membership_id === rejoinMembership.id),
+  "desativar a partilha remove imediatamente os períodos do colega",
+);
+
+const directoryAfterDisable = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  rows(
+    `select membership_id, teacher_name, calendar_sharing_enabled, is_self
+       from public.club_calendar_member_directory
+      where organization_id=$1
+      order by teacher_name`,
+    [clubA.id],
+  ),
+);
+check(
+  directoryAfterDisable.length === 2 &&
+    directoryAfterDisable.some(
+      (row) => row.membership_id === rejoinMembership.id && row.calendar_sharing_enabled === false,
+    ),
+  "quem não partilha continua a aparecer no diretório, com o estado de partilha",
+);
+check(
+  forbiddenColumns(directoryAfterDisable[0] ?? {}, [
+    "email",
+    "phone",
+    "avatar_url",
+    "profile_id",
+    "teacher_id",
+    "blocked_reason",
+  ]).length === 0,
+  "o diretório do calendário não expõe contactos nem identidades internas",
+);
+
+// Depois de remover a membership, nem o diretório nem o calendário a mostram.
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(`select public.remove_workspace_member($1)`, [rejoinMembership.id]),
+);
+const directoryAfterRemoval = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  rows(`select membership_id from public.club_calendar_member_directory where organization_id=$1`, [
+    clubA.id,
+  ]),
+);
+check(
+  directoryAfterRemoval.every((row) => row.membership_id !== rejoinMembership.id),
+  "membership removida desaparece do diretório do calendário",
+);
+await mustReject("membership removida não consulta o calendário do clube", () =>
+  asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+    db.query(`select * from public.get_club_availability_calendar($1,$2,$3,null)`, [
+      clubA.id,
+      CLUB_MONDAY,
+      CLUB_MONDAY,
+    ]),
+  ),
+);
+await mustReject("membership removida não altera a partilha", () =>
+  asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+    db.query(`select public.set_workspace_calendar_sharing($1, true)`, [clubA.id]),
+  ),
+);
+
+// ── Grants e search_path ────────────────────────────────────────────────────
+
+const availabilityTableGrants = await rows(
+  `select table_name, privilege_type
+     from information_schema.table_privileges
+    where table_schema='public'
+      and table_name in ('teacher_availability_rules','teacher_availability_exceptions','teacher_schedule_blocks')
+      and grantee in ('authenticated','anon')`,
+);
+check(
+  availabilityTableGrants.length === 0,
+  "a membership não abriu SELECT direto nas tabelas pessoais de disponibilidade",
+);
+
+const clubCalendarPrivileges = await rows(
+  `select proc.proname
+     from pg_proc proc
+     join pg_namespace ns on ns.oid = proc.pronamespace
+    where ns.nspname='public'
+      and proc.proname in ('get_club_availability_calendar','set_workspace_calendar_sharing')
+      and (
+        has_function_privilege('anon', proc.oid, 'EXECUTE')
+        or not has_function_privilege('authenticated', proc.oid, 'EXECUTE')
+      )`,
+);
+check(
+  clubCalendarPrivileges.length === 0,
+  "as RPCs do calendário do clube são executáveis por authenticated e nunca por anon",
+);
+
+const clubCalendarSearchPath = await rows(
+  `select proc.proname
+     from pg_proc proc
+     join pg_namespace ns on ns.oid = proc.pronamespace
+    where ns.nspname='public'
+      and proc.proname in ('get_club_availability_calendar','set_workspace_calendar_sharing')
+      and not exists (
+        select 1 from unnest(coalesce(proc.proconfig, array[]::text[])) as config
+        where config like 'search_path=%'
+      )`,
+);
+check(clubCalendarSearchPath.length === 0, "as RPCs do calendário do clube fixam search_path");
+
+const clubDirectoryAnonGrants = await rows(
+  `select privilege_type
+     from information_schema.table_privileges
+    where table_schema='public'
+      and table_name='club_calendar_member_directory'
+      and grantee in ('anon','PUBLIC')`,
+);
+check(
+  clubDirectoryAnonGrants.length === 0,
+  "anon não tem privilégios no diretório do calendário do clube",
+);
+
+await mustReject("anónimo não lê o diretório do calendário do clube", () =>
+  asDatabaseRole("anon", null, () =>
+    db.query(`select membership_id from public.club_calendar_member_directory`),
+  ),
+);
+
+const ambiguousClubFunctions = await rows(
+  `select proc.proname, count(*)::int as total
+     from pg_proc proc
+     join pg_namespace ns on ns.oid = proc.pronamespace
+    where ns.nspname='public'
+      and proc.proname in ('get_club_availability_calendar','set_workspace_calendar_sharing')
+    group by proc.proname
+   having count(*) > 1`,
+);
+check(ambiguousClubFunctions.length === 0, "as RPCs do calendário do clube têm assinatura única");
+
 section("Aulas (Fase 1)");
 
 const [generated] = await rows(
