@@ -9,7 +9,7 @@ import { requireRole } from "@/lib/auth/session";
 import { lisbonDateKey } from "@/lib/datetime";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import {
-  readCalendarSearchParams,
+  readCalendarSearchParamsResult,
   type CalendarSearchParams,
 } from "@/lib/validation/calendar";
 import type { TeacherAvailabilityCalendarRecord } from "@/types/database";
@@ -48,7 +48,8 @@ export default async function TeacherCalendarPage({
 
   const now = new Date();
   const today = lisbonDateKey(now);
-  const window = readCalendarSearchParams(await searchParams, now);
+  const calendarParams = readCalendarSearchParamsResult(await searchParams, now);
+  const { window } = calendarParams;
   const supabase = await createSupabaseServerClient();
 
   const [profileResult, calendarResult] = await Promise.all([
@@ -82,6 +83,8 @@ export default async function TeacherCalendarPage({
         settingsHref="/professor/definicoes/disponibilidade"
         defaultLessonDurationMinutes={profileResult.data.default_lesson_duration_minutes}
         minimumBreakMinutes={profileResult.data.minimum_break_minutes}
+        invalidDate={calendarParams.invalidDate}
+        invalidView={calendarParams.invalidView}
       />
 
       <Alert tone="info">

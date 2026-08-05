@@ -6,7 +6,7 @@
 
 **Documento vivo.** Atualizado no fim de cada fase com o que foi realmente construído.
 
-- **Estado atual:** Fases 1, 1.5, 2, 3 e 4 concluídas. A Fase 5 tem as **Etapas 5A e 5B — disponibilidade, intervalos, bloqueios e calendário visual seguro** concluídas e validadas com Supabase remoto e Auth/PostgREST real.
+- **Estado atual:** Fases 1, 1.5, 2, 3 e 4 concluídas. A Fase 5 tem as **Etapas 5A, 5B e 5B.1 — disponibilidade, intervalos, projeção segura e calendário visual refinado** concluídas; criação de aulas e clubes continuam pendentes.
 - **Timezone do sistema:** `Europe/Lisbon`
 - **Idioma da interface:** Português (pt-PT)
 
@@ -161,7 +161,7 @@ A divisão entre as duas últimas linhas e as primeiras não é duplicação. O 
 | Base de dados | Supabase PostgreSQL | versão do projeto remoto por confirmar | RLS nativo |
 | Autenticação | Supabase Auth + `@supabase/ssr` | 0.12.x | Cookies e renovação geridos pela biblioteca |
 | Validação | Zod | 4.4.x | Um schema para cliente e servidor |
-| Testes (unidade/regressão) | Vitest | 4.1.x | 254 testes |
+| Testes (unidade/regressão) | Vitest | 4.1.x | 260 testes |
 | Testes (esquema) | PGlite | 0.5.x | PostgreSQL em WASM — ver D-14 |
 | Ícones | lucide-react | 1.28.x | |
 | Datas | date-fns + `@date-fns/tz` | 4.4.x | |
@@ -446,11 +446,11 @@ A estrutura fica pronta para notificações push (Fase 8).
 | **2** | Perfis, definições e gestão administrativa básica de contas | **Concluído** |
 | **3** | Alunos, turmas, locais, política de cancelamento | **Concluído** |
 | **4** | Pacotes: modelos, atribuição, ajustes, painel de saldo | **Concluído** — Etapas 1A, 1B, 1C, 1D e 1E validadas |
-| **5** | Calendário e criação de aulas, com reserva de créditos | **Parcialmente concluído** — Etapas 5A e 5B: disponibilidade, intervalos, bloqueios e calendário visual seguro |
+| **5** | Calendário e criação de aulas, com reserva de créditos | **Parcialmente concluído** — Etapas 5A, 5B e 5B.1: disponibilidade, projeção segura e refinamento visual do calendário |
 | **6** | Cancelamento, reagendamento, presenças, histórico | **Planeado** |
 | **7** | Área do aluno: aulas, saldo, confirmação de presença | **Planeado** |
 | **8** | Notificações, lembretes e expiração agendada | **Planeado** |
-| **9** | Supabase real, concorrência, acessibilidade, deployment | **Parcialmente concluído** — Supabase/Auth reais validados para a Fase 4 e Etapas 5A-5B; concorrência real, acessibilidade completa e deployment pendentes |
+| **9** | Supabase real, concorrência, acessibilidade, deployment | **Parcialmente concluído** — Supabase/Auth reais validados para a Fase 4 e Etapas 5A-5B.1; concorrência real, acessibilidade completa e deployment pendentes |
 
 A ordem segue as prioridades pedidas: primeiro a área do professor ao computador, depois as regras seguras de créditos, depois o aluno no telemóvel.
 
@@ -461,7 +461,7 @@ A ordem segue as prioridades pedidas: primeiro a área do professor ao computado
 - 4 tabelas, 5 enums, 7 RPCs de mutação, 1 seletor e funções auxiliares
 - 7 colunas de cobrança em `lesson_participants`, `credit_cost` em `lessons`
 - `lib/domain/packages.ts` — usabilidade, seleção, alertas, decisão de cobrança
-- 57 testes de domínio de pacotes; mantidos na suite atual de 254 testes
+- 57 testes de domínio de pacotes; mantidos na suite atual de 260 testes
 - Garantias de créditos mantidas nas 336 verificações atuais; 30 migrações aplicadas do zero e reaplicadas
 - Larguras por função, navegação responsiva, rotas marcadoras de pacotes, manifesto e ícones PWA
 
@@ -511,7 +511,7 @@ A ordem segue as prioridades pedidas: primeiro a área do professor ao computado
 - Migração incremental `20260802001800_phase4_package_admin.sql`: `student_package_audit_events`, idempotência em movimentações administrativas, views `teacher_package_audit_records` e `teacher_package_history_records`, novas RPCs administrativas e correção de datas civis `Europe/Lisbon`
 - `/professor/pacotes/historico`: histórico global com filtros por aluno/pacote, origem, tipo, responsável e período
 - A área do aluno continua somente leitura: não recebe motivos administrativos, autoria privada, saldos antes/depois nem eventos internos
-- 20 testes Vitest novos de validação e 24 verificações PostgreSQL novas naquela entrega; suite atual com 254 testes e 336 verificações
+- 20 testes Vitest novos de validação e 24 verificações PostgreSQL novas naquela entrega; suite atual com 260 testes e 336 verificações
 
 ### Etapa 1E — Revisão integrada e validação real da gestão de pacotes
 
@@ -520,7 +520,7 @@ Estado atual: **concluída**.
 Concluído:
 
 - Projeto local ligado ao Supabase de desenvolvimento `fzkwacnpydoqhxipcvro`.
-- 27 migrações locais da Fase 4 aplicadas no remoto naquela etapa; o estado atual do projeto tem 30 migrações com as Etapas 5A e 5B.
+- 27 migrações locais da Fase 4 aplicadas no remoto naquela etapa; o estado atual do projeto tem 30 migrações com as Etapas 5A e 5B, e a 5B.1 não acrescentou migração.
 - Dependências Supabase auditadas: `@supabase/server` não é usado nem mantido; sessão/cookies continuam concentrados em `@supabase/ssr`, e `@supabase/supabase-js` fica para cliente admin server-only e tipos.
 - Variáveis de ambiente auditadas: o código lê `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `NEXT_PUBLIC_SITE_URL` e `SUPABASE_SERVICE_ROLE_KEY`; o exemplo não inclui chaves reais nem variáveis duplicadas de `SUPABASE_PUBLISHABLE_KEY`, `SUPABASE_SECRET_KEY` ou `SUPABASE_JWKS_URL`.
 - `scripts/verify-remote-supabase.mjs` valida o catálogo remoto sem escrever dados: migrações, tabelas, views, enums, índices, constraints, RLS, grants, assinaturas únicas de RPCs, `search_path` seguro, `EXECUTE` restrito e privacidade das views do aluno.
@@ -561,8 +561,8 @@ Concluído:
 - Server Actions com Zod estrito e reautenticação de professor ativo; organização, professor, autoria e timestamps nunca vêm do formulário.
 - `scripts/verify-schema.mjs` ampliado para 336 verificações, cobrindo grants, RLS, idempotência, sobreposição, precedência, privacidade, calendário seguro, bloqueio de conta e recusa de aluno/admin/anónimo.
 - `scripts/verify-remote-supabase.mjs` ampliado para catálogo remoto da Etapa 5A.
-- `scripts/verify-remote-auth.mjs` ampliado para Auth/PostgREST real das Etapas 5A-5B; suite atual com 90 verificações reais.
-- Testes Vitest novos para domínio e validação de disponibilidade; suite atual com 254 testes.
+- `scripts/verify-remote-auth.mjs` ampliado para Auth/PostgREST real das Etapas 5A-5B.1; suite atual com 90 verificações reais.
+- Testes Vitest novos para domínio e validação de disponibilidade; suite atual com 260 testes.
 - Supabase remoto `fzkwacnpydoqhxipcvro` atualizado com 30 migrações locais aplicadas.
 
 Teste manual recomendado:
@@ -594,7 +594,7 @@ Concluído:
 - Componente partilhado `AvailabilityCalendar`, alimentado por DTOs diferentes: professor recebe campos privados; aluno recebe apenas a projeção segura.
 - `loading.tsx` e `error.tsx` nas rotas de calendário de professor e aluno.
 - `scripts/verify-schema.mjs`, `scripts/verify-remote-supabase.mjs` e `scripts/verify-remote-auth.mjs` ampliados para as RPCs de calendário, privacidade do aluno, recusa de anónimo/bloqueado, limite de 42 dias e isolamento entre contas.
-- Testes Vitest novos de domínio e validação de calendário; suite atual com 254 testes.
+- Testes Vitest novos de domínio e validação de calendário; suite atual com 260 testes.
 - Supabase remoto atualizado com a migração 30; `db:verify:remote` e `db:verify:auth` passam com a validação de calendário seguro.
 
 Teste manual recomendado:
@@ -605,6 +605,80 @@ Teste manual recomendado:
 4. Confirmar que o aluno vê apenas horários disponíveis/indisponíveis, sem motivo de bloqueio, categoria, IDs internos ou escolha de professor.
 
 **Ainda não implementado:** criação de aulas, calendário de aulas reais, participantes, grupos ligados a aulas, recorrência, reserva/consumo de créditos, presenças, cancelamentos/reagendamentos de aulas, confirmação do aluno, lista de espera, notificações, reservas de campos, pagamentos, Google/Apple/ICS e drag-and-drop.
+
+### Concluído na Fase 5 — Etapa 5B.1: refinamento visual do calendário
+
+Estado atual: **concluída para apresentação visual**, sem alterar a fonte de dados.
+
+Concluído:
+
+- `AvailabilityCalendar` foi reconstruído como uma superfície de calendário, mantendo o mesmo contrato seguro de dados e sem biblioteca externa.
+- As vistas **Dia**, **Semana** e **Mês** ficaram visualmente distintas e preservadas por URL (`data` e `vista`), com seletor visível, botão "Hoje", anterior, seguinte, título do período e timezone `Europe/Lisbon`.
+- Vista semanal desktop: sete colunas alinhadas com cabeçalho de dias, coluna lateral de horas, grelha vertical, faixa de dia inteiro e blocos posicionados por início/duração.
+- Vista diária: uma coluna temporal, faixa de dia inteiro, blocos proporcionais, detalhes permitidos e prévia de inícios possíveis apenas para o professor.
+- Vista mensal: grelha tradicional de cinco ou seis semanas, sem linha temporal de horas, dias externos reduzidos, resumo real de disponibilidade/bloqueios/exceções e ligação de cada dia para a vista diária.
+- Mobile: a semana não força sete colunas; usa faixa horizontal de dias e mostra a timeline do dia selecionado. O mês fica compacto e a página evita overflow horizontal.
+- A linha de "agora" é um Client Component pequeno, aparece só depois da hidratação, respeita `Europe/Lisbon` e atualiza por minuto.
+- A distinção visual combina texto, ícones, contorno/padrão e contraste; o aluno continua a ver apenas "Disponível" ou "Indisponível".
+- `src/lib/domain/calendar.ts` centraliza janela selecionada, navegação civil, faixa horária visível, labels de horas, posicionamento proporcional, camada visual dos blocos e posição da linha atual.
+- `src/lib/validation/calendar.ts` sinaliza `data`/`vista` inválidas sem passar parâmetros inválidos para a RPC.
+- Loading das rotas de calendário passou a ter dimensões próximas da grelha final.
+- Testes Vitest ampliados para navegação mensal, serialização, hora lateral, altura proporcional, precedência visual de bloqueio, linha de agora e parâmetros inválidos.
+
+Decisão sobre biblioteca:
+
+- FullCalendar, React Big Calendar e semelhantes não foram instalados. Para o MVP, CSS Grid + cálculos puros cobre o requisito com menor bundle, melhor controlo de privacidade, melhor compatibilidade com Server Components e manutenção mais simples.
+
+Não alterado:
+
+- Nenhuma migração nova.
+- Nenhuma RPC nova.
+- Nenhuma tabela de aulas, clubes, recursos ou memberships.
+- Nenhum botão de reserva.
+- Nenhum registo fictício de aula.
+- Nenhuma integração Google Calendar, Apple Calendar, ICS ou drag-and-drop.
+
+### Planeado para a Fase 5 — Etapa 5B.2: clubes e calendário compartilhado
+
+Esta etapa ainda **não está implementada**. O professor independente continua totalmente suportado e não precisa criar clube para usar o AulaFlow.
+
+Decisões a preservar:
+
+- Professor independente mantém um workspace pessoal privado, vê somente a própria agenda e nenhum outro professor acessa sua agenda.
+- Clube funcionará como workspace compartilhado, com vários professores e possíveis administradores/gestores.
+- Clube poderá possuir locais, campos ou recursos; professores entrarão por convite ou vínculo autorizado.
+- Professores autorizados poderão ver um calendário compartilhado filtrável por professor, local, campo ou recurso.
+- Um professor do clube poderá ver, conforme permissão, nome do colega, horário ocupado, disponibilidade necessária para coordenação e local/campo usado.
+- Um professor do clube não deverá ver automaticamente nome dos alunos de outro professor, pacote, saldo, pagamento, telefone, notas privadas, motivo pessoal de bloqueio ou dados administrativos sensíveis.
+- Bloqueio privado de colega deve aparecer apenas como `Indisponível`.
+- O domínio deve preparar a possibilidade futura de um professor ter workspace pessoal, vínculo com um clube e vínculo com mais de um clube, sem implementar isso na 5B.1.
+
+Conflitos futuros a modelar:
+
+1. Conflito do professor: o mesmo professor não pode ter duas aulas simultâneas.
+2. Conflito do recurso: o mesmo campo ou recurso não pode receber duas aulas simultâneas.
+3. Ausência de conflito: professores diferentes podem dar aulas no mesmo horário usando recursos diferentes.
+
+Auditoria obrigatória antes de modelar clubes:
+
+- Auditar a estrutura atual de `organizations` antes de criar uma tabela `clubs`.
+- Avaliar se `organizations` já representa clube/workspace, se deve receber tipo `personal`/`club`, se clube é entidade separada ligada à organização ou se as associações atuais evoluem para memberships.
+- Não duplicar conceitos sem analisar o modelo real.
+
+Rotas futuras possíveis, dependentes da arquitetura escolhida:
+
+- `/professor/clube`
+- `/professor/clube/calendario`
+- `/professor/clube/professores`
+- `/professor/clube/locais`
+
+Ordem futura da Fase 5:
+
+1. 5B.1 — Refinamento visual.
+2. 5B.2 — Clubes e calendário compartilhado.
+3. 5C — Criação e edição de aulas.
+4. 5D — Recorrência, conflitos e reservas de créditos.
+5. 5E — Revisão integrada.
 
 ### Fase 2 — estado por item
 
@@ -620,7 +694,7 @@ Teste manual recomendado:
 | Preferências de notificação | **Concluído** | Persistência de canais/eventos; entrega automática continua planeada para a Fase 8 |
 | Diretório administrativo | **Concluído** | Pesquisa, filtros, professores, detalhe, estados vazios/erro/loading e resposta mobile/desktop |
 | Bloqueio e reativação | **Concluído** | RPC exclusiva de admin, sem auto-bloqueio, motivo, auditoria e revogação efetiva por RLS |
-| Validação num Supabase remoto | **Concluído para a Fase 4 e Etapas 5A-5B** | Migrações, catálogo remoto, GoTrue/Auth, JWT/PostgREST, contas reais e browser desktop/mobile da Fase 4 validados; calendário seguro validado por RPC/Auth real |
+| Validação num Supabase remoto | **Concluído para a Fase 4 e Etapas 5A-5B.1** | Migrações, catálogo remoto, GoTrue/Auth, JWT/PostgREST, contas reais e browser desktop/mobile da Fase 4 validados; calendário seguro validado por RPC/Auth real |
 
 ### Concluído na Fase 2
 
@@ -651,7 +725,7 @@ Teste manual recomendado:
 - **A interface de pacotes ainda é parcial.** `/professor/pacotes` gere modelos, atribuição, consulta, ajustes administrativos e histórico; `/aluno/pacotes` mostra os próprios pacotes. Transferências/fusões/divisões e integração com aulas reais continuam pendentes.
 - **A expiração de pacotes não é automática.** `refresh_package_status()` marca `expired` quando é chamada, mas nada corre à meia-noite. Precisa de uma tarefa agendada — Fase 8, com os lembretes.
 - **`credit_expired` e `credit_transferred_*` existem no enum mas não têm função.** Ficam para quando a expiração automática e a transferência entre pacotes forem implementadas numa fase futura.
-- **A validação remota da Fase 4 e das Etapas 5A-5B cobre Auth/PostgREST real, mas não concorrência simultânea.** O catálogo remoto é verificado por `db:verify:remote` e o cenário com contas reais por `db:verify:auth`; duas ligações concorrentes sobre o último crédito ainda pertencem à Fase 9.
+- **A validação remota da Fase 4 e das Etapas 5A-5B.1 cobre Auth/PostgREST real, mas não concorrência simultânea.** O catálogo remoto é verificado por `db:verify:remote` e o cenário com contas reais por `db:verify:auth`; duas ligações concorrentes sobre o último crédito ainda pertencem à Fase 9.
 - **A concorrência real não é reproduzida.** O teste sequencial confirma o resultado e as funções usam `FOR UPDATE`; duas ligações simultâneas ainda têm de ser testadas na Fase 9.
 - **Não existem Server Actions do ciclo de créditos.** As RPCs e decisões de domínio estão prontas, mas criar/cancelar/concluir/reagendar pela interface pertence às Fases 5–6.
 

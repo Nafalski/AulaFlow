@@ -7,12 +7,42 @@ export type CalendarView = (typeof CALENDAR_VIEW_VALUES)[number];
 
 export type CalendarWindow = {
   view: CalendarView;
+  selectedDate: string;
   startDate: string;
   endDate: string;
   days: string[];
 };
 
 export type AvailabilitySlot = TimeSlot;
+
+export type CalendarTimelineRange = {
+  startMinutes: number;
+  endMinutes: number;
+};
+
+export type CalendarTimelinePosition = {
+  startsAtMinutes: number;
+  endsAtMinutes: number;
+  durationMinutes: number;
+  topPercent: number;
+  heightPercent: number;
+};
+
+export type CalendarDisplayKind = "availability" | "exception" | "block" | "unavailable";
+
+export type CalendarDisplayItemContract = {
+  id: string;
+  kind: CalendarDisplayKind;
+  date: string;
+  startTime?: string;
+  endTime?: string;
+  title: string;
+  status: string;
+};
+
+export const DEFAULT_TIMELINE_START_MINUTES = 7 * 60;
+export const DEFAULT_TIMELINE_END_MINUTES = 22 * 60;
+export const TIMELINE_MINOR_STEP_MINUTES = 30;
 
 const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -80,22 +110,56 @@ export function monthWindowForDate(dateInput: string): { startDate: string; endD
 
 export function calendarWindowFor(dateInput: string, view: CalendarView): CalendarWindow {
   if (view === "day") {
-    return { view, startDate: dateInput, endDate: dateInput, days: [dateInput] };
+    return {
+      view,
+      selectedDate: dateInput,
+      startDate: dateInput,
+      endDate: dateInput,
+      days: [dateInput],
+    };
   }
 
   if (view === "month") {
     const { startDate, endDate } = monthWindowForDate(dateInput);
-    return { view, startDate, endDate, days: listDateRange(startDate, endDate) };
+    return {
+      view,
+      selectedDate: dateInput,
+      startDate,
+      endDate,
+      days: listDateRange(startDate, endDate),
+    };
   }
 
   const startDate = weekStartDate(dateInput);
   const endDate = addCivilDays(startDate, 6);
-  return { view, startDate, endDate, days: listDateRange(startDate, endDate) };
+  return {
+    view,
+    selectedDate: dateInput,
+    startDate,
+    endDate,
+    days: listDateRange(startDate, endDate),
+  };
+}
+
+function shiftMonth(dateInput: string, direction: -1 | 1): string {
+  if (!isDateOnly(dateInput)) return dateInput;
+
+  const [year, month] = dateInput.split("-").map(Number) as [number, number];
+  const zeroBasedMonth = month - 1 + direction;
+  const target = new Date(Date.UTC(year, zeroBasedMonth, 1));
+
+  return [
+    target.getUTCFullYear(),
+    String(target.getUTCMonth() + 1).padStart(2, "0"),
+    "01",
+  ].join("-");
 }
 
 export function shiftCalendarWindow(window: CalendarWindow, direction: -1 | 1): string {
-  const amount = window.view === "day" ? 1 : window.view === "month" ? window.days.length : 7;
-  return addCivilDays(window.startDate, amount * direction);
+  if (window.view === "month") return shiftMonth(window.selectedDate, direction);
+
+  const amount = window.view === "day" ? 1 : 7;
+  return addCivilDays(window.selectedDate, amount * direction);
 }
 
 export function timeToMinutes(value: string): number {
@@ -141,4 +205,127 @@ export function generateAvailabilitySlots({
   }
 
   return slots;
+}
+
+export function timelineRangeForItems(
+  items: Array<{ startsAt?: string | null; endsAt?: string | null }>,
+): CalendarTimelineRange {
+  const starts: number[] = [];
+  const ends: number[] = [];
+
+  for (const item of items) {
+    if (!item.startsAt || !item.endsAt) continue;
+
+    const start = timeToMinutes(item.startsAt);
+    const end = timeToMinutes(item.endsAt);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) continue;
+
+    starts.push(start);
+    ends.push(end);
+  }
+
+  if (starts.length === 0 || ends.length === 0) {
+    return {
+      startMinutes: DEFAULT_TIMELINE_START_MINUTES,
+      endMinutes: DEFAULT_TIMELINE_END_MINUTES,
+    };
+  }
+
+  const earliestStart = Math.min(...starts);
+  const latestEnd = Math.max(...ends);
+  const startMinutes =
+    earliestStart < DEFAULT_TIMELINE_START_MINUTES
+      ? Math.max(0, Math.floor(earliestStart / 60) * 60)
+      : DEFAULT_TIMELINE_START_MINUTES;
+  const endMinutes =
+    latestEnd > DEFAULT_TIMELINE_END_MINUTES
+      ? Math.min(24 * 60, Math.ceil(latestEnd / 60) * 60)
+      : DEFAULT_TIMELINE_END_MINUTES;
+
+  return { startMinutes, endMinutes: Math.max(endMinutes, startMinutes + 60) };
+}
+
+export function timelineHourLabels(range: CalendarTimelineRange): TimeSlot[] {
+  const firstHour = Math.ceil(range.startMinutes / 60) * 60;
+  const labels: TimeSlot[] = [];
+
+  for (let minutes = firstHour; minutes <= range.endMinutes; minutes += 60) {
+    labels.push({ startsAt: minutesToTime(minutes), endsAt: minutesToTime(minutes) });
+  }
+
+  return labels;
+}
+
+function clampMinutes(value: number, range: CalendarTimelineRange): number {
+  return Math.max(range.startMinutes, Math.min(range.endMinutes, value));
+}
+
+export function timelinePositionForMinutes(
+  minutes: number,
+  range: CalendarTimelineRange,
+): number | null {
+  const total = range.endMinutes - range.startMinutes;
+  if (total <= 0 || minutes < range.startMinutes || minutes > range.endMinutes) return null;
+
+  return ((minutes - range.startMinutes) / total) * 100;
+}
+
+export function positionCalendarBlock(
+  item: { startsAt?: string | null; endsAt?: string | null },
+  range: CalendarTimelineRange,
+): CalendarTimelinePosition | null {
+  if (!item.startsAt || !item.endsAt) return null;
+
+  const startsAtMinutes = timeToMinutes(item.startsAt);
+  const endsAtMinutes = timeToMinutes(item.endsAt);
+  const total = range.endMinutes - range.startMinutes;
+
+  if (
+    total <= 0 ||
+    !Number.isFinite(startsAtMinutes) ||
+    !Number.isFinite(endsAtMinutes) ||
+    endsAtMinutes <= startsAtMinutes
+  ) {
+    return null;
+  }
+
+  const clampedStart = clampMinutes(startsAtMinutes, range);
+  const clampedEnd = clampMinutes(endsAtMinutes, range);
+  const durationMinutes = clampedEnd - clampedStart;
+  if (durationMinutes <= 0) return null;
+
+  return {
+    startsAtMinutes,
+    endsAtMinutes,
+    durationMinutes: endsAtMinutes - startsAtMinutes,
+    topPercent: ((clampedStart - range.startMinutes) / total) * 100,
+    heightPercent: (durationMinutes / total) * 100,
+  };
+}
+
+export function calendarItemLayer({
+  status,
+  source,
+}: {
+  status: string;
+  source?: string | null;
+}): number {
+  if (source === "schedule_block") return 30;
+  if (status === "available") return source === "date_exception" ? 24 : 20;
+  return 10;
+}
+
+export function currentTimePositionForDate({
+  date,
+  today,
+  minutes,
+  range,
+}: {
+  date: string;
+  today: string;
+  minutes: number;
+  range: CalendarTimelineRange;
+}): number | null {
+  if (date !== today) return null;
+  return timelinePositionForMinutes(minutes, range);
 }

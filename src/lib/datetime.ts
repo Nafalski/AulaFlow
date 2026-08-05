@@ -49,6 +49,11 @@ export function formatFullDate(value: Date | string): string {
   return formatter({ day: "numeric", month: "long", year: "numeric" }).format(toDate(value));
 }
 
+/** "agosto de 2026" */
+export function formatMonthYear(value: Date | string): string {
+  return formatter({ month: "long", year: "numeric" }).format(toDate(value));
+}
+
 /** "segunda-feira, 10 de agosto" */
 export function formatWeekdayDate(value: Date | string): string {
   return formatter({ weekday: "long", day: "numeric", month: "long" }).format(toDate(value));

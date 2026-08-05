@@ -10,6 +10,12 @@ import { lisbonDateKey } from "@/lib/datetime";
 
 export type CalendarSearchParams = Record<string, string | string[] | undefined>;
 
+export type CalendarSearchParamsResult = {
+  window: CalendarWindow;
+  invalidDate: boolean;
+  invalidView: boolean;
+};
+
 const VIEW_PARAM_TO_VALUE: Record<string, CalendarView> = {
   dia: "day",
   day: "day",
@@ -43,12 +49,26 @@ export function readCalendarSearchParams(
   searchParams: CalendarSearchParams,
   now: Date = new Date(),
 ): CalendarWindow {
-  const dateParam = normalizeSingleParam(searchParams.data);
-  const viewResult = viewParamSchema.safeParse(searchParams.vista);
-  const view = viewResult.success ? viewResult.data : "week";
-  const date = dateParam && isDateOnly(dateParam) ? dateParam : lisbonDateKey(now);
+  return readCalendarSearchParamsResult(searchParams, now).window;
+}
 
-  return calendarWindowFor(date, view);
+export function readCalendarSearchParamsResult(
+  searchParams: CalendarSearchParams,
+  now: Date = new Date(),
+): CalendarSearchParamsResult {
+  const dateParam = normalizeSingleParam(searchParams.data);
+  const viewParam = normalizeSingleParam(searchParams.vista);
+  const viewResult = viewParamSchema.safeParse(viewParam);
+  const view = viewResult.success ? viewResult.data : "week";
+  const invalidDate = Boolean(dateParam && !isDateOnly(dateParam));
+  const invalidView = Boolean(viewParam && !(viewParam in VIEW_PARAM_TO_VALUE));
+  const date = dateParam && !invalidDate ? dateParam : lisbonDateKey(now);
+
+  return {
+    window: calendarWindowFor(date, view),
+    invalidDate,
+    invalidView,
+  };
 }
 
 export function calendarHref({

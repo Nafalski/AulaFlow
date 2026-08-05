@@ -5,8 +5,8 @@ Professores marcam aulas, escolhem os alunos e registam presenças; os alunos ve
 
 A começar pelo **beach tennis**, com arquitetura preparada para outras modalidades.
 
-> **Estado:** Fases 1, 1.5, 2, 3 e 4 concluídas. A Fase 5 tem as Etapas 5A e 5B: fonte de verdade da disponibilidade, calendário visual do professor e disponibilidade segura para o aluno.
-> Transferência/fusão de pacotes, criação de aulas e reservas de créditos continuam nas etapas seguintes.
+> **Estado:** Fases 1, 1.5, 2, 3 e 4 concluídas. A Fase 5 tem as Etapas 5A, 5B e 5B.1: fonte de verdade da disponibilidade, projeção segura e calendário visual refinado em dia/semana/mês.
+> Clubes, criação de aulas, transferência/fusão de pacotes e reservas de créditos continuam nas etapas seguintes.
 
 ---
 
@@ -44,7 +44,7 @@ Instruções completas — incluindo a configuração do Supabase — em [`AGENT
 - Ajustes administrativos de pacotes: adicionar/remover créditos disponíveis, suspender, reativar, cancelar, corrigir datas e corrigir movimentações por operação compensatória
 - Histórico completo em `/professor/pacotes/historico`, unindo livro-razão de créditos e eventos administrativos sem expor detalhes privados ao aluno
 - Disponibilidade do professor em `/professor/definicoes/disponibilidade`: horários semanais, intervalos por separação de períodos, exceções por data, bloqueios privados, duração padrão e intervalo mínimo
-- Calendários de disponibilidade em `/professor/calendario` e `/aluno/calendario`, com vistas dia/semana/mês; o aluno recebe só data, hora e estado do próprio professor
+- Calendários de disponibilidade em `/professor/calendario` e `/aluno/calendario`, com vistas Dia/Semana/Mês, semana em linha temporal no desktop, mês sem coluna de horas e mobile adaptado; o aluno recebe só data, hora e estado do próprio professor
 - Views seguras para a área do aluno, sem valor registado, origem administrativa, observações, autoria ou identificadores internos sensíveis
 - RPCs seguras de disponibilidade: professor vê detalhes dos próprios bloqueios; aluno não recebe motivo, categoria, fonte interna, organização nem `teacher_id`
 - Diretório administrativo com pesquisa, filtros, detalhe e bloqueio/reativação auditados
@@ -53,12 +53,14 @@ Instruções completas — incluindo a configuração do Supabase — em [`AGENT
 - Pacotes, saldos disponíveis/reservados/utilizados e livro-razão append-only
 - RPCs PostgreSQL para atribuir, reservar, consumir, libertar, reagendar, ajustar e corrigir créditos
 - RPCs PostgreSQL para guardar preferências, horários semanais, exceções, bloqueios e resolução segura de disponibilidade
-- Regras e validação com 254 testes de unidade/regressão
+- Regras e validação com 260 testes de unidade/regressão
 - 336 verificações PostgreSQL sobre migrações, permissões, RLS, gestão, claim, modelos, atribuição, consulta, ajustes administrativos, disponibilidade, calendário seguro, grants de views e saldos
 - 90 verificações Auth/PostgREST reais no Supabase de desenvolvimento
 - Estrutura responsiva das áreas de professor, aluno e administração, com manifesto e ícones PWA
 
-`/professor/pacotes` gere modelos reutilizáveis, atribuição, consulta e ajustes administrativos dos pacotes atribuídos. `/professor/pacotes/historico` mostra a auditoria global. `/professor/definicoes/disponibilidade` guarda a fonte de verdade da agenda do professor. `/professor/calendario` e `/aluno/calendario` mostram disponibilidade calculada; ainda não criam aulas. `/aluno/pacotes` mostra apenas os próprios pacotes e movimentos básicos.
+`/professor/pacotes` gere modelos reutilizáveis, atribuição, consulta e ajustes administrativos dos pacotes atribuídos. `/professor/pacotes/historico` mostra a auditoria global. `/professor/definicoes/disponibilidade` guarda a fonte de verdade da agenda do professor. `/professor/calendario` e `/aluno/calendario` mostram disponibilidade calculada em Dia/Semana/Mês; ainda não criam aulas. `/aluno/pacotes` mostra apenas os próprios pacotes e movimentos básicos.
+
+O próximo passo planeado da Fase 5 é a **Etapa 5B.2 — clubes e calendário compartilhado**. Clubes ainda não foram implementados; o professor independente continua totalmente suportado com agenda privada.
 
 Sem um bucket de Storage configurado, os avatares usam iniciais. Preparar a ligação de um aluno ainda não envia email sem um Supabase remoto; a interface identifica essa limitação. As preferências de email ficam guardadas, mas a entrega automática e os lembretes agendados pertencem à Fase 8.
 

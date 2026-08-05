@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { calendarHref, readCalendarSearchParams, viewParamFor } from "./calendar";
+import {
+  calendarHref,
+  readCalendarSearchParams,
+  readCalendarSearchParamsResult,
+  viewParamFor,
+} from "./calendar";
 
 describe("calendar search params", () => {
   const now = new Date(Date.UTC(2026, 7, 12, 12));
@@ -32,6 +37,21 @@ describe("calendar search params", () => {
       view: "week",
       startDate: "2026-08-10",
       endDate: "2026-08-16",
+    });
+  });
+
+  it("reports invalid date and view params without passing them to the database window", () => {
+    expect(
+      readCalendarSearchParamsResult({ data: "2026-02-30", vista: "agenda" }, now),
+    ).toMatchObject({
+      invalidDate: true,
+      invalidView: true,
+      window: {
+        view: "week",
+        selectedDate: "2026-08-12",
+        startDate: "2026-08-10",
+        endDate: "2026-08-16",
+      },
     });
   });
 

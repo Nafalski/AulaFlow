@@ -11,7 +11,7 @@ import { requireRole } from "@/lib/auth/session";
 import { lisbonDateKey } from "@/lib/datetime";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import {
-  readCalendarSearchParams,
+  readCalendarSearchParamsResult,
   type CalendarSearchParams,
 } from "@/lib/validation/calendar";
 import type { StudentAvailabilityCalendarRecord } from "@/types/database";
@@ -60,7 +60,8 @@ export default async function StudentCalendarPage({
   const user = await requireRole("student", "/aluno/calendario");
   const now = new Date();
   const today = lisbonDateKey(now);
-  const window = readCalendarSearchParams(await searchParams, now);
+  const calendarParams = readCalendarSearchParamsResult(await searchParams, now);
+  const { window } = calendarParams;
 
   if (!user.studentId) {
     return <UnlinkedStudentCard email={user.email} />;
@@ -113,6 +114,8 @@ export default async function StudentCalendarPage({
         title="Calendário"
         subtitle="Horários disponíveis do seu professor."
         teacherName={teacherResult.data?.public_name ?? null}
+        invalidDate={calendarParams.invalidDate}
+        invalidView={calendarParams.invalidView}
       />
 
       <Alert tone="info">

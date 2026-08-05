@@ -2,12 +2,17 @@ import { describe, expect, it } from "vitest";
 
 import {
   calendarWindowFor,
+  calendarItemLayer,
+  currentTimePositionForDate,
   daysBetweenInclusive,
   generateAvailabilitySlots,
   isDateOnly,
   listDateRange,
   monthWindowForDate,
+  positionCalendarBlock,
   shiftCalendarWindow,
+  timelineHourLabels,
+  timelineRangeForItems,
   weekStartDate,
 } from "./calendar";
 
@@ -30,8 +35,10 @@ describe("calendar domain", () => {
     const window = calendarWindowFor("2026-08-12", "week");
 
     expect(window.days).toHaveLength(7);
-    expect(shiftCalendarWindow(window, 1)).toBe("2026-08-17");
-    expect(shiftCalendarWindow(window, -1)).toBe("2026-08-03");
+    expect(window.selectedDate).toBe("2026-08-12");
+    expect(shiftCalendarWindow(window, 1)).toBe("2026-08-19");
+    expect(shiftCalendarWindow(window, -1)).toBe("2026-08-05");
+    expect(JSON.parse(JSON.stringify(window))).toEqual(window);
   });
 
   it("creates a month grid without exceeding the normal 42 day limit", () => {
@@ -41,6 +48,8 @@ describe("calendar domain", () => {
     expect(month.startDate).toBe("2026-07-27");
     expect(month.endDate).toBe("2026-09-06");
     expect(days).toHaveLength(42);
+    expect(calendarWindowFor("2026-08-12", "month").days.length / 7).toBe(6);
+    expect(shiftCalendarWindow(calendarWindowFor("2026-08-12", "month"), 1)).toBe("2026-09-01");
   });
 
   it("rejects inverted or excessive ranges", () => {
@@ -85,5 +94,61 @@ describe("calendar domain", () => {
         minimumBreakMinutes: 0,
       })[0],
     ).toEqual({ startsAt: "09:00", endsAt: "10:00" });
+  });
+
+  it("builds a professional timeline range with hour labels", () => {
+    const range = timelineRangeForItems([
+      { startsAt: "09:00", endsAt: "13:00" },
+      { startsAt: "18:30", endsAt: "20:00" },
+    ]);
+
+    expect(range).toEqual({ startMinutes: 420, endMinutes: 1320 });
+    expect(timelineHourLabels(range).map((label) => label.startsAt)).toContain("09:00");
+    expect(timelineHourLabels(range).map((label) => label.startsAt)).toContain("22:00");
+  });
+
+  it("expands the visible range when availability starts before the default", () => {
+    expect(
+      timelineRangeForItems([{ startsAt: "06:15", endsAt: "23:30" }]),
+    ).toEqual({ startMinutes: 360, endMinutes: 1440 });
+  });
+
+  it("positions blocks by start time and proportional duration", () => {
+    const range = timelineRangeForItems([{ startsAt: "09:00", endsAt: "13:00" }]);
+    const fourHours = positionCalendarBlock({ startsAt: "09:00", endsAt: "13:00" }, range);
+    const oneHour = positionCalendarBlock({ startsAt: "09:00", endsAt: "10:00" }, range);
+    const twoHours = positionCalendarBlock({ startsAt: "09:00", endsAt: "11:00" }, range);
+
+    expect(fourHours?.durationMinutes).toBe(240);
+    expect(fourHours?.topPercent).toBeCloseTo(((9 * 60 - 7 * 60) / (15 * 60)) * 100);
+    expect(fourHours?.heightPercent).toBeCloseTo((240 / (15 * 60)) * 100);
+    expect(oneHour?.heightPercent).toBeLessThan(twoHours?.heightPercent ?? 0);
+  });
+
+  it("keeps blocks above available periods without recalculating precedence", () => {
+    expect(calendarItemLayer({ status: "unavailable", source: "schedule_block" })).toBeGreaterThan(
+      calendarItemLayer({ status: "available", source: "weekly_rule" }),
+    );
+  });
+
+  it("shows the current-time position only for the Lisbon day in view", () => {
+    const range = timelineRangeForItems([{ startsAt: "09:00", endsAt: "13:00" }]);
+
+    expect(
+      currentTimePositionForDate({
+        date: "2026-08-10",
+        today: "2026-08-10",
+        minutes: 10 * 60,
+        range,
+      }),
+    ).toBeCloseTo(((10 * 60 - 7 * 60) / (15 * 60)) * 100);
+    expect(
+      currentTimePositionForDate({
+        date: "2026-08-11",
+        today: "2026-08-10",
+        minutes: 10 * 60,
+        range,
+      }),
+    ).toBeNull();
   });
 });

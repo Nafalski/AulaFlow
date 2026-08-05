@@ -1,5 +1,5 @@
-import { ManagementLoading } from "@/components/management/management-loading";
+import { CalendarLoading } from "@/components/calendar/calendar-loading";
 
 export default function TeacherCalendarLoading() {
-  return <ManagementLoading label="calendário" />;
+  return <CalendarLoading label="calendário do professor" />;
 }

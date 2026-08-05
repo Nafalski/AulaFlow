@@ -146,7 +146,7 @@ update public.profiles set role = 'admin' where email = 'voce@exemplo.pt';
 │   ├── ..._phase4_package_view_grants.sql grants explícitos das views da Fase 4
 │   ├── ..._phase5_teacher_availability.sql Etapa 5A: disponibilidade, exceções e bloqueios
 │   ├── ..._phase5_availability_view_grants.sql grants explícitos das views da Etapa 5A
-│   └── ..._phase5_calendar_projection.sql Etapa 5B: calendário visual e RPC segura do aluno
+│   └── ..._phase5_calendar_projection.sql Etapa 5B: projeção de calendário e RPC segura do aluno
 │
 └── src/
     ├── proxy.ts             Renova a sessão e protege rotas (era middleware.ts)
@@ -479,7 +479,7 @@ Estas regras vivem em `lib/domain/package-display.ts` e são partilhadas entre p
 
 `resolveCreditOutcome()` em `lib/domain/packages.ts` decide cobrar/devolver conforme prazo e política; a Server Action futura aplica essa decisão chamando a RPC correspondente. As interfaces e essas orquestrações ainda pertencem às Fases 4–7.
 
-### Disponibilidade e calendário (Etapas 5A e 5B)
+### Disponibilidade e calendário (Etapas 5A, 5B e 5B.1)
 
 A fonte de verdade da agenda do professor fica separada de aulas, participantes e créditos:
 
@@ -514,7 +514,31 @@ Ambas recusam intervalos vazios, invertidos ou superiores a 42 dias. A RPC do al
 
 A interface vive em `/professor/calendario` e `/aluno/calendario`, com vistas por dia, semana e mês via query params `data` e `vista`. O calendário do professor mostra detalhes privados e prévia de inícios possíveis com a duração/intervalo das preferências; o do aluno mostra apenas disponibilidade segura.
 
-**Ainda não implementado:** criação de aulas, calendário de aulas reais, recorrência, participantes, reservas/consumo de créditos, presenças, cancelamentos/reagendamentos de aulas, confirmação do aluno, lista de espera e notificações.
+Na Etapa 5B.1, a apresentação visual passou a usar:
+
+- **Dia:** uma coluna temporal, horas na lateral, faixa de dia inteiro e blocos proporcionais à duração.
+- **Semana desktop:** sete colunas alinhadas, cabeçalho de dias, horas na lateral, grelha com linhas de 30 minutos e blocos posicionados por minutos.
+- **Semana mobile:** faixa horizontal de dias e timeline do dia selecionado, sem apertar sete colunas no telefone.
+- **Mês:** grelha tradicional de cinco ou seis semanas, sem linha temporal de horas; cada célula mostra apenas resumos reais de disponibilidade, bloqueio ou exceção.
+- Linha de "agora" apenas no cliente, depois da hidratação, atualizada por minuto e respeitando `Europe/Lisbon`.
+
+`src/lib/domain/calendar.ts` centraliza janela selecionada, navegação civil, faixa horária visível, labels de horas, posição proporcional dos blocos e camada visual. O componente cliente recebe apenas strings, números, booleanos, arrays e objetos literais.
+
+**Ainda não implementado:** criação de aulas, calendário de aulas reais, recorrência, participantes, reservas/consumo de créditos, presenças, cancelamentos/reagendamentos de aulas, confirmação do aluno, lista de espera, notificações, clubes, memberships, calendário compartilhado entre professores, recursos/campos de clube, Google Calendar, Apple Calendar, ICS e drag-and-drop.
+
+### Clubes e calendário compartilhado (Etapa 5B.2 futura)
+
+A Etapa 5B.2 vem antes da criação de aulas. Ela ainda não está implementada.
+
+- Professor independente continua suportado com workspace pessoal privado e agenda própria.
+- Clube será avaliado como workspace compartilhado com professores, possíveis administradores/gestores, locais, campos ou recursos.
+- Professores autorizados poderão futuramente visualizar calendário compartilhado filtrado por professor, local, campo ou recurso.
+- Um professor de clube não deve ver automaticamente alunos, pacotes, saldos, pagamentos, telefones, notas privadas, motivo pessoal de bloqueio ou dados administrativos sensíveis de outro professor.
+- Bloqueios privados de colegas aparecem apenas como `Indisponível`.
+- Antes de criar `clubs`, auditar `organizations` para evitar duplicar o conceito de workspace.
+- Conflitos futuros: professor, recurso e ausência de conflito quando professores diferentes usam recursos diferentes.
+
+Ordem futura: 5B.2 clubes e calendário compartilhado → 5C criação/edição de aulas → 5D recorrência, conflitos e reservas de créditos → 5E revisão integrada.
 
 ### `src/types/database.ts`
 
@@ -526,7 +550,7 @@ As linhas são declaradas com `type`, **nunca com `interface`**. Um `interface` 
 
 Vitest, ambiente Node, `TZ=Europe/Lisbon` fixo para que um teste que passa localmente passe também no CI (que corre em UTC).
 
-Cobertura atual: **254 testes** em dezoito ficheiros — testes de domínio, regressões de respostas/autenticação do proxy, formulários da Fase 2, validação/normalização da gestão da Fase 3, modelos, atribuição, apresentação, navegação, ajustes administrativos de pacotes, disponibilidade do professor e calendário.
+Cobertura atual: **260 testes** em dezoito ficheiros — testes de domínio, regressões de respostas/autenticação do proxy, formulários da Fase 2, validação/normalização da gestão da Fase 3, modelos, atribuição, apresentação, navegação, ajustes administrativos de pacotes, disponibilidade do professor e calendário.
 
 Os testes de domínio exercem funções puras, sem base de dados nem mocks. Os testes de validação garantem normalização, limites, identificadores, estados, valores monetários em cêntimos, datas civis e rejeição de campos extra/protegidos. A integração SQL fica separada em `db:verify`.
 
@@ -549,11 +573,11 @@ Não existe um comando de formatação separado. Use `npm run lint:fix` apenas p
 | 2 | Perfis, definições e gestão administrativa básica de contas | **Concluído** |
 | 3 | Alunos, turmas, locais, política de cancelamento | **Concluído** |
 | 4 | Interfaces de modelos, atribuição, ajustes e saldos | **Concluído** — Etapas 1A, 1B, 1C, 1D e 1E validadas com Auth/PostgREST reais e browser desktop/mobile |
-| 5 | Calendário e criação de aulas com reserva | **Parcialmente concluído** — Etapas 5A e 5B: disponibilidade, intervalos, bloqueios e calendário visual seguro |
+| 5 | Calendário e criação de aulas com reserva | **Parcialmente concluído** — Etapas 5A, 5B e 5B.1: disponibilidade, projeção segura e refinamento visual |
 | 6 | Cancelamento, reagendamento, presenças e histórico | **Planeado** |
 | 7 | Área do aluno: aulas, créditos e confirmação | **Planeado** |
 | 8 | Notificações, lembretes e expiração agendada | **Planeado** |
-| 9 | Supabase real, concorrência, acessibilidade e deployment | **Parcialmente concluído** — RLS em PGlite e validação real da Fase 4/Etapas 5A-5B feitos; concorrência real, acessibilidade completa e deployment pendentes |
+| 9 | Supabase real, concorrência, acessibilidade e deployment | **Parcialmente concluído** — RLS em PGlite e validação real da Fase 4/Etapas 5A-5B.1 feitos; concorrência real, acessibilidade completa e deployment pendentes |
 
 **Ao concluir uma fase ou etapa:** `npm run check`, corrigir tudo o que falhe, atualizar `implementation_plan.md`, e resumir o que foi criado e como testar manualmente.
 
