@@ -146,7 +146,11 @@ update public.profiles set role = 'admin' where email = 'voce@exemplo.pt';
 │   ├── ..._phase4_package_view_grants.sql grants explícitos das views da Fase 4
 │   ├── ..._phase5_teacher_availability.sql Etapa 5A: disponibilidade, exceções e bloqueios
 │   ├── ..._phase5_availability_view_grants.sql grants explícitos das views da Etapa 5A
-│   └── ..._phase5_calendar_projection.sql Etapa 5B: projeção de calendário e RPC segura do aluno
+│   ├── ..._phase5_calendar_projection.sql Etapa 5B: projeção de calendário e RPC segura do aluno
+│   ├── ..._phase5_workspace_foundation.sql Etapa 5B.2A: workspaces tipados, membros e convites
+│   ├── ..._phase5_workspace_security.sql Etapa 5B.2A: RLS, grants e projeções de workspace
+│   ├── ..._phase5_workspace_functions.sql Etapa 5B.2A: RPCs atómicas de clubes e membros
+│   └── ..._phase5_workspace_grants.sql grants explícitos das views e funções da Etapa 5B.2A
 │
 └── src/
     ├── proxy.ts             Renova a sessão e protege rotas (era middleware.ts)
@@ -166,7 +170,8 @@ update public.profiles set role = 'admin' where email = 'voce@exemplo.pt';
     │   ├── auth/            Componentes de autenticação
     │   ├── settings/        Formulários de conta, perfil público, avisos e segurança
     │   ├── availability/    Horários, exceções e bloqueios do professor
-    │   ├── admin/           Diretório, filtros, detalhe e estado de contas
+    │   ├── workspaces/      Criação de clube, membros, convites e seletor de contexto
+    │   ├── admin/           Diretório, filtros, detalhe, estado de contas e clubes
     │   └── brand/           Logótipo
     │
     ├── lib/
@@ -260,6 +265,9 @@ Alvo: WCAG 2.1 AA. Os componentes de `components/ui/` já resolvem o essencial �
 7. **Autenticação sempre com `getUser()`.** `getSession()` apenas descodifica o cookie e acredita nele; serve para mostrar um nome, nunca para decidir um acesso.
 8. **Contas bloqueadas perdem identidades funcionais.** `auth_org_id()`, `current_teacher_id()` e `current_student_id()` só devolvem valores para perfis ativos; o layout encaminha a conta para `/conta-bloqueada`.
 9. **Estado de conta só pela RPC administrativa.** `admin_set_account_status()` exige admin ativo, recusa auto-bloqueio e deixa o estado anterior/novo e o motivo em `audit_log`.
+10. **`profiles.organization_id` é sempre pessoal.** Nunca apontar para um clube. É o que faz `auth_org_id()` nunca devolver um clube — e é por isso que uma membership não abre, sozinha, nenhuma policy de alunos, pacotes, locais ou disponibilidade.
+11. **Membership de clube não é autorização operacional.** Dá acesso a nome e papel dos colegas. Não acrescentar `SELECT` a tabelas existentes por causa de um clube; o calendário partilhado da 5B.2B terá a sua própria projeção restrita.
+12. **Uma view nova não é privada por acidente.** No Supabase, views e funções herdam privilégios de `PUBLIC`/`anon` por omissão. Cada uma tem de ter `revoke all ... from public, anon` e um `grant` explícito — como em `..._workspace_grants.sql`. Não confiar na cláusula `WHERE` para fazer o trabalho de uma permissão.
 
 ### Perfis e definições (Fase 2)
 
@@ -311,7 +319,7 @@ npm run typecheck
 
 ### `npm run db:verify`
 
-Executa **todas** as migrações, a partir de uma base vazia, contra PostgreSQL compilado para WebAssembly (PGlite), e volta a aplicá-las para confirmar idempotência. Depois exerce 336 garantias: RLS com papéis `authenticated`/`anon`, isolamento entre organizações e professores, privilégios das RPCs, perfis/claim/bloqueio, convites sem segredo, alunos, turmas, locais, modelos, atribuição, consulta e ajustes administrativos de pacotes, disponibilidade do professor, calendário seguro, grants estritos das views, políticas, reserva, consumo, libertação, reagendamento, exceções, correções, imutabilidade do livro-razão e constraints herdadas das aulas.
+Executa **todas** as migrações, a partir de uma base vazia, contra PostgreSQL compilado para WebAssembly (PGlite), e volta a aplicá-las para confirmar idempotência. Depois exerce 434 garantias: RLS com papéis `authenticated`/`anon`, isolamento entre organizações e professores, privilégios das RPCs, perfis/claim/bloqueio, convites sem segredo, alunos, turmas, locais, modelos, atribuição, consulta e ajustes administrativos de pacotes, disponibilidade do professor, calendário seguro, clubes, memberships, convites de workspace, papéis internos, contexto ativo, suspensão, grants estritos das views, políticas, reserva, consumo, libertação, reagendamento, exceções, correções, imutabilidade do livro-razão e constraints herdadas das aulas.
 
 Corre em segundos, sem Docker e sem projeto na nuvem — serve para o CI.
 
@@ -524,21 +532,53 @@ Na Etapa 5B.1, a apresentação visual passou a usar:
 
 `src/lib/domain/calendar.ts` centraliza janela selecionada, navegação civil, faixa horária visível, labels de horas, posição proporcional dos blocos e camada visual. O componente cliente recebe apenas strings, números, booleanos, arrays e objetos literais.
 
-**Ainda não implementado:** criação de aulas, calendário de aulas reais, recorrência, participantes, reservas/consumo de créditos, presenças, cancelamentos/reagendamentos de aulas, confirmação do aluno, lista de espera, notificações, clubes, memberships, calendário compartilhado entre professores, recursos/campos de clube, Google Calendar, Apple Calendar, ICS e drag-and-drop.
+**Ainda não implementado:** criação de aulas, calendário de aulas reais, recorrência, participantes, reservas/consumo de créditos, presenças, cancelamentos/reagendamentos de aulas, confirmação do aluno, lista de espera, notificações, calendário compartilhado entre professores, recursos/campos de clube, Google Calendar, Apple Calendar, ICS e drag-and-drop.
 
-### Clubes e calendário compartilhado (Etapa 5B.2 futura)
+### Clubes, workspaces e membros (Etapa 5B.2A)
 
-A Etapa 5B.2 vem antes da criação de aulas. Ela ainda não está implementada.
+**Decisão arquitetural: `organizations` é o workspace.** A auditoria concluiu que a tabela já era o que um clube precisaria de ser — nome, slug, timezone, timestamps e o eixo de isolamento de todas as tabelas. Criar `clubs` ao lado duplicaria o conceito. `organizations` ganhou `kind` (`personal`/`club`), `status`, autoria e campos de suspensão; o vínculo pessoa↔workspace vive em `organization_members`.
 
-- Professor independente continua suportado com workspace pessoal privado e agenda própria.
-- Clube será avaliado como workspace compartilhado com professores, possíveis administradores/gestores, locais, campos ou recursos.
-- Professores autorizados poderão futuramente visualizar calendário compartilhado filtrado por professor, local, campo ou recurso.
-- Um professor de clube não deve ver automaticamente alunos, pacotes, saldos, pagamentos, telefones, notas privadas, motivo pessoal de bloqueio ou dados administrativos sensíveis de outro professor.
-- Bloqueios privados de colegas aparecem apenas como `Indisponível`.
-- Antes de criar `clubs`, auditar `organizations` para evitar duplicar o conceito de workspace.
-- Conflitos futuros: professor, recurso e ausência de conflito quando professores diferentes usam recursos diferentes.
+**A regra que não pode ser quebrada:**
 
-Ordem futura: 5B.2 clubes e calendário compartilhado → 5C criação/edição de aulas → 5D recorrência, conflitos e reservas de créditos → 5E revisão integrada.
+> `profiles.organization_id` é sempre o workspace **pessoal** e **nunca** aponta para um clube.
+
+`auth_org_id()` lê essa coluna, portanto nenhum clube é a organização de RLS de ninguém. Entrar num clube não abre nenhuma policy existente de alunos, pacotes, locais ou disponibilidade — todas comparam com `auth_org_id()`. **Não escrever policies que dêem acesso a dados operacionais por causa de uma membership.**
+
+| Estrutura | Responsabilidade |
+|---|---|
+| `organizations.kind`/`status` | Workspace tipado (`personal`/`club`) e moderável |
+| `organization_members` | Vínculo N:M, papel interno, estado e auditoria de entrada/saída |
+| `organization_invitations` | Convite sem segredo: estado, email-alvo e auditoria |
+| `profiles.active_workspace_id` | Preferência de contexto, sem GRANT de UPDATE |
+
+Papéis internos (`owner`, `manager`, `teacher`) são **distintos** dos papéis globais. Criar um clube não altera `profiles.role` e não torna ninguém administrador da plataforma.
+
+Invariantes impostos em SQL, não na interface: ninguém é convidado para `owner`; ninguém altera o próprio papel; o papel do proprietário não muda por esta via; o último proprietário ativo não pode ser removido; só um proprietário remove outro; `manager` convida apenas `teacher`.
+
+**Convites não têm token.** Estado, email-alvo e auditoria — como em `student_invitations`. Aceitar exige sessão autenticada com esse email **confirmado**. Não reintroduzir tokens, códigos ou URLs com segredo.
+
+**Contexto ativo não é autorização.** `set_active_workspace()` guarda a preferência; `resolve_active_workspace_id()` revalida em cada leitura e devolve o workspace pessoal se o vínculo tiver caído. Nunca decidir acesso a partir do valor guardado.
+
+**Suspender não apaga.** Memberships, convites e auditoria ficam; as operações é que param. Suspender um workspace pessoal é recusado — isso é bloquear a conta, que tem caminho próprio em `admin_set_account_status()`.
+
+RPCs (`create_club_workspace`, `invite_workspace_member`, `revoke_workspace_invitation`, `accept_workspace_invitation`, `decline_workspace_invitation`, `update_workspace_member_role`, `remove_workspace_member`, `admin_set_workspace_status`, `set_active_workspace`) são o único caminho de escrita: as tabelas não têm GRANT de INSERT/UPDATE/DELETE.
+
+Views: `workspace_membership_records` (contextos próprios), `workspace_member_directory` (nome e papel dos colegas — sem email, telefone, alunos, pacotes ou agenda), `workspace_invitation_records` (gestão), `workspace_received_invitation_records` (convites dirigidos ao próprio) e `admin_workspace_directory` (moderação).
+
+Interface: `/professor/clubes`, `/professor/clubes/[id]`, `/professor/convites`, `/admin/clubes` e o seletor de contexto no shell do professor.
+
+**Limite honesto:** mudar de contexto **não** torna alunos, pacotes, turmas, locais, disponibilidade ou calendário multi-clube. `PERSONAL_ONLY_MODULES` em `lib/domain/workspaces.ts` é mostrado ao utilizador em vez de fingir o contrário. Não anunciar módulos como multi-clube antes de o serem.
+
+### Calendário compartilhado do clube (Etapa 5B.2B futura)
+
+Ainda **não implementada**. A 5B.2A não abriu nenhuma leitura de agenda entre membros: a 5B.2B terá de trazer uma projeção própria e restrita.
+
+- Bloqueio privado de colega aparece apenas como `Indisponível`, sem motivo nem categoria.
+- Filtro por professor e, mais tarde, por local/campo/recurso.
+- Um professor de clube continua a não ver alunos, pacotes, saldos, pagamentos, telefones, notas privadas ou dados administrativos de outro professor.
+- Conflitos futuros: professor, recurso, e ausência de conflito quando professores diferentes usam recursos diferentes.
+
+Ordem: 5B.2B calendário compartilhado → 5B.3 locais, campos e Google Places → 5C criação/edição de aulas → 5D recorrência, conflitos e reservas de créditos → 5E revisão integrada.
 
 ### `src/types/database.ts`
 
@@ -550,7 +590,7 @@ As linhas são declaradas com `type`, **nunca com `interface`**. Um `interface` 
 
 Vitest, ambiente Node, `TZ=Europe/Lisbon` fixo para que um teste que passa localmente passe também no CI (que corre em UTC).
 
-Cobertura atual: **260 testes** em dezoito ficheiros — testes de domínio, regressões de respostas/autenticação do proxy, formulários da Fase 2, validação/normalização da gestão da Fase 3, modelos, atribuição, apresentação, navegação, ajustes administrativos de pacotes, disponibilidade do professor e calendário.
+Cobertura atual: **313 testes** em vinte ficheiros — testes de domínio, regressões de respostas/autenticação do proxy, formulários da Fase 2, validação/normalização da gestão da Fase 3, modelos, atribuição, apresentação, navegação, ajustes administrativos de pacotes, disponibilidade do professor, calendário, permissões de clube e validação de workspaces.
 
 Os testes de domínio exercem funções puras, sem base de dados nem mocks. Os testes de validação garantem normalização, limites, identificadores, estados, valores monetários em cêntimos, datas civis e rejeição de campos extra/protegidos. A integração SQL fica separada em `db:verify`.
 
@@ -573,7 +613,7 @@ Não existe um comando de formatação separado. Use `npm run lint:fix` apenas p
 | 2 | Perfis, definições e gestão administrativa básica de contas | **Concluído** |
 | 3 | Alunos, turmas, locais, política de cancelamento | **Concluído** |
 | 4 | Interfaces de modelos, atribuição, ajustes e saldos | **Concluído** — Etapas 1A, 1B, 1C, 1D e 1E validadas com Auth/PostgREST reais e browser desktop/mobile |
-| 5 | Calendário e criação de aulas com reserva | **Parcialmente concluído** — Etapas 5A, 5B e 5B.1: disponibilidade, projeção segura e refinamento visual |
+| 5 | Calendário e criação de aulas com reserva | **Parcialmente concluído** — Etapas 5A, 5B, 5B.1 e 5B.2A: disponibilidade, projeção segura, refinamento visual e fundação de clubes/membros |
 | 6 | Cancelamento, reagendamento, presenças e histórico | **Planeado** |
 | 7 | Área do aluno: aulas, créditos e confirmação | **Planeado** |
 | 8 | Notificações, lembretes e expiração agendada | **Planeado** |

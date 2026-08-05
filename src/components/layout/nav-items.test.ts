@@ -63,6 +63,8 @@ describe("navItemsForRole", () => {
       "/professor/pacotes",
       "/professor/grupos",
       "/professor/locais",
+      "/professor/clubes",
+      "/professor/convites",
       "/professor/historico",
       "/professor/notificacoes",
       "/professor/definicoes",
@@ -81,6 +83,7 @@ describe("navItemsForRole", () => {
       "/admin",
       "/admin/professores",
       "/admin/utilizadores",
+      "/admin/clubes",
     ]);
   });
 });

@@ -4,8 +4,10 @@ export const NAV_ICON_KEYS = [
   "bell",
   "calendar",
   "calendarRange",
+  "clubs",
   "dashboard",
   "history",
+  "invitations",
   "locations",
   "packages",
   "profile",
@@ -43,6 +45,8 @@ const TEACHER_NAV = [
   { href: "/professor/pacotes", label: "Pacotes", iconKey: "packages", primary: true },
   { href: "/professor/grupos", label: "Turmas", iconKey: "groups" },
   { href: "/professor/locais", label: "Locais", iconKey: "locations" },
+  { href: "/professor/clubes", label: "Clubes", iconKey: "clubs" },
+  { href: "/professor/convites", label: "Convites", iconKey: "invitations" },
   { href: "/professor/historico", label: "Histórico", iconKey: "history" },
   { href: "/professor/notificacoes", label: "Avisos", iconKey: "bell" },
   {
@@ -89,6 +93,7 @@ const ADMIN_NAV = [
     iconKey: "groups",
     primary: true,
   },
+  { href: "/admin/clubes", label: "Clubes", iconKey: "clubs", primary: true },
 ] as const satisfies readonly NavItem[];
 
 export function navItemsForRole(role: UserRole): readonly NavItem[] {

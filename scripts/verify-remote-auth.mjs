@@ -832,6 +832,393 @@ try {
   );
   check(cancelledBlock.status === "cancelled", "Professor cancela bloqueio preservando historico");
 
+  section("Clubes e membros");
+
+  const clubName = `Clube E2E ${runId}`;
+  // O clube é reutilizado entre execuções: a chave determinística garante que
+  // repetir o E2E não enche o ambiente de clubes iguais.
+  const clubKey = deterministicUuid(`club:${runId}`);
+  const clubBKey = deterministicUuid(`club-b:${runId}`);
+  // Um convite, ao contrário de um clube, é CONSUMIDO ao ser aceite. Reutilizar
+  // a chave entre execuções devolveria o convite já aceite da execução
+  // anterior, que é o comportamento correto da idempotência e o errado para o
+  // cenário: cada execução é, de facto, um novo convite intencional. A
+  // idempotência dentro da execução continua a ser verificada abaixo.
+  const inviteKey = deterministicUuid(`club-invite:${runId}:${new Date().toISOString()}`);
+
+  const personalContext = await getSingle(
+    "workspace pessoal do Professor A",
+    teacherClient
+      .from("workspace_membership_records")
+      .select("organization_id, kind, role, is_personal, workspace_status")
+      .eq("is_personal", true),
+  );
+  check(
+    personalContext.organization_id === teacherRecord.organization_id &&
+      personalContext.kind === "personal" &&
+      personalContext.role === "owner" &&
+      personalContext.workspace_status === "active",
+    "Professor A e proprietario do proprio workspace pessoal",
+  );
+
+  const { data: clubId, error: clubError } = await teacherClient.rpc("create_club_workspace", {
+    p_name: clubName,
+    p_timezone: "Europe/Lisbon",
+    p_idempotency_key: clubKey,
+  });
+  if (clubError) throw new Error(`Criar clube E2E: ${summarizeError(clubError)}`);
+  ok(`Professor A criou ou reutilizou o clube E2E (${maskId(clubId)})`);
+
+  const { data: clubIdRepeat } = await teacherClient.rpc("create_club_workspace", {
+    p_name: clubName,
+    p_timezone: "Europe/Lisbon",
+    p_idempotency_key: clubKey,
+  });
+  check(clubIdRepeat === clubId, "Criar clube com a mesma chave e idempotente");
+
+  const clubContext = await getSingle(
+    "contexto do clube",
+    teacherClient
+      .from("workspace_membership_records")
+      .select("organization_id, organization_name, kind, role, is_personal, active_member_count")
+      .eq("organization_id", clubId),
+  );
+  check(
+    clubContext.role === "owner" && clubContext.kind === "club" && clubContext.is_personal === false,
+    "O criador do clube e proprietario e o clube nao e pessoal",
+  );
+
+  const contextsA = await teacherClient
+    .from("workspace_membership_records")
+    .select("organization_id, is_personal");
+  check(
+    (contextsA.data ?? []).some((row) => row.is_personal) &&
+      (contextsA.data ?? []).some((row) => row.organization_id === clubId),
+    "Professor A mantem o workspace pessoal e o clube em simultaneo",
+  );
+
+  const { data: invitationId, error: inviteError } = await teacherClient.rpc(
+    "invite_workspace_member",
+    {
+      p_organization_id: clubId,
+      p_email: credentials.teacherB.email,
+      p_role: "teacher",
+      p_idempotency_key: inviteKey,
+    },
+  );
+  if (inviteError) throw new Error(`Convidar Professor B: ${summarizeError(inviteError)}`);
+  ok("Professor A convidou o Professor B");
+
+  const { data: invitationRepeat } = await teacherClient.rpc("invite_workspace_member", {
+    p_organization_id: clubId,
+    p_email: credentials.teacherB.email,
+    p_role: "teacher",
+    p_idempotency_key: inviteKey,
+  });
+  check(invitationRepeat === invitationId, "Convite repetido com a mesma chave nao duplica");
+
+  const pendingInvitations = await teacherClient
+    .from("workspace_invitation_records")
+    .select("id, status, target_email")
+    .eq("organization_id", clubId)
+    .eq("status", "pending");
+  check(
+    (pendingInvitations.data ?? []).some((row) => row.id === invitationId),
+    "Professor A consulta o convite pendente que emitiu",
+  );
+
+  await signIn(
+    teacherBClient,
+    credentials.teacherB.email,
+    credentials.teacherB.password,
+    "Professor B",
+  );
+
+  await mustReturnNoRows("Convite pendente nao concede acesso ao clube", () =>
+    teacherBClient.from("workspace_member_directory").select("membership_id").eq("organization_id", clubId),
+  );
+
+  const receivedByB = await teacherBClient
+    .from("workspace_received_invitation_records")
+    .select("id, organization_name, role");
+  check(
+    (receivedByB.data ?? []).some((row) => row.id === invitationId),
+    "Professor B ve o convite dirigido ao seu email confirmado",
+  );
+  check(
+    forbiddenColumns((receivedByB.data ?? [])[0] ?? {}, [
+      "token",
+      "invite_code",
+      "idempotency_key",
+      "invited_by",
+      "suspension_reason",
+    ]).length === 0,
+    "Convite recebido nao contem token nem autoria administrativa",
+  );
+
+  await mustReject("Aluno nao aceita convite de clube", async () =>
+    studentClient.rpc("accept_workspace_invitation", { p_invitation_id: invitationId }),
+  );
+  await mustReject("Aluno nao cria clube", async () =>
+    studentClient.rpc("create_club_workspace", {
+      p_name: `Clube do aluno ${runId}`,
+      p_timezone: "Europe/Lisbon",
+      p_idempotency_key: deterministicUuid(`club-student:${runId}`),
+    }),
+  );
+  await mustReturnNoRows("Aluno nao consulta memberships de professores", () =>
+    studentClient.from("workspace_membership_records").select("organization_id").limit(1),
+  );
+
+  const { data: membershipId, error: acceptError } = await teacherBClient.rpc(
+    "accept_workspace_invitation",
+    { p_invitation_id: invitationId },
+  );
+  if (acceptError) throw new Error(`Aceitar convite: ${summarizeError(acceptError)}`);
+  ok("Professor B aceitou o convite");
+
+  const { data: membershipRepeat } = await teacherBClient.rpc("accept_workspace_invitation", {
+    p_invitation_id: invitationId,
+  });
+  check(membershipRepeat === membershipId, "Aceitar duas vezes nao duplica a membership");
+
+  const memberDirectory = await teacherBClient
+    .from("workspace_member_directory")
+    .select("membership_id, full_name, role, status, is_self")
+    .eq("organization_id", clubId);
+  check(
+    (memberDirectory.data ?? []).length === 2 &&
+      (memberDirectory.data ?? []).some((row) => row.role === "owner" && row.is_self === false),
+    "Professor B ve nome e papel dos colegas do clube",
+  );
+  check(
+    forbiddenColumns((memberDirectory.data ?? [])[0] ?? {}, [
+      "email",
+      "phone",
+      "blocked_reason",
+      "credits_available",
+      "student_id",
+      "paid_amount_cents",
+      "notes",
+    ]).length === 0,
+    "Diretorio de membros nao expoe contactos nem dados operacionais",
+  );
+
+  await mustReturnNoRows("Membro do clube nao le alunos do colega", () =>
+    teacherBClient
+      .from("teacher_student_management_records")
+      .select("id")
+      .eq("organization_id", teacherRecord.organization_id),
+  );
+  await mustReturnNoRows("Membro do clube nao le pacotes do colega", () =>
+    teacherBClient
+      .from("teacher_package_records")
+      .select("id")
+      .eq("organization_id", teacherRecord.organization_id),
+  );
+  await mustReturnNoRows("Membro do clube nao le a agenda do colega", () =>
+    teacherBClient
+      .from("teacher_schedule_block_records")
+      .select("id")
+      .eq("organization_id", teacherRecord.organization_id),
+  );
+  await mustReturnNoRows("Professor membro nao le os convites administrativos do clube", () =>
+    teacherBClient.from("workspace_invitation_records").select("id").eq("organization_id", clubId),
+  );
+  await mustReject("Professor membro nao convida", async () =>
+    teacherBClient.rpc("invite_workspace_member", {
+      p_organization_id: clubId,
+      p_email: credentials.studentB.email,
+      p_role: "teacher",
+      p_idempotency_key: deterministicUuid(`club-invite-forbidden:${runId}`),
+    }),
+  );
+
+  const { data: promoted, error: promoteError } = await teacherClient.rpc(
+    "update_workspace_member_role",
+    { p_membership_id: membershipId, p_role: "manager" },
+  );
+  if (promoteError) throw new Error(`Promover Professor B: ${summarizeError(promoteError)}`);
+  const { data: promotedRepeat } = await teacherClient.rpc("update_workspace_member_role", {
+    p_membership_id: membershipId,
+    p_role: "manager",
+  });
+  check(
+    promoted === true && promotedRepeat === false,
+    "Alterar papel funciona e repetir e idempotente",
+  );
+
+  await mustReject("Gestor nao promove ninguem a proprietario", async () =>
+    teacherBClient.rpc("update_workspace_member_role", {
+      p_membership_id: membershipId,
+      p_role: "owner",
+    }),
+  );
+  await mustReject("Ninguem altera o proprio papel", async () =>
+    teacherBClient.rpc("update_workspace_member_role", {
+      p_membership_id: membershipId,
+      p_role: "teacher",
+    }),
+  );
+
+  const { data: clubBId, error: clubBError } = await teacherBClient.rpc("create_club_workspace", {
+    p_name: `Clube E2E B ${runId}`,
+    p_timezone: "Europe/Lisbon",
+    p_idempotency_key: clubBKey,
+  });
+  if (clubBError) throw new Error(`Criar clube do Professor B: ${summarizeError(clubBError)}`);
+
+  await mustReturnNoRows("Professor de um clube nao consulta os membros de outro clube", () =>
+    teacherClient.from("workspace_member_directory").select("membership_id").eq("organization_id", clubBId),
+  );
+  await mustReject("Proprietario do Clube A nao convida para o Clube B", async () =>
+    teacherClient.rpc("invite_workspace_member", {
+      p_organization_id: clubBId,
+      p_email: credentials.studentB.email,
+      p_role: "teacher",
+      p_idempotency_key: deterministicUuid(`club-cross-invite:${runId}`),
+    }),
+  );
+  await mustReject("Contexto de um clube alheio e recusado", async () =>
+    teacherClient.rpc("set_active_workspace", { p_organization_id: clubBId }),
+  );
+
+  const { error: contextError } = await teacherBClient.rpc("set_active_workspace", {
+    p_organization_id: clubId,
+  });
+  check(!contextError, "Professor B seleciona o clube como contexto ativo");
+
+  const activeContext = await getSingle(
+    "contexto ativo do Professor B",
+    teacherBClient
+      .from("workspace_membership_records")
+      .select("organization_id, is_active_context")
+      .eq("organization_id", clubId),
+  );
+  check(activeContext.is_active_context === true, "O contexto selecionado fica assinalado");
+
+  const ownerMembership = await getSingle(
+    "membership do proprietario",
+    teacherClient
+      .from("workspace_member_directory")
+      .select("membership_id, role, is_self")
+      .eq("organization_id", clubId)
+      .eq("role", "owner"),
+  );
+  await mustReject("O ultimo proprietario nao pode ser removido", async () =>
+    teacherClient.rpc("remove_workspace_member", { p_membership_id: ownerMembership.membership_id }),
+  );
+
+  const { data: removed, error: removeError } = await teacherClient.rpc("remove_workspace_member", {
+    p_membership_id: membershipId,
+  });
+  if (removeError) throw new Error(`Remover Professor B: ${summarizeError(removeError)}`);
+  const { data: removedRepeat } = await teacherClient.rpc("remove_workspace_member", {
+    p_membership_id: membershipId,
+  });
+  check(removed === true && removedRepeat === false, "Remover membro e idempotente");
+
+  await mustReturnNoRows("Membership removida perde o acesso imediatamente", () =>
+    teacherBClient.from("workspace_member_directory").select("membership_id").eq("organization_id", clubId),
+  );
+  await mustReturnNoRows("Clube removido deixa de aparecer nos contextos", () =>
+    teacherBClient.from("workspace_membership_records").select("organization_id").eq("organization_id", clubId),
+  );
+
+  const fallbackContext = await teacherBClient.rpc("resolve_active_workspace_id");
+  check(
+    !fallbackContext.error && fallbackContext.data !== clubId,
+    "Contexto sem autorizacao cai para o workspace pessoal",
+  );
+
+  section("Administracao de clubes");
+
+  await mustReject("Professor nao suspende o proprio clube", async () =>
+    teacherClient.rpc("admin_set_workspace_status", {
+      p_organization_id: clubId,
+      p_status: "suspended",
+      p_reason: "tentativa indevida",
+    }),
+  );
+  await mustReject("Administracao nao suspende um workspace pessoal", async () =>
+    adminClient.rpc("admin_set_workspace_status", {
+      p_organization_id: teacherRecord.organization_id,
+      p_status: "suspended",
+      p_reason: "workspace pessoal",
+    }),
+  );
+  await mustReject("Suspensao sem motivo e recusada", async () =>
+    adminClient.rpc("admin_set_workspace_status", {
+      p_organization_id: clubId,
+      p_status: "suspended",
+      p_reason: null,
+    }),
+  );
+
+  const { error: clubSuspendError } = await adminClient.rpc("admin_set_workspace_status", {
+    p_organization_id: clubId,
+    p_status: "suspended",
+    p_reason: `Suspensao E2E ${runId}`,
+  });
+  check(!clubSuspendError, "Administrador suspende o clube");
+
+  const suspendedRow = await getSingle(
+    "clube suspenso",
+    adminClient
+      .from("admin_workspace_directory")
+      .select("id, status, suspension_reason, active_member_count")
+      .eq("id", clubId),
+  );
+  check(
+    suspendedRow.status === "suspended" && suspendedRow.active_member_count >= 1,
+    "Suspender bloqueia o clube sem apagar memberships",
+  );
+
+  await mustReject("Clube suspenso nao aceita novos convites", async () =>
+    teacherClient.rpc("invite_workspace_member", {
+      p_organization_id: clubId,
+      p_email: credentials.teacherB.email,
+      p_role: "teacher",
+      p_idempotency_key: deterministicUuid(`club-invite-suspended:${runId}`),
+    }),
+  );
+  await mustReject("Clube suspenso nao permite gerir membros", async () =>
+    teacherClient.rpc("remove_workspace_member", { p_membership_id: ownerMembership.membership_id }),
+  );
+
+  const personalDuringSuspension = await teacherClient
+    .from("teacher_student_management_records")
+    .select("id")
+    .eq("organization_id", teacherRecord.organization_id)
+    .limit(1);
+  check(
+    !personalDuringSuspension.error && (personalDuringSuspension.data ?? []).length > 0,
+    "Workspace pessoal continua a funcionar durante a suspensao do clube",
+  );
+
+  const { error: clubReactivateError } = await adminClient.rpc("admin_set_workspace_status", {
+    p_organization_id: clubId,
+    p_status: "active",
+    p_reason: null,
+  });
+  check(!clubReactivateError, "Administrador reativa o clube");
+
+  const reactivatedRow = await getSingle(
+    "clube reativado",
+    adminClient
+      .from("admin_workspace_directory")
+      .select("id, status, suspension_reason")
+      .eq("id", clubId),
+  );
+  check(
+    reactivatedRow.status === "active" && reactivatedRow.suspension_reason === null,
+    "Reativar limpa o motivo de suspensao",
+  );
+
+  await mustReturnNoRows("Professor nao le a projecao administrativa de clubes", () =>
+    teacherClient.from("admin_workspace_directory").select("id").limit(1),
+  );
+
   section("Conta bloqueada e anonimo");
   await signIn(blockedClient, credentials.blocked.email, credentials.blocked.password, "Conta bloqueada");
   await mustReturnNoRows("Conta bloqueada nao le views de pacotes", () =>
@@ -861,8 +1248,41 @@ try {
     }),
   );
 
+  await mustReturnNoRows("Conta bloqueada nao consulta contextos de workspace", () =>
+    blockedClient.from("workspace_membership_records").select("organization_id").limit(1),
+  );
+  await mustReject("Conta bloqueada nao muda de contexto", async () =>
+    blockedClient.rpc("set_active_workspace", { p_organization_id: null }),
+  );
+  await mustReject("Conta bloqueada nao cria clube", async () =>
+    blockedClient.rpc("create_club_workspace", {
+      p_name: `Clube bloqueado ${runId}`,
+      p_timezone: "Europe/Lisbon",
+      p_idempotency_key: deterministicUuid(`club-blocked:${runId}`),
+    }),
+  );
+  await mustReject("Conta bloqueada nao aceita convite", async () =>
+    blockedClient.rpc("accept_workspace_invitation", { p_invitation_id: invitationId }),
+  );
+
   await mustReject("Anonimo nao le view de pacotes", async () =>
     anonClient.from("student_package_records").select("id").limit(1),
+  );
+  await mustReject("Anonimo nao le membros de clube", async () =>
+    anonClient.from("workspace_member_directory").select("membership_id").limit(1),
+  );
+  await mustReject("Anonimo nao le contextos de workspace", async () =>
+    anonClient.from("workspace_membership_records").select("organization_id").limit(1),
+  );
+  await mustReject("Anonimo nao cria clube", async () =>
+    anonClient.rpc("create_club_workspace", {
+      p_name: `Clube anonimo ${runId}`,
+      p_timezone: "Europe/Lisbon",
+      p_idempotency_key: deterministicUuid(`club-anon:${runId}`),
+    }),
+  );
+  await mustReject("Anonimo nao muda de contexto", async () =>
+    anonClient.rpc("set_active_workspace", { p_organization_id: null }),
   );
   await mustReject("Anonimo nao executa RPC", async () =>
     anonClient.rpc("assign_student_package", {

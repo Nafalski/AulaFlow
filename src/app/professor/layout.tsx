@@ -1,5 +1,8 @@
 import { AppShell } from "@/components/layout/app-shell";
+import type { WorkspaceSwitcherOption } from "@/components/workspaces/workspace-switcher";
 import { requireRole } from "@/lib/auth/session";
+import { loadWorkspaceContextsForShell } from "@/lib/auth/workspace-context";
+import { toWorkspaceSwitcherEntries } from "@/lib/domain/workspaces";
 
 /**
  * Nunca pré-renderizar esta área.
@@ -30,5 +33,18 @@ export const dynamic = "force-dynamic";
 export default async function TeacherLayout({ children }: { children: React.ReactNode }) {
   const user = await requireRole("teacher");
 
-  return <AppShell user={user}>{children}</AppShell>;
+  // Só chegam ao cliente contextos com membership ATIVA — a view já filtrou.
+  // O mapeamento é puro e produz apenas strings e booleanos, para o seletor
+  // continuar a receber props serializáveis.
+  const contexts = await loadWorkspaceContextsForShell();
+  const workspaceOptions: WorkspaceSwitcherOption[] = toWorkspaceSwitcherEntries(
+    contexts,
+    user.profile.full_name,
+  );
+
+  return (
+    <AppShell user={user} workspaceOptions={workspaceOptions}>
+      {children}
+    </AppShell>
+  );
 }

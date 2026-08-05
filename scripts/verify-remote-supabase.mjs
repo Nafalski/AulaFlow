@@ -69,6 +69,8 @@ const expectedTables = [
   "teacher_availability_rules",
   "teacher_availability_exceptions",
   "teacher_schedule_blocks",
+  "organization_members",
+  "organization_invitations",
 ];
 
 const expectedViews = [
@@ -81,6 +83,11 @@ const expectedViews = [
   "teacher_availability_exception_records",
   "teacher_schedule_block_records",
   "teacher_availability_public_records",
+  "workspace_membership_records",
+  "workspace_member_directory",
+  "workspace_invitation_records",
+  "workspace_received_invitation_records",
+  "admin_workspace_directory",
 ];
 
 const expectedEnums = [
@@ -93,6 +100,11 @@ const expectedEnums = [
   "schedule_block_category",
   "schedule_block_status",
   "availability_public_status",
+  "workspace_kind",
+  "workspace_status",
+  "workspace_member_role",
+  "workspace_member_status",
+  "workspace_invitation_status",
 ];
 
 const expectedIndexes = [
@@ -115,6 +127,15 @@ const expectedIndexes = [
   "teacher_schedule_blocks_org_idx",
   "teacher_schedule_blocks_idempotency_unique",
   "teacher_schedule_blocks_cancel_idempotency_unique",
+  "organizations_kind_status_idx",
+  "organizations_creation_idempotency_unique",
+  "organization_members_profile_idx",
+  "organization_members_organization_idx",
+  "organization_members_owner_idx",
+  "organization_invitations_one_pending",
+  "organization_invitations_idempotency_unique",
+  "organization_invitations_email_idx",
+  "organization_invitations_organization_idx",
 ];
 
 const expectedConstraints = [
@@ -135,6 +156,13 @@ const expectedConstraints = [
   "teacher_schedule_blocks_cancel_reason_length",
   "teacher_schedule_blocks_reasonable_length",
   "teacher_schedule_blocks_cancel_state",
+  "organizations_suspension_coherent",
+  "organizations_personal_stays_active",
+  "organization_members_unique_membership",
+  "organization_members_status_coherent",
+  "organization_invitations_email_format",
+  "organization_invitations_role_allowed",
+  "organization_invitations_status_coherent",
 ];
 
 const expectedFunctions = [
@@ -173,6 +201,23 @@ const expectedFunctions = [
   "resolve_teacher_availability_calendar_core",
   "get_teacher_availability_calendar",
   "get_student_availability_calendar",
+  "auth_confirmed_email",
+  "workspace_member_role",
+  "is_workspace_member",
+  "can_manage_workspace",
+  "is_workspace_owner",
+  "resolve_active_workspace_id",
+  "workspace_timezone_is_supported",
+  "log_workspace_event",
+  "create_club_workspace",
+  "invite_workspace_member",
+  "revoke_workspace_invitation",
+  "accept_workspace_invitation",
+  "decline_workspace_invitation",
+  "update_workspace_member_role",
+  "remove_workspace_member",
+  "admin_set_workspace_status",
+  "set_active_workspace",
 ];
 
 const authenticatedRpc = [
@@ -199,6 +244,17 @@ const authenticatedRpc = [
   "resolve_teacher_availability_for_date",
   "get_teacher_availability_calendar",
   "get_student_availability_calendar",
+  "create_club_workspace",
+  "invite_workspace_member",
+  "revoke_workspace_invitation",
+  "accept_workspace_invitation",
+  "decline_workspace_invitation",
+  "update_workspace_member_role",
+  "remove_workspace_member",
+  "admin_set_workspace_status",
+  "set_active_workspace",
+  "resolve_active_workspace_id",
+  "auth_confirmed_email",
 ];
 
 const internalFunctions = [
@@ -211,6 +267,8 @@ const internalFunctions = [
   "validate_teacher_availability_exception",
   "validate_teacher_schedule_block",
   "resolve_teacher_availability_calendar_core",
+  "workspace_timezone_is_supported",
+  "log_workspace_event",
 ];
 
 const sql = `
@@ -374,6 +432,114 @@ checks as (
       join pg_class class on class.oid = to_regclass('public.' || expected.name)
       where not class.relrowsecurity
     ), 'ok')
+
+  union all
+  select
+    'seguranca',
+    'cliente autenticado nao escreve membros nem convites de clube',
+    not exists (
+      select 1
+      from information_schema.table_privileges
+      where table_schema = 'public'
+        and table_name in ('organization_members', 'organization_invitations')
+        and grantee in ('authenticated', 'anon')
+        and privilege_type in ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE')
+    ),
+    coalesce((
+      select string_agg(table_name || '.' || privilege_type, ', ')
+      from information_schema.table_privileges
+      where table_schema = 'public'
+        and table_name in ('organization_members', 'organization_invitations')
+        and grantee in ('authenticated', 'anon')
+        and privilege_type in ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE')
+    ), 'ok')
+
+  union all
+  select
+    'seguranca',
+    'anon nao le membros nem convites de clube',
+    not exists (
+      select 1
+      from information_schema.table_privileges
+      where table_schema = 'public'
+        and table_name in (
+          'organization_members', 'organization_invitations',
+          'workspace_membership_records', 'workspace_member_directory',
+          'workspace_invitation_records', 'workspace_received_invitation_records',
+          'admin_workspace_directory'
+        )
+        and grantee = 'anon'
+    ),
+    'ok'
+
+  union all
+  select
+    'privacidade',
+    'colunas administrativas de organizations ficam fora do GRANT partilhado',
+    not exists (
+      select 1
+      from information_schema.column_privileges
+      where table_schema = 'public'
+        and table_name = 'organizations'
+        and grantee = 'authenticated'
+        and privilege_type = 'SELECT'
+        and column_name in ('suspension_reason', 'created_by', 'creation_idempotency_key')
+    ),
+    coalesce((
+      select string_agg(column_name, ', ')
+      from information_schema.column_privileges
+      where table_schema = 'public'
+        and table_name = 'organizations'
+        and grantee = 'authenticated'
+        and privilege_type = 'SELECT'
+        and column_name in ('suspension_reason', 'created_by', 'creation_idempotency_key')
+    ), 'ok')
+
+  union all
+  select
+    'privacidade',
+    'diretorio de membros do clube nao expoe contactos nem dados operacionais',
+    not exists (
+      select 1
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'workspace_member_directory'
+        and column_name in (
+          'email', 'phone', 'preferred_contact_method', 'blocked_reason',
+          'blocked_at', 'locale', 'timezone', 'credits_available', 'student_id',
+          'student_name', 'paid_amount_cents', 'notes'
+        )
+    ),
+    'ok'
+
+  union all
+  select
+    'privacidade',
+    'convite recebido pelo professor nao expoe autoria administrativa nem segredo',
+    not exists (
+      select 1
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'workspace_received_invitation_records'
+        and column_name in (
+          'token', 'invite_code', 'secret', 'idempotency_key', 'invited_by',
+          'responded_by', 'revoked_by', 'suspension_reason'
+        )
+    ),
+    'ok'
+
+  union all
+  select
+    'privacidade',
+    'tabela de convites nao guarda token, codigo nem URL',
+    not exists (
+      select 1
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'organization_invitations'
+        and column_name in ('token', 'token_hash', 'invite_code', 'secret', 'url')
+    ),
+    'ok'
 
   union all
   select

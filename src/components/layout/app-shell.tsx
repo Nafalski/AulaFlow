@@ -5,6 +5,10 @@ import type { ReactNode } from "react";
 import { BottomNav, PageTitle, Sidebar } from "./app-nav";
 import { navItemsForRole } from "./nav-items";
 import { Logo, LogoMark } from "@/components/brand/logo";
+import {
+  WorkspaceSwitcher,
+  type WorkspaceSwitcherOption,
+} from "@/components/workspaces/workspace-switcher";
 import type { SessionUser } from "@/lib/auth/session";
 import { cn, initials } from "@/lib/utils";
 
@@ -52,13 +56,21 @@ export function AppShell({
   user,
   children,
   headerAction,
+  workspaceOptions,
 }: {
   user: SessionUser;
   children: ReactNode;
   headerAction?: ReactNode;
+  /**
+   * Contextos autorizados do professor, já validados no servidor. Props
+   * primitivas: o shell é um Server Component e o seletor é um Client
+   * Component, pelo que só atravessam a fronteira strings e booleanos.
+   */
+  workspaceOptions?: readonly WorkspaceSwitcherOption[];
 }) {
   const items = navItemsForRole(user.profile.role);
   const roots = ["/professor", "/aluno", "/admin"];
+  const hasWorkspaceSwitcher = Boolean(workspaceOptions && workspaceOptions.length > 0);
 
   return (
     <div className="min-h-dvh md:flex">
@@ -71,6 +83,11 @@ export function AppShell({
         <Sidebar items={items} roots={roots} />
 
         <div className="mt-auto border-t border-line pt-3">
+          {hasWorkspaceSwitcher && workspaceOptions && (
+            <div className="mb-2">
+              <WorkspaceSwitcher options={workspaceOptions} placement="up" />
+            </div>
+          )}
           <UserSummary user={user} />
           <SignOutButton className="mt-2 w-full" />
         </div>
@@ -97,6 +114,15 @@ export function AppShell({
             </div>
           </div>
         </header>
+
+        {/* No telemóvel não há barra lateral onde pôr o seletor de contexto.
+            Fica aqui, numa faixa própria, em vez de espremido num cabeçalho
+            que já tem logótipo, título e terminar sessão. */}
+        {hasWorkspaceSwitcher && workspaceOptions && (
+          <div className="border-b border-line bg-surface px-4 py-2 md:hidden">
+            <WorkspaceSwitcher options={workspaceOptions} placement="down" />
+          </div>
+        )}
 
         {/* pb-24 no telemóvel: espaço para a barra inferior não tapar o fim
             do conteúdo. */}

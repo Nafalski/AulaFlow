@@ -4899,6 +4899,922 @@ await asDatabaseRole("authenticated", ADMIN_UID, () =>
   db.query(`select public.admin_set_account_status($1,'active',null)`, [TEACHER_UID]),
 );
 
+// ── Clubes, workspaces e membros (Etapa 5B.2A) ───────────────────────────────
+
+section("Workspaces e clubes");
+
+const auditCount = async (action, targetId) =>
+  Number(
+    (
+      await one(`select count(*)::int as total from public.audit_log where action=$1 and target_id=$2`, [
+        action,
+        targetId,
+      ])
+    ).total,
+  );
+
+const contextsFor = (uid) =>
+  asDatabaseRole("authenticated", uid, () =>
+    rows(
+      `select organization_id, organization_name, kind::text, workspace_status::text,
+              role::text, is_personal, is_active_context, active_member_count
+         from public.workspace_membership_records
+        order by is_personal desc, organization_name`,
+    ),
+  );
+
+// O workspace pessoal do professor tem de continuar a existir — e agora com uma
+// linha de proprietário criada pela migração/trigger. Sem isto, a lista de
+// contextos ignoraria todas as contas anteriores a esta etapa, incluindo as E2E.
+const personalWorkspace = await one(
+  `select kind::text, status::text from public.organizations where id=$1`,
+  [org],
+);
+check(
+  personalWorkspace.kind === "personal" && personalWorkspace.status === "active",
+  "organização criada no registo é um workspace pessoal ativo",
+);
+
+const personalMembership = await one(
+  `select role::text, status::text from public.organization_members
+    where organization_id=$1 and profile_id=$2`,
+  [org, TEACHER_UID],
+);
+check(
+  personalMembership?.role === "owner" && personalMembership?.status === "active",
+  "professor é proprietário ativo do próprio workspace pessoal",
+);
+
+const preClubContexts = await contextsFor(TEACHER_UID);
+check(
+  preClubContexts.length === 1 && preClubContexts[0].is_personal === true,
+  "professor sem clubes vê apenas o contexto pessoal",
+);
+
+// ── Criação e idempotência ──────────────────────────────────────────────────
+
+const clubKey = randomUUID();
+const clubA = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select public.create_club_workspace('Clube Central', 'Europe/Lisbon', $1) as id`, [clubKey]),
+);
+const clubARow = await one(
+  `select name, kind::text, status::text, timezone, created_by from public.organizations where id=$1`,
+  [clubA.id],
+);
+check(
+  clubARow.kind === "club" &&
+    clubARow.status === "active" &&
+    clubARow.name === "Clube Central" &&
+    clubARow.created_by === TEACHER_UID,
+  "professor cria clube ativo e fica registado como criador",
+);
+
+const clubAOwner = await one(
+  `select role::text, status::text, accepted_at from public.organization_members
+    where organization_id=$1 and profile_id=$2`,
+  [clubA.id, TEACHER_UID],
+);
+check(
+  clubAOwner?.role === "owner" && clubAOwner?.status === "active" && clubAOwner.accepted_at !== null,
+  "o criador do clube torna-se proprietário com membership ativa",
+);
+
+const clubARepeat = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select public.create_club_workspace('Clube Central', 'Europe/Lisbon', $1) as id`, [clubKey]),
+);
+const clubCountForKey = await one(
+  `select count(*)::int as total from public.organizations where creation_idempotency_key=$1`,
+  [clubKey],
+);
+check(
+  clubARepeat.id === clubA.id && Number(clubCountForKey.total) === 1,
+  "repetir a criação com a mesma chave devolve o mesmo clube e não cria um segundo",
+);
+check(
+  (await auditCount("workspace.created", clubA.id)) === 1,
+  "criação idempotente não repete o evento de auditoria",
+);
+
+const clubB = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select public.create_club_workspace('Arena Lisboa', 'Atlantic/Madeira', $1) as id`, [
+    randomUUID(),
+  ]),
+);
+check(
+  clubB.id !== clubA.id,
+  "uma submissão intencionalmente nova, com chave nova, cria outro clube",
+);
+
+await mustReject("clube com fuso não suportado", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.create_club_workspace('Clube X', 'America/Sao_Paulo', $1)`, [
+      randomUUID(),
+    ]),
+  ),
+);
+await mustReject("clube com nome demasiado curto", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.create_club_workspace('C', 'Europe/Lisbon', $1)`, [randomUUID()]),
+  ),
+);
+await mustReject("aluno não cria clube", () =>
+  asDatabaseRole("authenticated", ANA_UID, () =>
+    db.query(`select public.create_club_workspace('Clube do Aluno', 'Europe/Lisbon', $1)`, [
+      randomUUID(),
+    ]),
+  ),
+);
+await mustReject("anónimo não cria clube", () =>
+  asDatabaseRole("anon", null, () =>
+    db.query(`select public.create_club_workspace('Clube Anónimo', 'Europe/Lisbon', $1)`, [
+      randomUUID(),
+    ]),
+  ),
+);
+
+const contextsWithClubs = await contextsFor(TEACHER_UID);
+check(
+  contextsWithClubs.length === 3 &&
+    contextsWithClubs[0].is_personal === true &&
+    contextsWithClubs.some((context) => context.organization_id === clubA.id),
+  "professor mantém o workspace pessoal e acumula os clubes que criou",
+);
+
+// Criar um clube não é uma promoção na plataforma.
+const creatorRole = await one(`select role::text from public.profiles where id=$1`, [TEACHER_UID]);
+check(creatorRole.role === "teacher", "criar um clube não torna a conta administradora da plataforma");
+
+// ── Convites ────────────────────────────────────────────────────────────────
+
+const inviteKey = randomUUID();
+const inviteB = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select public.invite_workspace_member($1,'outro.prof@exemplo.pt','teacher',$2) as id`, [
+    clubA.id,
+    inviteKey,
+  ]),
+);
+check(inviteB.id !== null, "proprietário cria convite pendente");
+
+const inviteRepeat = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select public.invite_workspace_member($1,'outro.prof@exemplo.pt','teacher',$2) as id`, [
+    clubA.id,
+    inviteKey,
+  ]),
+);
+const inviteRepeatNewKey = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select public.invite_workspace_member($1,'Outro.Prof@Exemplo.pt','teacher',$2) as id`, [
+    clubA.id,
+    randomUUID(),
+  ]),
+);
+const invitesForEmail = await one(
+  `select count(*)::int as total from public.organization_invitations
+    where organization_id=$1 and lower(target_email)='outro.prof@exemplo.pt'`,
+  [clubA.id],
+);
+check(
+  inviteRepeat.id === inviteB.id &&
+    inviteRepeatNewKey.id === inviteB.id &&
+    Number(invitesForEmail.total) === 1,
+  "convidar a mesma pessoa outra vez devolve o convite pendente e não duplica",
+);
+
+await mustReject("professor comum não convida", () =>
+  asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+    db.query(`select public.invite_workspace_member($1,'novo@exemplo.pt','teacher',$2)`, [
+      clubA.id,
+      randomUUID(),
+    ]),
+  ),
+);
+await mustReject("aluno não convida", () =>
+  asDatabaseRole("authenticated", ANA_UID, () =>
+    db.query(`select public.invite_workspace_member($1,'novo@exemplo.pt','teacher',$2)`, [
+      clubA.id,
+      randomUUID(),
+    ]),
+  ),
+);
+await mustReject("convite com email inválido", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.invite_workspace_member($1,'sem-arroba','teacher',$2)`, [
+      clubA.id,
+      randomUUID(),
+    ]),
+  ),
+);
+await mustReject("convite para uma conta de aluno", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.invite_workspace_member($1,'ana@exemplo.pt','teacher',$2)`, [
+      clubA.id,
+      randomUUID(),
+    ]),
+  ),
+);
+await mustReject("convite para um workspace pessoal", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.invite_workspace_member($1,'novo@exemplo.pt','teacher',$2)`, [
+      org,
+      randomUUID(),
+    ]),
+  ),
+);
+
+// Um convite pendente é apenas um estado administrativo: não é uma membership
+// e não abre nada.
+const pendingAccess = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  rows(`select membership_id from public.workspace_member_directory where organization_id=$1`, [
+    clubA.id,
+  ]),
+);
+check(pendingAccess.length === 0, "convite pendente não concede acesso aos dados do clube");
+
+const pendingContexts = await contextsFor(OTHER_TEACHER_UID);
+check(
+  pendingContexts.every((context) => context.organization_id !== clubA.id),
+  "convite pendente não aparece como contexto disponível",
+);
+
+// ── Aceitação ───────────────────────────────────────────────────────────────
+
+await mustReject("utilizador com outro email não aceita o convite", () =>
+  asDatabaseRole("authenticated", SAME_ORG_TEACHER_UID, () =>
+    db.query(`select public.accept_workspace_invitation($1)`, [inviteB.id]),
+  ),
+);
+await mustReject("aluno não aceita convite de clube", () =>
+  asDatabaseRole("authenticated", ANA_UID, () =>
+    db.query(`select public.accept_workspace_invitation($1)`, [inviteB.id]),
+  ),
+);
+await mustReject("anónimo não aceita convite de clube", () =>
+  asDatabaseRole("anon", null, () =>
+    db.query(`select public.accept_workspace_invitation($1)`, [inviteB.id]),
+  ),
+);
+
+const receivedByB = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  rows(
+    `select id, organization_name, role::text from public.workspace_received_invitation_records`,
+  ),
+);
+check(
+  receivedByB.length === 1 && receivedByB[0].id === inviteB.id,
+  "o convidado vê o convite dirigido ao seu email confirmado",
+);
+
+const membershipB = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  one(`select public.accept_workspace_invitation($1) as id`, [inviteB.id]),
+);
+const membershipBRow = await one(
+  `select role::text, status::text from public.organization_members where id=$1`,
+  [membershipB.id],
+);
+check(
+  membershipBRow.role === "teacher" && membershipBRow.status === "active",
+  "aceitar o convite cria uma membership ativa de professor",
+);
+
+const membershipBRepeat = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  one(`select public.accept_workspace_invitation($1) as id`, [inviteB.id]),
+);
+const membershipCount = await one(
+  `select count(*)::int as total from public.organization_members
+    where organization_id=$1 and profile_id=$2`,
+  [clubA.id, OTHER_TEACHER_UID],
+);
+check(
+  membershipBRepeat.id === membershipB.id && Number(membershipCount.total) === 1,
+  "aceitar duas vezes não duplica a membership",
+);
+check(
+  (await auditCount("workspace.invitation_accepted", clubA.id)) === 1,
+  "aceitação repetida não repete a auditoria",
+);
+
+const contextsB = await contextsFor(OTHER_TEACHER_UID);
+check(
+  contextsB.some((context) => context.organization_id === clubA.id && context.role === "teacher") &&
+    contextsB.some((context) => context.is_personal === true),
+  "o novo membro mantém o workspace pessoal e passa a ter o clube como contexto",
+);
+
+// ── Privacidade entre membros ───────────────────────────────────────────────
+
+const directoryForB = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  rows(
+    `select membership_id, profile_id, full_name, role::text, status::text, is_self
+       from public.workspace_member_directory where organization_id=$1 order by role`,
+    [clubA.id],
+  ),
+);
+check(
+  directoryForB.length === 2 &&
+    directoryForB.some(
+      (member) => member.is_self === false && member.role === "owner" && Boolean(member.full_name),
+    ) &&
+    directoryForB.some((member) => member.is_self === true),
+  "membro ativo vê nome e papel dos colegas do clube",
+);
+check(
+  forbiddenColumns(directoryForB[0] ?? {}, [
+    "email",
+    "phone",
+    "preferred_contact_method",
+    "blocked_reason",
+    "organization_name",
+  ]).length === 0,
+  "o diretório de membros não expõe email, telefone nem motivos de bloqueio",
+);
+
+const clubMateStudents = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  rows(`select id from public.teacher_student_management_records where organization_id=$1`, [org]),
+);
+const clubMatePackages = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  rows(`select id from public.teacher_package_records where organization_id=$1`, [org]),
+);
+const clubMateAvailability = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  rows(`select id from public.teacher_schedule_block_records where organization_id=$1`, [org]),
+);
+check(
+  clubMateStudents.length === 0 &&
+    clubMatePackages.length === 0 &&
+    clubMateAvailability.length === 0,
+  "pertencer ao mesmo clube não dá acesso a alunos, pacotes nem agenda do colega",
+);
+
+const clubMateOrgRead = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  rows(`select id from public.locations where organization_id=$1`, [org]),
+);
+check(clubMateOrgRead.length === 0, "membro do clube não passa a ler os locais do workspace pessoal alheio");
+
+const invitationsSeenByMember = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  rows(`select id from public.workspace_invitation_records where organization_id=$1`, [clubA.id]),
+);
+check(
+  invitationsSeenByMember.length === 0,
+  "professor membro não vê a lista de convites administrativos do clube",
+);
+
+const studentSeesMemberships = await asDatabaseRole("authenticated", ANA_UID, () =>
+  rows(`select id from public.organization_members`),
+);
+check(studentSeesMemberships.length === 0, "aluno não consulta memberships de professores");
+
+// ── Papéis ──────────────────────────────────────────────────────────────────
+
+await mustReject("professor comum não altera papéis", () =>
+  asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+    db.query(`select public.update_workspace_member_role($1,'manager')`, [membershipB.id]),
+  ),
+);
+
+const promoted = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select public.update_workspace_member_role($1,'manager') as changed`, [membershipB.id]),
+);
+const promotedRepeat = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select public.update_workspace_member_role($1,'manager') as changed`, [membershipB.id]),
+);
+check(
+  promoted.changed === true && promotedRepeat.changed === false,
+  "alterar o papel é idempotente: repetir devolve falso sem novo evento",
+);
+check(
+  (await auditCount("workspace.member_role_changed", clubA.id)) === 1,
+  "alteração de papel repetida não repete a auditoria",
+);
+
+const ownerMembership = await one(
+  `select id from public.organization_members where organization_id=$1 and profile_id=$2`,
+  [clubA.id, TEACHER_UID],
+);
+
+await mustReject("gestor não promove ninguém a proprietário", () =>
+  asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+    db.query(`select public.update_workspace_member_role($1,'owner')`, [membershipB.id]),
+  ),
+);
+await mustReject("gestor não altera o papel do proprietário", () =>
+  asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+    db.query(`select public.update_workspace_member_role($1,'teacher')`, [ownerMembership.id]),
+  ),
+);
+await mustReject("ninguém altera o próprio papel", () =>
+  asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+    db.query(`select public.update_workspace_member_role($1,'teacher')`, [membershipB.id]),
+  ),
+);
+
+// O gestor convida professores; convidar gestores continua a ser do proprietário.
+const managerInvite = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  one(`select public.invite_workspace_member($1,'colega.prof@exemplo.pt','teacher',$2) as id`, [
+    clubA.id,
+    randomUUID(),
+  ]),
+);
+check(managerInvite.id !== null, "gestor convida professores");
+
+await mustReject("gestor não convida outro gestor", () =>
+  asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+    db.query(`select public.invite_workspace_member($1,'novo.gestor@exemplo.pt','manager',$2)`, [
+      clubA.id,
+      randomUUID(),
+    ]),
+  ),
+);
+
+// ── Recusa e revogação ──────────────────────────────────────────────────────
+
+const declined = await asDatabaseRole("authenticated", SAME_ORG_TEACHER_UID, () =>
+  one(`select public.decline_workspace_invitation($1) as done`, [managerInvite.id]),
+);
+const declinedRepeat = await asDatabaseRole("authenticated", SAME_ORG_TEACHER_UID, () =>
+  one(`select public.decline_workspace_invitation($1) as done`, [managerInvite.id]),
+);
+const declinedMembership = await one(
+  `select count(*)::int as total from public.organization_members
+    where organization_id=$1 and profile_id=$2`,
+  [clubA.id, SAME_ORG_TEACHER_UID],
+);
+check(
+  declined.done === true && declinedRepeat.done === false && Number(declinedMembership.total) === 0,
+  "recusar é idempotente e não cria membership nenhuma",
+);
+
+const revocableInvite = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select public.invite_workspace_member($1,'revogado@exemplo.pt','teacher',$2) as id`, [
+    clubA.id,
+    randomUUID(),
+  ]),
+);
+const revoked = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select public.revoke_workspace_invitation($1) as done`, [revocableInvite.id]),
+);
+const revokedRepeat = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select public.revoke_workspace_invitation($1) as done`, [revocableInvite.id]),
+);
+check(
+  revoked.done === true && revokedRepeat.done === false,
+  "revogar um convite é idempotente",
+);
+check(
+  (await auditCount("workspace.invitation_revoked", clubA.id)) === 1,
+  "revogação repetida não repete a auditoria",
+);
+await mustReject("convite revogado já não pode ser aceite", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.revoke_workspace_invitation($1)`, [inviteB.id]),
+  ),
+);
+
+// ── Isolamento entre clubes ─────────────────────────────────────────────────
+
+const clubC = await asDatabaseRole("authenticated", SAME_ORG_TEACHER_UID, () =>
+  one(`select public.create_club_workspace('Clube Rival', 'Europe/Lisbon', $1) as id`, [
+    randomUUID(),
+  ]),
+);
+
+const rivalMembersSeenByB = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  rows(`select membership_id from public.workspace_member_directory where organization_id=$1`, [
+    clubC.id,
+  ]),
+);
+check(
+  rivalMembersSeenByB.length === 0,
+  "gestor do Clube A não consulta os membros do Clube B",
+);
+await mustReject("gestor do Clube A não convida para o Clube B", () =>
+  asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+    db.query(`select public.invite_workspace_member($1,'intruso@exemplo.pt','teacher',$2)`, [
+      clubC.id,
+      randomUUID(),
+    ]),
+  ),
+);
+
+const rivalOrgRead = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  rows(`select id from public.organizations where id=$1`, [clubC.id]),
+);
+check(rivalOrgRead.length === 0, "professor de um clube não lê a linha de outro clube");
+
+// ── Contexto ativo ──────────────────────────────────────────────────────────
+
+const activeClub = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  one(`select public.set_active_workspace($1) as id`, [clubA.id]),
+);
+check(activeClub.id === clubA.id, "membro ativo seleciona um clube como contexto");
+
+const activeContexts = await contextsFor(OTHER_TEACHER_UID);
+check(
+  activeContexts.find((context) => context.organization_id === clubA.id)?.is_active_context === true,
+  "o contexto selecionado fica assinalado na projeção",
+);
+
+await mustReject("contexto de um clube alheio é recusado", () =>
+  asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+    db.query(`select public.set_active_workspace($1)`, [clubC.id]),
+  ),
+);
+await mustReject("contexto inexistente é recusado", () =>
+  asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+    db.query(`select public.set_active_workspace($1)`, [randomUUID()]),
+  ),
+);
+
+const backToPersonal = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  one(`select public.set_active_workspace(null) as id`, []),
+);
+check(
+  backToPersonal.id === otherTeacher.organization_id,
+  "valor vazio devolve o professor ao workspace pessoal",
+);
+
+// ── Remoção ─────────────────────────────────────────────────────────────────
+
+await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  db.query(`select public.set_active_workspace($1)`, [clubA.id]),
+);
+
+await mustReject("o último proprietário não pode ser removido", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.remove_workspace_member($1)`, [ownerMembership.id]),
+  ),
+);
+await mustReject("ninguém se remove a si próprio", () =>
+  asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+    db.query(`select public.remove_workspace_member($1)`, [membershipB.id]),
+  ),
+);
+
+const removed = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select public.remove_workspace_member($1) as done`, [membershipB.id]),
+);
+const removedRepeat = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select public.remove_workspace_member($1) as done`, [membershipB.id]),
+);
+const removedRow = await one(
+  `select status::text, removed_at from public.organization_members where id=$1`,
+  [membershipB.id],
+);
+check(
+  removed.done === true &&
+    removedRepeat.done === false &&
+    removedRow.status === "revoked" &&
+    removedRow.removed_at !== null,
+  "remover preserva a linha, marca a data e é idempotente",
+);
+
+const removedAccess = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  rows(`select membership_id from public.workspace_member_directory where organization_id=$1`, [
+    clubA.id,
+  ]),
+);
+check(removedAccess.length === 0, "membership removida perde o acesso imediatamente");
+
+const removedContexts = await contextsFor(OTHER_TEACHER_UID);
+check(
+  removedContexts.every((context) => context.organization_id !== clubA.id) &&
+    removedContexts.some((context) => context.is_personal === true),
+  "quem é removido do clube volta a ter apenas o workspace pessoal",
+);
+
+const fallbackContext = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  one(`select public.resolve_active_workspace_id() as id`),
+);
+check(
+  fallbackContext.id === otherTeacher.organization_id,
+  "um contexto que deixou de estar autorizado cai para o workspace pessoal",
+);
+
+// ── Suspensão administrativa ────────────────────────────────────────────────
+
+await mustReject("professor não suspende o próprio clube", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.admin_set_workspace_status($1,'suspended','Tentativa')`, [clubA.id]),
+  ),
+);
+await mustReject("suspensão sem motivo", () =>
+  asDatabaseRole("authenticated", ADMIN_UID, () =>
+    db.query(`select public.admin_set_workspace_status($1,'suspended',null)`, [clubA.id]),
+  ),
+);
+await mustReject("administração não suspende um workspace pessoal", () =>
+  asDatabaseRole("authenticated", ADMIN_UID, () =>
+    db.query(`select public.admin_set_workspace_status($1,'suspended','Motivo')`, [org]),
+  ),
+);
+
+await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  db.query(`select public.admin_set_workspace_status($1,'suspended','Denúncia em análise')`, [
+    clubA.id,
+  ]),
+);
+await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  db.query(`select public.admin_set_workspace_status($1,'suspended','Denúncia em análise')`, [
+    clubA.id,
+  ]),
+);
+check(
+  (await auditCount("workspace.suspended", clubA.id)) === 1,
+  "suspender duas vezes não duplica a auditoria",
+);
+
+const suspendedRow = await one(
+  `select status::text, suspended_at, suspension_reason from public.organizations where id=$1`,
+  [clubA.id],
+);
+check(
+  suspendedRow.status === "suspended" &&
+    suspendedRow.suspended_at !== null &&
+    suspendedRow.suspension_reason === "Denúncia em análise",
+  "suspender guarda estado, data e motivo administrativo",
+);
+
+const membersAfterSuspension = await one(
+  `select count(*)::int as total from public.organization_members where organization_id=$1`,
+  [clubA.id],
+);
+check(
+  Number(membersAfterSuspension.total) >= 2,
+  "suspender não apaga memberships nem histórico",
+);
+
+await mustReject("clube suspenso não aceita novos convites", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.invite_workspace_member($1,'depois@exemplo.pt','teacher',$2)`, [
+      clubA.id,
+      randomUUID(),
+    ]),
+  ),
+);
+await mustReject("clube suspenso não permite gerir membros", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.remove_workspace_member($1)`, [ownerMembership.id]),
+  ),
+);
+
+const suspendedInvite = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select public.invite_workspace_member($1,'pendente@exemplo.pt','teacher',$2) as id`, [
+    clubB.id,
+    randomUUID(),
+  ]),
+);
+await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  db.query(`select public.admin_set_workspace_status($1,'suspended','Suspensão de teste')`, [
+    clubB.id,
+  ]),
+);
+await mustReject("convite de clube suspenso não pode ser aceite", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.accept_workspace_invitation($1)`, [suspendedInvite.id]),
+  ),
+);
+
+// O workspace pessoal continua a funcionar durante a suspensão do clube.
+const personalDuringSuspension = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  rows(`select id from public.teacher_student_management_records where organization_id=$1`, [org]),
+);
+check(
+  personalDuringSuspension.length > 0,
+  "o workspace pessoal continua a funcionar enquanto um clube está suspenso",
+);
+
+await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  db.query(`select public.admin_set_workspace_status($1,'active',null)`, [clubA.id]),
+);
+const reactivatedRow = await one(
+  `select status::text, suspended_at, suspension_reason from public.organizations where id=$1`,
+  [clubA.id],
+);
+check(
+  reactivatedRow.status === "active" &&
+    reactivatedRow.suspended_at === null &&
+    reactivatedRow.suspension_reason === null,
+  "reativar limpa data e motivo de suspensão",
+);
+
+const adminClubDirectory = await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  rows(
+    `select id, name, status::text, active_member_count, pending_invitation_count
+       from public.admin_workspace_directory where kind='club' order by name`,
+  ),
+);
+check(
+  adminClubDirectory.some((entry) => entry.id === clubA.id) &&
+    adminClubDirectory.some((entry) => entry.id === clubC.id),
+  "administrador consulta o diretório de clubes para moderação",
+);
+
+const teacherSeesAdminDirectory = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  rows(`select id from public.admin_workspace_directory`),
+);
+check(
+  teacherSeesAdminDirectory.length === 0,
+  "professor não lê a projeção administrativa de clubes",
+);
+
+// ── Conta bloqueada e anónimo ───────────────────────────────────────────────
+
+await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  db.query(`select public.admin_set_account_status($1,'blocked','Teste de clubes')`, [
+    OTHER_TEACHER_UID,
+  ]),
+);
+await mustReject("conta bloqueada não aceita convite", () =>
+  asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+    db.query(`select public.accept_workspace_invitation($1)`, [inviteB.id]),
+  ),
+);
+await mustReject("conta bloqueada não muda de contexto", () =>
+  asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+    db.query(`select public.set_active_workspace(null)`),
+  ),
+);
+const blockedContexts = await contextsFor(OTHER_TEACHER_UID);
+check(blockedContexts.length === 0, "conta bloqueada não consulta contextos");
+await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  db.query(`select public.admin_set_account_status($1,'active',null)`, [OTHER_TEACHER_UID]),
+);
+
+// `anon` nem sequer tem GRANT nestas tabelas: a leitura é recusada antes de o
+// RLS ser avaliado, que é a ordem certa.
+await mustReject("anónimo não lê membros de clube", () =>
+  asDatabaseRole("anon", null, () => db.query(`select id from public.organization_members`)),
+);
+await mustReject("anónimo não lê convites de clube", () =>
+  asDatabaseRole("anon", null, () => db.query(`select id from public.organization_invitations`)),
+);
+await mustReject("anónimo não lê as projeções de workspace", () =>
+  asDatabaseRole("anon", null, () =>
+    db.query(`select organization_id from public.workspace_membership_records`),
+  ),
+);
+await mustReject("anónimo não muda de contexto", () =>
+  asDatabaseRole("anon", null, () => db.query(`select public.set_active_workspace(null)`)),
+);
+
+// ── Grants mínimos e auditoria append-only ──────────────────────────────────
+
+const workspaceWritePrivileges = await rows(
+  `select table_name, privilege_type
+     from information_schema.table_privileges
+    where table_schema='public'
+      and table_name in ('organization_members','organization_invitations')
+      and grantee in ('authenticated','anon')
+      and privilege_type in ('INSERT','UPDATE','DELETE','TRUNCATE')`,
+);
+check(
+  workspaceWritePrivileges.length === 0,
+  "cliente autenticado não escreve diretamente em membros nem em convites",
+);
+
+// Uma view nova herda SELECT de PUBLIC se ninguém revogar. As cláusulas WHERE
+// já devolveriam zero linhas a `anon`, mas depender disso é depender de uma
+// condição em vez de uma permissão.
+const anonWorkspacePrivileges = await rows(
+  `select table_name
+     from information_schema.table_privileges
+    where table_schema='public'
+      and table_name in (
+        'workspace_membership_records','workspace_member_directory',
+        'workspace_invitation_records','workspace_received_invitation_records',
+        'admin_workspace_directory'
+      )
+      and grantee in ('anon','PUBLIC')`,
+);
+check(
+  anonWorkspacePrivileges.length === 0,
+  "anon não tem privilégios nas projeções de workspace",
+);
+
+const workspaceFunctionPrivileges = await rows(
+  `select proc.proname
+     from pg_proc proc
+     join pg_namespace ns on ns.oid = proc.pronamespace
+    where ns.nspname='public'
+      and proc.proname in ('log_workspace_event','workspace_timezone_is_supported')
+      and (
+        has_function_privilege('authenticated', proc.oid, 'EXECUTE')
+        or has_function_privilege('anon', proc.oid, 'EXECUTE')
+      )`,
+);
+check(
+  workspaceFunctionPrivileges.length === 0,
+  "funções internas de workspace não são executáveis pelo cliente",
+);
+
+const insecureWorkspaceFunctions = await rows(
+  `select proc.proname
+     from pg_proc proc
+     join pg_namespace ns on ns.oid = proc.pronamespace
+    where ns.nspname='public'
+      and proc.proname in (
+        'create_club_workspace','invite_workspace_member','revoke_workspace_invitation',
+        'accept_workspace_invitation','decline_workspace_invitation',
+        'update_workspace_member_role','remove_workspace_member',
+        'admin_set_workspace_status','set_active_workspace','resolve_active_workspace_id',
+        'workspace_member_role','is_workspace_member','can_manage_workspace',
+        'is_workspace_owner','auth_confirmed_email','log_workspace_event'
+      )
+      and not exists (
+        select 1 from unnest(coalesce(proc.proconfig, array[]::text[])) as config
+        where config like 'search_path=%'
+      )`,
+);
+check(
+  insecureWorkspaceFunctions.length === 0,
+  "todas as funções de workspace fixam search_path",
+);
+
+await mustReject("cliente não escreve diretamente uma membership", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(
+      `insert into public.organization_members (organization_id, profile_id, role, status, accepted_at)
+       values ($1,$2,'owner','active',now())`,
+      [clubC.id, TEACHER_UID],
+    ),
+  ),
+);
+await mustReject("cliente não altera diretamente um convite", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`update public.organization_invitations set status='accepted' where id=$1`, [
+      revocableInvite.id,
+    ]),
+  ),
+);
+await mustReject("cliente não apaga uma membership", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`delete from public.organization_members where id=$1`, [ownerMembership.id]),
+  ),
+);
+await mustReject("cliente não escreve auditoria de workspace", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(
+      `insert into public.audit_log (actor_id, action, target_table, target_id)
+       values ($1,'workspace.created','organizations',$2)`,
+      [TEACHER_UID, clubA.id],
+    ),
+  ),
+);
+await mustReject("cliente não altera auditoria de workspace", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`update public.audit_log set action='x' where target_id=$1`, [clubA.id]),
+  ),
+);
+await mustReject("cliente não apaga auditoria de workspace", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`delete from public.audit_log where target_id=$1`, [clubA.id]),
+  ),
+);
+
+const organizationGrants = await rows(
+  `select column_name
+     from information_schema.column_privileges
+    where table_schema='public'
+      and table_name='organizations'
+      and grantee='authenticated'
+      and privilege_type='SELECT'
+      and column_name in ('suspension_reason','created_by','creation_idempotency_key')`,
+);
+check(
+  organizationGrants.length === 0,
+  "colunas administrativas de organizations ficam fora do GRANT partilhado",
+);
+
+const duplicateMembership = await mustReject(
+  "a base recusa duas memberships para a mesma pessoa no mesmo clube",
+  () =>
+    db.query(
+      `insert into public.organization_members (organization_id, profile_id, role, status, accepted_at)
+       values ($1,$2,'teacher','active',now())`,
+      [clubA.id, TEACHER_UID],
+    ),
+);
+void duplicateMembership;
+
+await mustReject("a base recusa um convite com papel de proprietário", () =>
+  db.query(
+    `insert into public.organization_invitations (organization_id, target_email, role)
+     values ($1,'owner@exemplo.pt','owner')`,
+    [clubA.id],
+  ),
+);
+await mustReject("a base recusa um workspace pessoal suspenso", () =>
+  db.query(
+    `update public.organizations set status='suspended', suspended_at=now(),
+            suspension_reason='Motivo' where id=$1`,
+    [org],
+  ),
+);
+
+const workspaceEnums = await rows(
+  `select typname from pg_type
+    where typname in ('workspace_kind','workspace_status','workspace_member_role',
+                      'workspace_member_status','workspace_invitation_status')`,
+);
+check(workspaceEnums.length === 5, "os cinco tipos enumerados de workspace existem");
+
 section("Aulas (Fase 1)");
 
 const [generated] = await rows(

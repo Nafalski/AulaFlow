@@ -6,7 +6,7 @@
 
 **Documento vivo.** Atualizado no fim de cada fase com o que foi realmente construído.
 
-- **Estado atual:** Fases 1, 1.5, 2, 3 e 4 concluídas. A Fase 5 tem as **Etapas 5A, 5B e 5B.1 — disponibilidade, intervalos, projeção segura e calendário visual refinado** concluídas; criação de aulas e clubes continuam pendentes.
+- **Estado atual:** Fases 1, 1.5, 2, 3 e 4 concluídas. A Fase 5 tem as **Etapas 5A, 5B, 5B.1 e 5B.2A** concluídas — disponibilidade, projeção segura, calendário visual refinado e fundação de clubes/workspaces/membros. O **calendário compartilhado (5B.2B)** e a criação de aulas continuam pendentes.
 - **Timezone do sistema:** `Europe/Lisbon`
 - **Idioma da interface:** Português (pt-PT)
 
@@ -638,9 +638,89 @@ Não alterado:
 - Nenhum registo fictício de aula.
 - Nenhuma integração Google Calendar, Apple Calendar, ICS ou drag-and-drop.
 
-### Planeado para a Fase 5 — Etapa 5B.2: clubes e calendário compartilhado
+### Concluído na Fase 5 — Etapa 5B.2A: clubes, workspaces e membros
 
-Esta etapa ainda **não está implementada**. O professor independente continua totalmente suportado e não precisa criar clube para usar o AulaFlow.
+Estado: **concluída**. Cria o domínio seguro de clubes e vínculos; **não** implementa calendário compartilhado, agenda de colegas, aulas, locais/campos, recursos ou diretório público.
+
+#### Decisão arquitetural: Opção A — `organizations` é o workspace
+
+A auditoria mostrou que `organizations` já era exatamente o que um clube precisaria de ser: tem `name`, `slug`, `timezone` e timestamps, é criada automaticamente uma por professor no registo, e é o eixo de isolamento de **todas** as tabelas do produto. Uma tabela `clubs` ao lado duplicaria o conceito de workspace e obrigaria a decidir, tabela a tabela, qual dos dois manda.
+
+`organizations` passou portanto a ter um **tipo** (`personal` | `club`) e um **estado** (`active` | `suspended` | `archived`), e o vínculo pessoa↔workspace passou a viver em `organization_members`, N:M.
+
+A propriedade que torna isto seguro, e que não pode ser perdida:
+
+> `profiles.organization_id` continua a ser o workspace **pessoal** do professor e **nunca** aponta para um clube.
+
+Como `auth_org_id()` lê exatamente essa coluna, nenhum clube é alguma vez a organização de RLS de alguém. Consequência: entrar num clube não concede, por si só, acesso a **uma única linha** de alunos, pacotes, saldos, locais ou disponibilidade — todas essas policies comparam com `auth_org_id()`, e a resposta continua a ser o workspace pessoal. A privacidade entre colegas fica garantida pela estrutura, e não por uma policy que alguém tenha de se lembrar de escrever.
+
+Alternativas descartadas:
+
+- **Opção B (clube separado da organização):** criaria duas hierarquias de tenancy a conviver, e cada tabela futura teria de escolher a sua.
+- **Fazer o clube ser o `organization_id` do professor:** impossibilitaria pertencer a vários clubes e migraria à força alunos, pacotes e disponibilidade já existentes.
+
+#### Estratégia de migração
+
+Determinística e sem recriar UUIDs:
+
+- Todas as organizações existentes ficam `kind = 'personal'`, `status = 'active'`.
+- Cada professor já registado recebe uma membership `owner`/`active` no seu próprio workspace pessoal, com `accepted_at` derivado da data de criação da conta.
+- `organizations.created_by` é preenchido a partir de `teacher_profiles`.
+- `handle_new_user()` foi reescrito (a migração original não foi editada) para criar o workspace pessoal já tipado e com a linha de proprietário.
+- Nenhum professor, aluno, pacote, local ou disponibilidade muda de dono. As contas E2E continuam intactas.
+
+#### Estruturas
+
+| Estrutura | Responsabilidade |
+|---|---|
+| `organizations.kind` / `.status` / `.created_by` / `.suspended_at` / `.suspension_reason` | Workspace tipado, com estado e moderação |
+| `organization_members` | Vínculo N:M com papel interno, estado e auditoria de entrada/saída |
+| `organization_invitations` | Convite sem segredo: estado, email-alvo e auditoria |
+| `profiles.active_workspace_id` | Preferência de contexto, sem GRANT de UPDATE |
+
+#### Papéis internos, distintos dos papéis globais
+
+O papel global (`profiles.role`: `student`/`teacher`/`admin`) não é tocado. Criar um clube **não** torna a conta administradora da plataforma.
+
+| Papel interno | Pode |
+|---|---|
+| `owner` | Gerir membros, convidar `manager` ou `teacher`, alterar papéis, remover membros |
+| `manager` | Convidar `teacher`, alterar papéis entre gestor e professor, remover membros não proprietários |
+| `teacher` | Pertencer ao clube e ver nome/papel dos colegas |
+
+Invariantes impostos em SQL: ninguém é convidado para `owner`; ninguém altera o próprio papel; o papel do proprietário não muda por esta via; o último proprietário ativo não pode ser removido; só um proprietário remove outro proprietário.
+
+#### Convites
+
+Sem token, sem código, sem URL com segredo — a mesma decisão já tomada em `student_invitations`. Um convite é um estado administrativo dirigido a um email; quem o aceita tem de estar autenticado com esse email **confirmado**. Não havendo bearer token, não há nada que possa vazar num log, num histórico de browser ou num referer. Um convite para um email ainda sem conta fica guardado; o envio por email pertence à Fase 8 e a interface diz isso por palavras.
+
+#### Contexto ativo
+
+Guardado no servidor em `profiles.active_workspace_id`, escrito só por `set_active_workspace()` e **sempre** revalidado na leitura por `resolve_active_workspace_id()`, que ignora a preferência se o vínculo tiver caído e devolve o workspace pessoal. Um cookie decidiria o que a aplicação mostra, mas nunca poderia decidir o que o utilizador pode ver.
+
+#### Suspensão
+
+Suspender um clube não apaga nada: memberships, convites e auditoria ficam. O que para são as operações — `can_manage_workspace()` exige workspace ativo, e aceitar convite verifica o estado. O workspace pessoal de cada professor continua intacto, e suspender um workspace pessoal é recusado (isso é bloquear a conta, que já tem caminho próprio e auditado).
+
+#### Interface
+
+- `/professor/clubes` — lista de contextos (pessoal + clubes), papel, estado, contagem de membros e criação de clube.
+- `/professor/clubes/[id]` — detalhe, membros, convites pendentes e ações permitidas, com confirmação antes de remover/revogar.
+- `/professor/convites` — convites recebidos, aceitar ou recusar.
+- `/admin/clubes` — moderação: estado, dimensão, autoria e suspender/reativar com motivo.
+- Seletor de contexto no shell do professor: barra lateral no desktop, faixa própria no telemóvel, props primitivas e sem contextos não autorizados.
+
+#### Limite honesto, declarado na própria interface
+
+Mudar de contexto **não** torna alunos, pacotes, turmas, locais, disponibilidade ou calendário multi-clube. Esses módulos continuam ligados ao workspace pessoal, e a lista `PERSONAL_ONLY_MODULES` em `lib/domain/workspaces.ts` é mostrada ao utilizador em vez de fingir que já mudaram.
+
+#### Não implementado nesta etapa
+
+Calendário compartilhado, agenda de colegas, aulas, participantes, recorrência, créditos, presenças, conflitos, locais/campos/recursos, Google Places/Maps/Calendar, Apple Calendar, ICS, notificações, pagamentos, diretório público de clubes, pesquisa pública de professores, transferência de propriedade e edição das definições do clube.
+
+### Planeado para a Fase 5 — Etapa 5B.2B: calendário compartilhado do clube
+
+Esta subetapa ainda **não está implementada**. Vai usar a fundação da 5B.2A. O professor independente continua totalmente suportado e não precisa criar clube para usar o AulaFlow.
 
 Decisões a preservar:
 
@@ -659,26 +739,27 @@ Conflitos futuros a modelar:
 2. Conflito do recurso: o mesmo campo ou recurso não pode receber duas aulas simultâneas.
 3. Ausência de conflito: professores diferentes podem dar aulas no mesmo horário usando recursos diferentes.
 
-Auditoria obrigatória antes de modelar clubes:
+A auditoria de `organizations` foi feita na 5B.2A e concluiu pela Opção A (organização = workspace tipado). A 5B.2B parte daí e não volta a discutir o modelo de tenancy.
 
-- Auditar a estrutura atual de `organizations` antes de criar uma tabela `clubs`.
-- Avaliar se `organizations` já representa clube/workspace, se deve receber tipo `personal`/`club`, se clube é entidade separada ligada à organização ou se as associações atuais evoluem para memberships.
-- Não duplicar conceitos sem analisar o modelo real.
+O que a 5B.2B terá de trazer de novo:
 
-Rotas futuras possíveis, dependentes da arquitetura escolhida:
+- Uma projeção própria e restrita da agenda partilhada — a 5B.2A **não** abriu nenhuma leitura de disponibilidade entre membros.
+- Bloqueio privado de colega visível apenas como `Indisponível`, sem motivo nem categoria.
+- Filtro por professor e, mais tarde, por local/campo/recurso.
 
-- `/professor/clube`
-- `/professor/clube/calendario`
-- `/professor/clube/professores`
-- `/professor/clube/locais`
+Rotas prováveis:
 
-Ordem futura da Fase 5:
+- `/professor/clubes/[id]/calendario`
 
-1. 5B.1 — Refinamento visual.
-2. 5B.2 — Clubes e calendário compartilhado.
-3. 5C — Criação e edição de aulas.
-4. 5D — Recorrência, conflitos e reservas de créditos.
-5. 5E — Revisão integrada.
+Ordem da Fase 5:
+
+1. 5B.1 — Refinamento visual. **Concluída.**
+2. 5B.2A — Clubes, workspaces e membros. **Concluída.**
+3. 5B.2B — Calendário compartilhado do clube.
+4. 5B.3 — Locais, campos e Google Places.
+5. 5C — Criação e edição de aulas.
+6. 5D — Recorrência, conflitos e reservas de créditos.
+7. 5E — Revisão integrada.
 
 ### Fase 2 — estado por item
 
@@ -795,6 +876,14 @@ Ver secção 1.4. Preservar o que funciona; a separação por área é a pedida.
 **Alternativa:** cache offline básica.
 **Porquê:** o requisito pede explicitamente que não haja offline complexo, e há uma razão de correção: operações sobre créditos exigem sempre o servidor. Um saldo lido de cache levaria a reservar um crédito que já não existe.
 
+### D-19 — Clube é uma organização tipada, não uma tabela nova
+**Alternativa:** tabela `clubs` ligada a `organizations`, ou clube a substituir o `organization_id` do professor.
+**Porquê:** `organizations` já tinha nome, slug, timezone, timestamps e era o eixo de isolamento de todas as tabelas — uma tabela `clubs` duplicaria o conceito de workspace. E fazer do clube o `organization_id` do professor impossibilitaria pertencer a vários clubes e migraria à força os dados existentes. Mantendo `profiles.organization_id` sempre pessoal, `auth_org_id()` nunca devolve um clube, e portanto entrar num clube não abre nenhuma das policies existentes: a privacidade entre colegas passa a ser uma propriedade da estrutura, não de uma policy que alguém tenha de se lembrar de escrever.
+
+### D-20 — Convite de clube sem token
+**Alternativa:** token assinado numa URL de convite.
+**Porquê:** a mesma razão de `student_invitations`. Um token é um segredo portador que aparece em logs, históricos de browser e cabeçalhos `Referer`, e obriga a gerir entropia, hashing, expiração e uso único. Exigir que quem aceita esteja autenticado com o email **confirmado** do convite dá a mesma garantia sem criar nada que possa vazar. O custo é não poder convidar alguém que nunca confirme o email — que é precisamente quem não deveria entrar.
+
 ---
 
 ## 12. Pontos de extensão
@@ -803,7 +892,7 @@ Preparados, **não implementados**. Assinalados no código com `// EXTENSÃO:`.
 
 | Funcionalidade | O que já está preparado | O que falta |
 |---|---|---|
-| Academias com vários professores | `organization_id` em todas as tabelas; políticas por professor | Convites; papel `org_admin` |
+| Clubes com vários professores | `organizations` tipada, `organization_members`, convites, papéis internos e contexto ativo (5B.2A) | Calendário compartilhado (5B.2B); locais/campos (5B.3); transferência de propriedade |
 | Outras modalidades | Tabela `sports`; pacotes com `sport_id` opcional | Seed; campos por desporto |
 | Pagamentos | `paid_amount_cents`, `reference_price_cents` | Stripe; tabela `payments` |
 | Expiração automática de créditos | `credit_expired` no enum; `refresh_package_status()` | Tarefa agendada noturna |

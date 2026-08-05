@@ -161,19 +161,87 @@ export type AvailabilityCalendarSource =
   | "schedule_block"
   | "default";
 
+/** `personal` é o workspace privado do professor; `club` é o espaço partilhado. */
+export type WorkspaceKind = "personal" | "club";
+
+/** `archived` existe no enum e está reservado: nenhum fluxo da 5B.2A o produz. */
+export type WorkspaceStatus = "active" | "suspended" | "archived";
+
+export type WorkspaceMemberRole = "owner" | "manager" | "teacher";
+
+/**
+ * `pending` e `declined` existem para o vocabulário ficar completo. Na 5B.2A a
+ * linha de membro só nasce na aceitação, pelo que só ocorrem `active` e
+ * `revoked`; um convite por responder vive em `organization_invitations`.
+ */
+export type WorkspaceMemberStatus = "pending" | "active" | "revoked" | "declined";
+
+export type WorkspaceInvitationStatus = "pending" | "accepted" | "declined" | "revoked";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Linhas
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Workspace e unidade de tenancy.
+ *
+ * As colunas administrativas (`created_by`, `suspended_at`, `suspension_reason`,
+ * `creation_idempotency_key`) existem na tabela mas estão FORA do GRANT de
+ * `authenticated` — aparecem apenas em `admin_workspace_directory`. Por isso
+ * não fazem parte desta linha: pedi-las numa consulta normal daria erro.
+ */
 export type Organization = {
   id: UUID;
   name: string;
   slug: string | null;
   timezone: string;
+  kind: WorkspaceKind;
+  status: WorkspaceStatus;
   created_at: Timestamp;
   updated_at: Timestamp;
 }
 
+export type OrganizationMember = {
+  id: UUID;
+  organization_id: UUID;
+  profile_id: UUID;
+  role: WorkspaceMemberRole;
+  status: WorkspaceMemberStatus;
+  invited_by: UUID | null;
+  invited_at: Timestamp | null;
+  accepted_at: Timestamp | null;
+  removed_at: Timestamp | null;
+  created_at: Timestamp;
+  updated_at: Timestamp;
+}
+
+/** Convite sem segredo: estado, email-alvo e auditoria. Nunca token nem URL. */
+export type OrganizationInvitation = {
+  id: UUID;
+  organization_id: UUID;
+  target_email: string;
+  role: WorkspaceMemberRole;
+  status: WorkspaceInvitationStatus;
+  invited_by: UUID | null;
+  responded_by: UUID | null;
+  invited_at: Timestamp;
+  responded_at: Timestamp | null;
+  revoked_at: Timestamp | null;
+  revoked_by: UUID | null;
+  idempotency_key: UUID | null;
+  created_at: Timestamp;
+  updated_at: Timestamp;
+}
+
+/**
+ * Conta privada.
+ *
+ * `active_workspace_id` existe na tabela mas fica DELIBERADAMENTE fora deste
+ * tipo: é uma preferência escrita só por `set_active_workspace()` e o valor em
+ * bruto nunca autoriza nada. A aplicação lê o contexto já revalidado, por
+ * `workspace_membership_records.is_active_context`, para que nenhum ecrã possa
+ * confiar na preferência sem a membership ter sido verificada.
+ */
 export type Profile = {
   id: UUID;
   organization_id: UUID | null;
@@ -906,6 +974,84 @@ export type StudentAvailabilityCalendarRecord = {
 /** Aula completa do professor, incluindo as suas observações privadas. */
 export type TeacherLessonRecord = Lesson;
 
+/** Contextos autorizados do próprio utilizador: workspace pessoal e clubes. */
+export type WorkspaceMembershipRecord = {
+  membership_id: UUID;
+  organization_id: UUID;
+  organization_name: string;
+  kind: WorkspaceKind;
+  workspace_status: WorkspaceStatus;
+  timezone: string;
+  role: WorkspaceMemberRole;
+  member_status: WorkspaceMemberStatus;
+  accepted_at: Timestamp | null;
+  created_at: Timestamp;
+  is_personal: boolean;
+  is_active_context: boolean;
+  active_member_count: number;
+}
+
+/**
+ * Colegas de clube: identificação mínima.
+ *
+ * Sem email, telefone, alunos, pacotes, saldos, notas privadas nem agenda —
+ * pertencer ao mesmo clube não é motivo para conhecer nada disso.
+ */
+export type WorkspaceMemberDirectoryEntry = {
+  membership_id: UUID;
+  organization_id: UUID;
+  profile_id: UUID;
+  full_name: string;
+  avatar_url: string | null;
+  role: WorkspaceMemberRole;
+  status: WorkspaceMemberStatus;
+  accepted_at: Timestamp | null;
+  is_self: boolean;
+}
+
+/** Convites emitidos, visíveis a quem gere o clube. */
+export type WorkspaceInvitationRecord = {
+  id: UUID;
+  organization_id: UUID;
+  target_email: string;
+  role: WorkspaceMemberRole;
+  status: WorkspaceInvitationStatus;
+  invited_at: Timestamp;
+  responded_at: Timestamp | null;
+  revoked_at: Timestamp | null;
+  invited_by_name: string | null;
+}
+
+/** Convites dirigidos ao próprio utilizador, por email confirmado. */
+export type WorkspaceReceivedInvitationRecord = {
+  id: UUID;
+  organization_id: UUID;
+  organization_name: string;
+  kind: WorkspaceKind;
+  workspace_status: WorkspaceStatus;
+  timezone: string;
+  role: WorkspaceMemberRole;
+  status: WorkspaceInvitationStatus;
+  invited_at: Timestamp;
+  invited_by_name: string | null;
+}
+
+/** Moderação de clubes. Não dá acesso a alunos, pacotes nem agendas. */
+export type AdminWorkspaceDirectoryEntry = {
+  id: UUID;
+  name: string;
+  kind: WorkspaceKind;
+  status: WorkspaceStatus;
+  timezone: string;
+  suspended_at: Timestamp | null;
+  suspension_reason: string | null;
+  created_at: Timestamp;
+  updated_at: Timestamp;
+  created_by_name: string | null;
+  active_member_count: number;
+  pending_invitation_count: number;
+}
+
 /** Dados básicos necessários à gestão administrativa de contas. */
 export type AdminUserDirectoryEntry = {
   id: UUID;
@@ -1017,6 +1163,20 @@ export type Database = {
       student_invitations: {
         Row: StudentInvitation;
         // Estado administrativo escrito apenas pelas RPCs de convite/claim.
+        Insert: never;
+        Update: never;
+        Relationships: [];
+      };
+      organization_members: {
+        Row: OrganizationMember;
+        // Quem pertence a um clube muda apenas por RPC.
+        Insert: never;
+        Update: never;
+        Relationships: [];
+      };
+      organization_invitations: {
+        Row: OrganizationInvitation;
+        // Convites mudam apenas por RPC.
         Insert: never;
         Update: never;
         Relationships: [];
@@ -1343,6 +1503,26 @@ export type Database = {
         Row: AdminUserDirectoryEntry;
         Relationships: [];
       };
+      workspace_membership_records: {
+        Row: WorkspaceMembershipRecord;
+        Relationships: [];
+      };
+      workspace_member_directory: {
+        Row: WorkspaceMemberDirectoryEntry;
+        Relationships: [];
+      };
+      workspace_invitation_records: {
+        Row: WorkspaceInvitationRecord;
+        Relationships: [];
+      };
+      workspace_received_invitation_records: {
+        Row: WorkspaceReceivedInvitationRecord;
+        Relationships: [];
+      };
+      admin_workspace_directory: {
+        Row: AdminWorkspaceDirectoryEntry;
+        Relationships: [];
+      };
     };
     Functions: {
       claim_student_profile: {
@@ -1591,6 +1771,51 @@ export type Database = {
         Args: { p_start_date: DateOnly; p_end_date: DateOnly };
         Returns: StudentAvailabilityCalendarRecord[];
       };
+      create_club_workspace: {
+        Args: { p_name: string; p_timezone: string; p_idempotency_key: UUID };
+        Returns: UUID;
+      };
+      invite_workspace_member: {
+        Args: {
+          p_organization_id: UUID;
+          p_email: string;
+          p_role: WorkspaceMemberRole;
+          p_idempotency_key: UUID;
+        };
+        Returns: UUID;
+      };
+      revoke_workspace_invitation: {
+        Args: { p_invitation_id: UUID };
+        Returns: boolean;
+      };
+      accept_workspace_invitation: {
+        Args: { p_invitation_id: UUID };
+        Returns: UUID;
+      };
+      decline_workspace_invitation: {
+        Args: { p_invitation_id: UUID };
+        Returns: boolean;
+      };
+      update_workspace_member_role: {
+        Args: { p_membership_id: UUID; p_role: WorkspaceMemberRole };
+        Returns: boolean;
+      };
+      remove_workspace_member: {
+        Args: { p_membership_id: UUID };
+        Returns: boolean;
+      };
+      admin_set_workspace_status: {
+        Args: {
+          p_organization_id: UUID;
+          p_status: WorkspaceStatus;
+          p_reason?: string | null;
+        };
+        Returns: undefined;
+      };
+      set_active_workspace: {
+        Args: { p_organization_id: UUID | null };
+        Returns: UUID;
+      };
     };
     Enums: {
       user_role: UserRole;
@@ -1615,6 +1840,11 @@ export type Database = {
       schedule_block_category: ScheduleBlockCategory;
       schedule_block_status: ScheduleBlockStatus;
       availability_public_status: AvailabilityPublicStatus;
+      workspace_kind: WorkspaceKind;
+      workspace_status: WorkspaceStatus;
+      workspace_member_role: WorkspaceMemberRole;
+      workspace_member_status: WorkspaceMemberStatus;
+      workspace_invitation_status: WorkspaceInvitationStatus;
     };
     CompositeTypes: Record<never, never>;
   };
