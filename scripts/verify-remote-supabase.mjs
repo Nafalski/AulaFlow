@@ -222,6 +222,8 @@ const expectedFunctions = [
   "set_active_workspace",
   "set_workspace_calendar_sharing",
   "get_club_availability_calendar",
+  "resolve_teacher_availability_windows",
+  "resolve_teacher_block_segments",
 ];
 
 const authenticatedRpc = [
@@ -275,6 +277,8 @@ const internalFunctions = [
   "resolve_teacher_availability_calendar_core",
   "workspace_timezone_is_supported",
   "log_workspace_event",
+  "resolve_teacher_availability_windows",
+  "resolve_teacher_block_segments",
 ];
 
 const sql = `

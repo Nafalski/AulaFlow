@@ -48,7 +48,7 @@ Instruções completas — incluindo a configuração do Supabase — em [`AGENT
 - Clubes como workspaces partilhados em `/professor/clubes`: criação, papéis internos (proprietário, gestor, professor), convites por email confirmado, gestão de membros e seletor de contexto no shell
 - Convites recebidos em `/professor/convites`, com aceitar e recusar; moderação de clubes em `/admin/clubes`, com suspender/reativar auditado que não apaga dados
 - Calendário partilhado do clube em `/professor/clubes/[id]/calendario`, com Dia/Semana/Mês e filtro por professor: cada professor decide, clube a clube, se partilha a disponibilidade, e quem não partilha aparece como «Disponibilidade não partilhada»
-- A projeção partilhada mostra apenas disponível ou indisponível — um bloqueio pessoal de um colega nunca revela motivo, categoria nem identificadores internos
+- A projeção partilhada tem quatro estados: disponível, indisponível, fora do horário (espaço vazio, incluindo dias inteiros sem rotina) e disponibilidade não partilhada; um bloqueio pessoal de um colega aparece como faixa indisponível, sem nunca revelar motivo, categoria nem identificadores internos
 - Views seguras para a área do aluno, sem valor registado, origem administrativa, observações, autoria ou identificadores internos sensíveis
 - RPCs seguras de disponibilidade: professor vê detalhes dos próprios bloqueios; aluno não recebe motivo, categoria, fonte interna, organização nem `teacher_id`
 - Diretório administrativo com pesquisa, filtros, detalhe e bloqueio/reativação auditados
@@ -57,9 +57,9 @@ Instruções completas — incluindo a configuração do Supabase — em [`AGENT
 - Pacotes, saldos disponíveis/reservados/utilizados e livro-razão append-only
 - RPCs PostgreSQL para atribuir, reservar, consumir, libertar, reagendar, ajustar e corrigir créditos
 - RPCs PostgreSQL para guardar preferências, horários semanais, exceções, bloqueios e resolução segura de disponibilidade
-- Regras e validação com 340 testes de unidade/regressão
-- 479 verificações PostgreSQL sobre migrações, permissões, RLS, gestão, claim, modelos, atribuição, consulta, ajustes administrativos, disponibilidade, calendário seguro, clubes, memberships, convites, contexto ativo, consentimento de partilha, calendário partilhado, grants de views e saldos
-- 179 verificações Auth/PostgREST reais no Supabase de desenvolvimento
+- Regras e validação com 349 testes de unidade/regressão
+- 491 verificações PostgreSQL sobre migrações, permissões, RLS, gestão, claim, modelos, atribuição, consulta, ajustes administrativos, disponibilidade, calendário seguro, clubes, memberships, convites, contexto ativo, consentimento de partilha, calendário partilhado, grants de views e saldos
+- 184 verificações Auth/PostgREST reais no Supabase de desenvolvimento
 - Estrutura responsiva das áreas de professor, aluno e administração, com manifesto e ícones PWA
 
 `/professor/clubes` gere contextos, clubes e membros; `/professor/clubes/[id]/calendario` mostra a disponibilidade partilhada do clube; `/professor/convites` mostra os convites recebidos. `/professor/pacotes` gere modelos reutilizáveis, atribuição, consulta e ajustes administrativos dos pacotes atribuídos. `/professor/pacotes/historico` mostra a auditoria global. `/professor/definicoes/disponibilidade` guarda a fonte de verdade da agenda do professor. `/professor/calendario` e `/aluno/calendario` mostram disponibilidade calculada em Dia/Semana/Mês; ainda não criam aulas. `/aluno/pacotes` mostra apenas os próprios pacotes e movimentos básicos.

@@ -151,7 +151,9 @@ update public.profiles set role = 'admin' where email = 'voce@exemplo.pt';
 │   ├── ..._phase5_workspace_security.sql Etapa 5B.2A: RLS, grants e projeções de workspace
 │   ├── ..._phase5_workspace_functions.sql Etapa 5B.2A: RPCs atómicas de clubes e membros
 │   ├── ..._phase5_workspace_grants.sql grants explícitos das views e funções da Etapa 5B.2A
-│   └── ..._phase5_club_calendar.sql Etapa 5B.2B: consentimento por membership e calendário do clube
+│   ├── ..._phase5_club_calendar.sql Etapa 5B.2B: consentimento por membership e calendário do clube
+│   ├── ..._phase5_club_calendar_states.sql Etapa 5B.2B: distinguir indisponível de fora do horário
+│   └── ..._phase5_club_calendar_outside_hours.sql Etapa 5B.2B: dia sem janela positiva é fora do horário
 │
 └── src/
     ├── proxy.ts             Renova a sessão e protege rotas (era middleware.ts)
@@ -321,7 +323,7 @@ npm run typecheck
 
 ### `npm run db:verify`
 
-Executa **todas** as migrações, a partir de uma base vazia, contra PostgreSQL compilado para WebAssembly (PGlite), e volta a aplicá-las para confirmar idempotência. Depois exerce 479 garantias: RLS com papéis `authenticated`/`anon`, isolamento entre organizações e professores, privilégios das RPCs, perfis/claim/bloqueio, convites sem segredo, alunos, turmas, locais, modelos, atribuição, consulta e ajustes administrativos de pacotes, disponibilidade do professor, calendário seguro, clubes, memberships, convites de workspace, papéis internos, contexto ativo, suspensão, consentimento de partilha por clube, projeção do calendário partilhado, grants estritos das views, políticas, reserva, consumo, libertação, reagendamento, exceções, correções, imutabilidade do livro-razão e constraints herdadas das aulas.
+Executa **todas** as migrações, a partir de uma base vazia, contra PostgreSQL compilado para WebAssembly (PGlite), e volta a aplicá-las para confirmar idempotência. Depois exerce 491 garantias: RLS com papéis `authenticated`/`anon`, isolamento entre organizações e professores, privilégios das RPCs, perfis/claim/bloqueio, convites sem segredo, alunos, turmas, locais, modelos, atribuição, consulta e ajustes administrativos de pacotes, disponibilidade do professor, calendário seguro, clubes, memberships, convites de workspace, papéis internos, contexto ativo, suspensão, consentimento de partilha por clube, projeção do calendário partilhado, grants estritos das views, políticas, reserva, consumo, libertação, reagendamento, exceções, correções, imutabilidade do livro-razão e constraints herdadas das aulas.
 
 Corre em segundos, sem Docker e sem projeto na nuvem — serve para o CI.
 
@@ -588,9 +590,22 @@ Está na membership, e não em `teacher_profiles`, porque uma preferência globa
 | `get_club_availability_calendar(p_organization_id, p_start_date, p_end_date, p_membership_id)` | Membro ativo de clube ativo | `membership_id`, `teacher_name`, `date`, `starts_at`, `ends_at`, `status` |
 | `club_calendar_member_directory` | Membro ativo de clube ativo | `membership_id`, `organization_id`, `teacher_name`, `role`, `calendar_sharing_enabled`, `is_self` |
 
-O calendário do clube **nunca** devolve `source`, `source_id`, `reason`, `category`, `all_day`, IDs de regra/exceção/bloqueio, `teacher_id`, `profile_id`, organização pessoal, autoria, email ou telefone. Reaproveita o motor `resolve_teacher_availability_calendar_core()`, mas só sobrevivem as linhas `available`: **um bloqueio pessoal chega ao colega como ausência de disponibilidade**, indistinguível de não ter horário.
+O calendário do clube **nunca** devolve `source`, `source_id`, `reason`, `category`, `all_day`, IDs de regra/exceção/bloqueio, `teacher_id`, `profile_id`, organização pessoal, autoria, email ou telefone.
 
-Quem não consentiu não produz linha nenhuma. A interface distingue "indisponível" de "não partilhada" pelo diretório, não pelo calendário.
+**Os quatro estados, e como cada um é representado:**
+
+| Estado | Representação |
+|---|---|
+| `available` | Linha `available` com horas |
+| `unavailable` | Linha `unavailable` com horas — **só** quando o servidor prova que o horário pertence a uma janela positiva cortada por bloqueio ativo |
+| `outside_hours` | **Ausência de linha.** Inclui dias inteiros sem rotina: sem janela positiva não há indisponibilidade a comunicar |
+| `not_shared` | Nenhuma linha e `calendar_sharing_enabled = false` no diretório |
+
+A projeção devolve **apenas segmentos com horas**. A regra que sustenta isto: **não marcar como indisponível o que o servidor não consegue provar pertencer a uma janela positiva**. Um bloqueio pessoal num dia sem rotina não produz linha nenhuma — além de ser a etiqueta errada, sinalizá-lo diria ao colega que ali há alguma coisa num dia em que o professor nem trabalha. Uma pausa de almoço — que a Etapa 5A representa como o espaço entre `09:00–13:00` e `15:00–20:00` — é ausência, não bloqueio. Deduzir "buraco = ocupado" no cliente marcaria almoços como indisponibilidade.
+
+Para calcular a interseção (janela ∩ bloqueio) sem duplicar regras, a precedência e o recorte de fuso vivem em `resolve_teacher_availability_windows()` e `resolve_teacher_block_segments()`; `resolve_teacher_availability_calendar_core()` é construído a partir delas. As três são internas — sem `EXECUTE` para `authenticated`, porque devolvem motivo, categoria e IDs de origem.
+
+Quem não consentiu não produz linha nenhuma. A interface distingue "indisponível" de "não partilhada" pelo diretório, não pelo calendário, e explica "fora do horário" numa legenda — espaço vazio não se explica sozinho.
 
 **Autorização:** professor global ativo + membership `active` + `kind = 'club'` + `status = 'active'`. `active_workspace_id` **não** participa da decisão. O filtro `p_membership_id` é revalidado: tem de ser uma membership ativa **deste** clube, caso contrário é recusado em vez de devolver vazio.
 
@@ -610,7 +625,7 @@ As linhas são declaradas com `type`, **nunca com `interface`**. Um `interface` 
 
 Vitest, ambiente Node, `TZ=Europe/Lisbon` fixo para que um teste que passa localmente passe também no CI (que corre em UTC).
 
-Cobertura atual: **340 testes** em vinte e um ficheiros — testes de domínio, regressões de respostas/autenticação do proxy, formulários da Fase 2, validação/normalização da gestão da Fase 3, modelos, atribuição, apresentação, navegação, ajustes administrativos de pacotes, disponibilidade do professor, calendário, permissões de clube, validação de workspaces e regras do calendário partilhado.
+Cobertura atual: **349 testes** em vinte e um ficheiros — testes de domínio, regressões de respostas/autenticação do proxy, formulários da Fase 2, validação/normalização da gestão da Fase 3, modelos, atribuição, apresentação, navegação, ajustes administrativos de pacotes, disponibilidade do professor, calendário, permissões de clube, validação de workspaces e regras do calendário partilhado.
 
 Os testes de domínio exercem funções puras, sem base de dados nem mocks. Os testes de validação garantem normalização, limites, identificadores, estados, valores monetários em cêntimos, datas civis e rejeição de campos extra/protegidos. A integração SQL fica separada em `db:verify`.
 

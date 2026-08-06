@@ -10,6 +10,7 @@ import {
 import { Alert } from "@/components/ui/alert";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { EmptyState } from "@/components/ui/empty-state";
+import { ClubCalendarLegend } from "@/components/workspaces/club-calendar-legend";
 import { ClubCalendarSharingForm } from "@/components/workspaces/club-calendar-sharing-form";
 import { ClubCalendarTeacherFilter } from "@/components/workspaces/club-calendar-teacher-filter";
 import { requireRole } from "@/lib/auth/session";
@@ -174,6 +175,8 @@ export default async function ClubCalendarPage({
             date={window.selectedDate}
             view={window.view}
           />
+
+          <ClubCalendarLegend />
 
           {nobodyShares ? (
             <EmptyState

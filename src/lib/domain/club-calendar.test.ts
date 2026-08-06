@@ -2,7 +2,10 @@ import { describe, expect, it } from "vitest";
 
 import {
   CLUB_CALENDAR_ALL_TEACHERS,
+  CLUB_CALENDAR_STATES,
+  CLUB_CALENDAR_STATE_LABELS,
   clubCalendarBasePath,
+  clubCalendarStateFor,
   isClubCalendarEmpty,
   mergeClubPeriods,
   resolveClubCalendarFilter,
@@ -172,16 +175,112 @@ describe("sobreposição em “Todos”", () => {
     expect(merged.filter((item) => item.status === "available")).toHaveLength(2);
   });
 
-  it("marca como indisponível um dia sem qualquer disponibilidade", () => {
-    const merged = mergeClubPeriods([period("m1", "2026-09-08", null, null, "unavailable")]);
-
-    expect(merged).toEqual([
-      { date: "2026-09-08", startsAt: null, endsAt: null, status: "unavailable" },
-    ]);
+  // Um dia sem janela positiva é "fora do horário", não "indisponível": marcá-lo
+  // como indisponível diria que o professor está ocupado num dia em que apenas
+  // não trabalha.
+  it("um dia sem janela positiva não produz linha nenhuma", () => {
+    expect(mergeClubPeriods([period("m1", "2026-09-08", null, null, "unavailable")])).toEqual([]);
   });
 
   it("não inventa disponibilidade quando não há períodos", () => {
     expect(mergeClubPeriods([])).toEqual([]);
+  });
+
+  // O bloqueio de um professor não pode escurecer uma hora em que um colega
+  // está livre: em "Todos", a pergunta é se ALGUÉM está disponível.
+  it("não marca como indisponível um horário em que outro professor está livre", () => {
+    const merged = mergeClubPeriods([
+      period("m1", "2026-09-07", "10:00:00", "11:00:00", "unavailable"),
+      period("m2", "2026-09-07", "09:00:00", "12:00:00"),
+    ]);
+
+    expect(merged).toEqual([
+      { date: "2026-09-07", startsAt: "09:00:00", endsAt: "12:00:00", status: "available" },
+    ]);
+  });
+
+  it("mantém indisponível a parte do bloqueio que ninguém cobre", () => {
+    const merged = mergeClubPeriods([
+      period("m1", "2026-09-07", "10:00:00", "12:00:00", "unavailable"),
+      period("m2", "2026-09-07", "11:00:00", "13:00:00"),
+    ]);
+
+    expect(merged).toEqual([
+      { date: "2026-09-07", startsAt: "10:00:00", endsAt: "11:00:00", status: "unavailable" },
+      { date: "2026-09-07", startsAt: "11:00:00", endsAt: "13:00:00", status: "available" },
+    ]);
+  });
+
+  it("parte o bloqueio em dois quando a disponibilidade cobre o meio", () => {
+    const merged = mergeClubPeriods([
+      period("m1", "2026-09-07", "09:00:00", "13:00:00", "unavailable"),
+      period("m2", "2026-09-07", "10:00:00", "11:00:00"),
+    ]);
+
+    expect(merged.filter((item) => item.status === "unavailable")).toEqual([
+      { date: "2026-09-07", startsAt: "09:00:00", endsAt: "10:00:00", status: "unavailable" },
+      { date: "2026-09-07", startsAt: "11:00:00", endsAt: "13:00:00", status: "unavailable" },
+    ]);
+  });
+
+  it("um dia com janela bloqueada devolve só a faixa, sem dia inteiro", () => {
+    const merged = mergeClubPeriods([
+      period("m1", "2026-09-14", "09:00:00", "13:00:00", "unavailable"),
+    ]);
+
+    expect(merged).toEqual([
+      { date: "2026-09-14", startsAt: "09:00:00", endsAt: "13:00:00", status: "unavailable" },
+    ]);
+    expect(merged.some((item) => item.startsAt === null)).toBe(false);
+  });
+
+  it("nunca devolve faixas sem horas", () => {
+    const merged = mergeClubPeriods([
+      period("m1", "2026-09-07", "09:00:00", "10:00:00"),
+      period("m1", "2026-09-08", null, null, "unavailable"),
+      period("m2", "2026-09-09", null, null, "unavailable"),
+    ]);
+
+    expect(merged.every((item) => item.startsAt !== null && item.endsAt !== null)).toBe(true);
+  });
+});
+
+describe("estados genéricos da etapa", () => {
+  it("declara exatamente quatro estados, e nenhum é uma aula", () => {
+    expect([...CLUB_CALENDAR_STATES]).toEqual([
+      "available",
+      "unavailable",
+      "outside_hours",
+      "not_shared",
+    ]);
+
+    const vocabulary = JSON.stringify(CLUB_CALENDAR_STATE_LABELS).toLowerCase();
+    for (const fake of ["ocupado com", "reservad", "lotad", "vaga", "conflito", "aula"]) {
+      expect(vocabulary).not.toContain(fake);
+    }
+  });
+
+  it("rotula cada estado em português", () => {
+    expect(CLUB_CALENDAR_STATE_LABELS.available).toBe("Disponível");
+    expect(CLUB_CALENDAR_STATE_LABELS.unavailable).toBe("Indisponível");
+    expect(CLUB_CALENDAR_STATE_LABELS.outside_hours).toBe("Fora do horário");
+    expect(CLUB_CALENDAR_STATE_LABELS.not_shared).toBe("Disponibilidade não partilhada");
+  });
+
+  it("traduz as linhas da projeção nos dois estados que o servidor devolve", () => {
+    expect(clubCalendarStateFor("available")).toBe("available");
+    expect(clubCalendarStateFor("unavailable")).toBe("unavailable");
+  });
+
+  // "Fora do horário" é ausência de linha: nunca chega do servidor.
+  it("fora do horário nunca é um estado devolvido pela projeção", () => {
+    const statuses = toClubCalendarItems([
+      period("m1", "2026-09-07", "09:00:00", "10:00:00"),
+      period("m1", "2026-09-07", "10:00:00", "11:00:00", "unavailable"),
+    ]).map((item) => item.status);
+
+    expect(statuses).not.toContain("outside_hours");
+    expect(statuses).not.toContain("not_shared");
   });
 });
 

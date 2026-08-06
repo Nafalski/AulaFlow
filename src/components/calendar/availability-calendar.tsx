@@ -830,7 +830,18 @@ function MonthSummary({
   const available = dayItems.filter((item) => item.status === "available" && item.startsAt && item.endsAt);
   const hasBlock = audience === "teacher" && dayItems.some((item) => item.source === "schedule_block");
   const hasException = audience === "teacher" && dayItems.some((item) => item.source === "date_exception");
-  const isUnavailable = available.length === 0;
+
+  /**
+   * "Indisponível" exige uma linha que o diga.
+   *
+   * No calendário do clube, um dia sem qualquer linha significa que o colega
+   * não tem horário de trabalho — "fora do horário", não "indisponível".
+   * Marcá-lo como indisponível diria que está ocupado num dia em que apenas
+   * não trabalha. Os calendários do professor e do aluno recebem sempre uma
+   * linha por dia, pelo que continuam a ler-se como antes.
+   */
+  const isUnavailable = available.length === 0 && dayItems.length > 0;
+  const isOutsideHours = dayItems.length === 0;
 
   return (
     <div className="mt-1 flex min-w-0 flex-col gap-1">
@@ -860,6 +871,11 @@ function MonthSummary({
       {isUnavailable && (
         <span className="truncate rounded bg-line-soft px-1.5 py-0.5 text-[0.68rem] font-bold text-muted">
           Indisponível
+        </span>
+      )}
+      {isOutsideHours && audience === "club" && (
+        <span className="truncate rounded border border-dashed border-line px-1.5 py-0.5 text-[0.68rem] font-semibold text-muted">
+          Fora do horário
         </span>
       )}
     </div>

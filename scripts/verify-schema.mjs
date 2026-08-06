@@ -6213,6 +6213,199 @@ await asDatabaseRole("authenticated", ADMIN_UID, () =>
   db.query(`select public.admin_set_account_status($1,'active',null)`, [OTHER_TEACHER_UID]),
 );
 
+// ── Semântica dos estados ───────────────────────────────────────────────────
+//
+// A pausa de almoço e um bloqueio privado são ambos "buracos" no dia. Se a
+// projeção os representasse da mesma maneira, a interface não teria como
+// distinguir "fora do horário" de "indisponível" — e adivinhar pelo buraco
+// marcaria almoços como ocupação. Esta secção fixa essa distinção.
+//
+// Quinta-feira é usada de propósito: nenhuma outra verificação lhe toca, pelo
+// que a rotina com pausa de almoço não perturba os cenários anteriores.
+
+const SEMANTIC_THURSDAY = "2026-09-24";
+const SEMANTIC_FRIDAY = "2026-09-25";
+const SEMANTIC_WEDNESDAY = "2026-09-23";
+const SEMANTIC_BLOCKED_THURSDAY = "2026-10-01";
+
+for (const [startsAt, endsAt] of [
+  ["09:00", "13:00"],
+  ["15:00", "20:00"],
+]) {
+  await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+    db.query(
+      `select public.upsert_teacher_availability_rule(
+         p_weekday => 4, p_starts_at => $1::time, p_ends_at => $2::time,
+         p_idempotency_key => $3::uuid)`,
+      [startsAt, endsAt, randomUUID()],
+    ),
+  );
+}
+
+// Bloqueio privado das 10:00 às 11:00 locais, dentro da primeira janela.
+await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  db.query(
+    `select public.upsert_teacher_schedule_block(
+       p_starts_at => '2026-09-24 09:00+00'::timestamptz,
+       p_ends_at => '2026-09-24 10:00+00'::timestamptz,
+       p_all_day => false, p_reason => 'Consulta médica particular',
+       p_category => 'personal', p_idempotency_key => $1::uuid)`,
+    [randomUUID()],
+  ),
+);
+// Exceção positiva numa quarta-feira sem rotina semanal.
+await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  db.query(
+    `select public.upsert_teacher_availability_exception(
+       p_exception_date => $1::date, p_starts_at => '18:00'::time, p_ends_at => '20:00'::time,
+       p_mode => 'add', p_idempotency_key => $2::uuid)`,
+    [SEMANTIC_WEDNESDAY, randomUUID()],
+  ),
+);
+// Quinta-feira de trabalho inteiramente bloqueada.
+await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  db.query(
+    `select public.upsert_teacher_schedule_block(
+       p_starts_at => '2026-10-01 00:00+01'::timestamptz,
+       p_ends_at => '2026-10-02 00:00+01'::timestamptz,
+       p_all_day => true, p_reason => 'Férias em família', p_category => 'vacation',
+       p_idempotency_key => $1::uuid)`,
+    [randomUUID()],
+  ),
+);
+
+const semanticRows = async (day) =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    rows(
+      `select calendar.starts_at::text as starts_at, calendar.ends_at::text as ends_at,
+              calendar.status::text as status
+         from public.get_club_availability_calendar($1,$2,$2,$3) calendar
+        order by calendar.starts_at nulls last`,
+      [clubA.id, day, rejoinMembership.id],
+    ),
+  );
+
+const asRange = (row) => `${row.starts_at ?? "—"}–${row.ends_at ?? "—"} ${row.status}`;
+
+const thursdaySemantics = await semanticRows(SEMANTIC_THURSDAY);
+check(
+  thursdaySemantics.map(asRange).join(" | ") ===
+    "09:00:00–10:00:00 available | 10:00:00–11:00:00 unavailable | 11:00:00–13:00:00 available | 15:00:00–20:00:00 available",
+  "bloqueio dentro da janela é indisponível; a pausa de almoço fica ausente e é fora do horário",
+);
+check(
+  thursdaySemantics.some(
+    (row) =>
+      row.starts_at === "10:00:00" && row.ends_at === "11:00:00" && row.status === "unavailable",
+  ),
+  "bloqueio parcial dentro de um período disponível aparece como faixa indisponível",
+);
+check(
+  !thursdaySemantics.some((row) => row.starts_at === "13:00:00"),
+  "a pausa entre dois períodos NÃO é marcada como indisponível",
+);
+
+// Um dia sem janela positiva é "fora do horário", e fora do horário é ausência
+// de linha. Marcá-lo como indisponível diria que o professor está ocupado num
+// dia em que apenas não trabalha.
+const fridaySemantics = await semanticRows(SEMANTIC_FRIDAY);
+check(
+  fridaySemantics.length === 0,
+  "dia sem rotina nenhuma não devolve linha: é fora do horário, não indisponível",
+);
+
+// Pior do que uma etiqueta errada seria uma fuga: um bloqueio pessoal num dia
+// sem horário de trabalho não diz respeito ao clube e não pode produzir sinal.
+await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  db.query(
+    `select public.upsert_teacher_schedule_block(
+       p_starts_at => '2026-09-25 09:00+00'::timestamptz,
+       p_ends_at => '2026-09-25 10:00+00'::timestamptz,
+       p_all_day => false, p_reason => 'Assunto pessoal fora do horário',
+       p_category => 'personal', p_idempotency_key => $1::uuid)`,
+    [randomUUID()],
+  ),
+);
+const fridayWithBlock = await semanticRows(SEMANTIC_FRIDAY);
+check(
+  fridayWithBlock.length === 0,
+  "bloqueio pessoal num dia sem rotina não produz linha nenhuma para o colega",
+);
+
+const wednesdaySemantics = await semanticRows(SEMANTIC_WEDNESDAY);
+check(
+  wednesdaySemantics.length === 1 &&
+    wednesdaySemantics[0].starts_at === "18:00:00" &&
+    wednesdaySemantics[0].ends_at === "20:00:00" &&
+    wednesdaySemantics[0].status === "available",
+  "exceção positiva num dia sem rotina aparece como disponível",
+);
+
+const blockedDaySemantics = await semanticRows(SEMANTIC_BLOCKED_THURSDAY);
+check(
+  blockedDaySemantics.length === 2 &&
+    blockedDaySemantics.every((row) => row.status === "unavailable") &&
+    blockedDaySemantics[0].starts_at === "09:00:00" &&
+    blockedDaySemantics[1].starts_at === "15:00:00",
+  "dia de trabalho inteiramente bloqueado mostra as janelas como indisponíveis",
+);
+check(
+  !blockedDaySemantics.some((row) => row.starts_at === null),
+  "um dia com janelas bloqueadas não recebe também faixa de dia inteiro",
+);
+
+// A projeção do clube passou a devolver exclusivamente segmentos com horas.
+const wideWindow = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  rows(
+    `select calendar.starts_at, calendar.ends_at
+       from public.get_club_availability_calendar($1,'2026-09-21','2026-10-02',null) calendar`,
+    [clubA.id],
+  ),
+);
+check(
+  wideWindow.length > 0 &&
+    wideWindow.every((row) => row.starts_at !== null && row.ends_at !== null),
+  "o calendário do clube devolve apenas segmentos com horas, nunca faixas de dia inteiro",
+);
+check(
+  !/Férias|vacation|Consulta|personal|schedule_block|weekly_rule|date_exception/.test(
+    JSON.stringify([...thursdaySemantics, ...blockedDaySemantics]),
+  ),
+  "nenhum motivo, categoria ou origem acompanha as faixas indisponíveis",
+);
+
+// O motor privado do professor continua a devolver o detalhe que sempre deu.
+const teacherStillSeesDetail = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  rows(
+    `select calendar.reason, calendar.category::text as category
+       from public.get_teacher_availability_calendar($1,$1) calendar
+      where calendar.source = 'schedule_block'`,
+    [SEMANTIC_BLOCKED_THURSDAY],
+  ),
+);
+check(
+  teacherStillSeesDetail.some(
+    (row) => row.reason === "Férias em família" && row.category === "vacation",
+  ),
+  "o professor continua a ver motivo e categoria dos próprios bloqueios",
+);
+
+const internalCalendarFunctions = await rows(
+  `select proc.proname
+     from pg_proc proc
+     join pg_namespace ns on ns.oid = proc.pronamespace
+    where ns.nspname='public'
+      and proc.proname in ('resolve_teacher_availability_windows','resolve_teacher_block_segments')
+      and (
+        has_function_privilege('authenticated', proc.oid, 'EXECUTE')
+        or has_function_privilege('anon', proc.oid, 'EXECUTE')
+      )`,
+);
+check(
+  internalCalendarFunctions.length === 0,
+  "as funções internas de janelas e bloqueios não são executáveis pelo cliente",
+);
+
 // ── Desativar a partilha ────────────────────────────────────────────────────
 
 const disabled = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>

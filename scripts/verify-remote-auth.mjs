@@ -1381,6 +1381,75 @@ try {
     "Calendario do clube devolve apenas disponivel ou indisponivel",
   );
 
+  // Semântica dos estados: um bloqueio privado dentro da janela de trabalho
+  // tem de chegar ao colega como faixa "indisponível", e nunca confundido com
+  // o fim do horário — que é representado por ausência de linha.
+  const { error: semanticBlockError } = await teacherBClient.rpc("upsert_teacher_schedule_block", {
+    p_starts_at: `${clubCalendarDate}T09:00:00+01:00`,
+    p_ends_at: `${clubCalendarDate}T10:00:00+01:00`,
+    p_all_day: false,
+    p_reason: "Compromisso pessoal E2E",
+    p_category: "personal",
+    p_idempotency_key: deterministicUuid(`club-calendar-block:${runId}`),
+  });
+  if (semanticBlockError) {
+    throw new Error(`Bloqueio do Professor B: ${summarizeError(semanticBlockError)}`);
+  }
+
+  const semanticCalendar = await teacherClient.rpc("get_club_availability_calendar", {
+    p_organization_id: clubId,
+    p_start_date: clubCalendarDate,
+    p_end_date: clubCalendarDate,
+    p_membership_id: calendarMembershipId,
+  });
+  const semanticRanges = (semanticCalendar.data ?? [])
+    .map((row) => `${(row.starts_at ?? "—").slice(0, 5)}-${(row.ends_at ?? "—").slice(0, 5)} ${row.status}`)
+    .join(" | ");
+  // A janela do Professor B e 09:00-12:00 e o bloqueio ocupa a primeira hora.
+  // O que se prova aqui e a distincao: a hora bloqueada chega como faixa
+  // `unavailable`, e nao como ausencia de linha — que significaria fora do
+  // horario. As 12:00-24:00 continuam ausentes, e e assim que devem ficar.
+  check(
+    !semanticCalendar.error &&
+      semanticRanges === "09:00-10:00 unavailable | 10:00-12:00 available",
+    `Bloqueio dentro da janela chega como faixa indisponivel (recebido: ${semanticRanges})`,
+  );
+  check(
+    (semanticCalendar.data ?? []).every((row) => row.starts_at !== null),
+    "Um dia com janela de trabalho nao recebe tambem faixa de dia inteiro",
+  );
+
+  // Um dia sem janela positiva e "fora do horario": ausencia de linha. O
+  // Professor B so tem rotina no dia da semana usado acima.
+  const outsideHoursDay = isoDatePlusDays(15, fixtureBaseDate);
+  const outsideHoursCalendar = await teacherClient.rpc("get_club_availability_calendar", {
+    p_organization_id: clubId,
+    p_start_date: outsideHoursDay,
+    p_end_date: outsideHoursDay,
+    p_membership_id: calendarMembershipId,
+  });
+  check(
+    !outsideHoursCalendar.error && (outsideHoursCalendar.data ?? []).length === 0,
+    "Dia sem rotina nao devolve linha: e fora do horario, nao indisponivel",
+  );
+  check(
+    !/Compromisso pessoal|personal|schedule_block|reason|category/.test(
+      JSON.stringify(semanticCalendar.data ?? []),
+    ),
+    "A faixa indisponivel nao transporta motivo, categoria nem origem",
+  );
+
+  const privateDetail = await teacherBClient.rpc("get_teacher_availability_calendar", {
+    p_start_date: clubCalendarDate,
+    p_end_date: clubCalendarDate,
+  });
+  check(
+    (privateDetail.data ?? []).some(
+      (row) => row.source === "schedule_block" && row.reason === "Compromisso pessoal E2E",
+    ),
+    "O proprio professor continua a ver motivo e categoria do seu bloqueio",
+  );
+
   const filteredCalendar = await teacherClient.rpc("get_club_availability_calendar", {
     p_organization_id: clubId,
     p_start_date: clubCalendarDate,

@@ -21,6 +21,42 @@ export const CLUB_CALENDAR_FILTER_PARAM = "professor";
 
 export type ClubCalendarSharingState = "shared" | "not_shared";
 
+/**
+ * Os quatro estados desta etapa — e nenhum deles é uma aula.
+ *
+ * `outside_hours` não é devolvido pelo servidor: é a AUSÊNCIA de linha. O
+ * servidor só marca `unavailable` quando consegue provar que o horário
+ * pertencia a uma janela positiva cortada por um bloqueio. Tudo o resto fica
+ * por dizer, e por dizer significa exatamente "fora do horário de trabalho".
+ */
+export const CLUB_CALENDAR_STATES = [
+  "available",
+  "unavailable",
+  "outside_hours",
+  "not_shared",
+] as const;
+
+export type ClubCalendarState = (typeof CLUB_CALENDAR_STATES)[number];
+
+export const CLUB_CALENDAR_STATE_LABELS: Record<ClubCalendarState, string> = {
+  available: "Disponível",
+  unavailable: "Indisponível",
+  outside_hours: "Fora do horário",
+  not_shared: "Disponibilidade não partilhada",
+};
+
+export const CLUB_CALENDAR_STATE_DESCRIPTIONS: Record<ClubCalendarState, string> = {
+  available: "O professor tem este período livre na sua agenda.",
+  unavailable: "É horário de trabalho do professor, mas não está livre. O motivo é privado.",
+  outside_hours: "Fora da rotina de trabalho do professor. Aparece como espaço vazio.",
+  not_shared: "O professor ainda não partilhou a disponibilidade com este clube.",
+};
+
+/** Traduz uma linha da projeção no estado que a interface mostra. */
+export function clubCalendarStateFor(status: AvailabilityPublicStatus): ClubCalendarState {
+  return status === "available" ? "available" : "unavailable";
+}
+
 export type ClubCalendarMember = {
   /** `organization_members.id` — opaco e válido apenas dentro deste clube. */
   membershipId: string;
@@ -103,6 +139,9 @@ export function isClubCalendarEmpty(members: readonly ClubCalendarMember[]): boo
  * `sourceId`, `reason`, `category` nem `allDay` — não porque a interface os
  * ignore, mas porque não existem no contrato. Uma fuga futura teria de começar
  * por alguém acrescentar o campo aqui de propósito.
+ *
+ * A projeção só devolve segmentos com horas. "Fora do horário" nunca chega como
+ * linha: é a ausência dela.
  */
 export function toClubCalendarItems(
   periods: readonly ClubCalendarPeriod[],
@@ -115,26 +154,75 @@ export function toClubCalendarItems(
   }));
 }
 
+type Interval = { start: string; end: string };
+
+/** Une intervalos que se tocam ou sobrepõem. Assume horas `HH:MM:SS` comparáveis. */
+function mergeIntervals(intervals: readonly Interval[]): Interval[] {
+  const ordered = [...intervals].sort((left, right) => left.start.localeCompare(right.start));
+  const merged: Interval[] = [];
+
+  for (const interval of ordered) {
+    const last = merged[merged.length - 1];
+    if (last && interval.start <= last.end) {
+      if (interval.end > last.end) last.end = interval.end;
+    } else {
+      merged.push({ ...interval });
+    }
+  }
+
+  return merged;
+}
+
+/** `base` menos `holes`. Usado para não marcar como ocupado o que outro professor tem livre. */
+function subtractIntervals(base: readonly Interval[], holes: readonly Interval[]): Interval[] {
+  const result: Interval[] = [];
+
+  for (const interval of base) {
+    let segments: Interval[] = [{ ...interval }];
+
+    for (const hole of holes) {
+      const next: Interval[] = [];
+      for (const segment of segments) {
+        if (hole.end <= segment.start || hole.start >= segment.end) {
+          next.push(segment);
+          continue;
+        }
+        if (hole.start > segment.start) next.push({ start: segment.start, end: hole.start });
+        if (hole.end < segment.end) next.push({ start: hole.end, end: segment.end });
+      }
+      segments = next;
+    }
+
+    result.push(...segments);
+  }
+
+  return result;
+}
+
 /**
  * Junta os períodos de vários professores num único dia/hora.
  *
- * Quando o filtro está em "todos", o clube quer saber se ALGUÉM está
- * disponível. Sobrepor os períodos evita desenhar sete blocos idênticos e
- * evita sugerir exclusividade — que seria um estado de aula, e aulas não
- * existem nesta etapa.
+ * Em "Todos", a pergunta do clube é "há ALGUÉM disponível?". Por isso os
+ * períodos disponíveis são sobrepostos, e um horário só fica indisponível
+ * quando a janela de trabalho de alguém está bloqueada **e** mais ninguém está
+ * livre nesse momento. Sem esta subtração, o bloqueio de um professor
+ * escureceria uma hora em que um colega está disponível.
+ *
+ * Sobrepor evita ainda desenhar sete blocos idênticos e evita sugerir
+ * exclusividade — que seria um estado de aula, e aulas não existem nesta etapa.
  */
 export function mergeClubPeriods(
   periods: readonly ClubCalendarPeriod[],
 ): Array<{ date: string; startsAt: string | null; endsAt: string | null; status: AvailabilityPublicStatus }> {
-  const available = periods.filter(
-    (period) => period.status === "available" && period.startsAt && period.endsAt,
-  );
+  const availableByDate = new Map<string, Interval[]>();
+  const busyByDate = new Map<string, Interval[]>();
 
-  const byDate = new Map<string, Array<{ start: string; end: string }>>();
-  for (const period of available) {
-    const list = byDate.get(period.date) ?? [];
-    list.push({ start: period.startsAt as string, end: period.endsAt as string });
-    byDate.set(period.date, list);
+  for (const period of periods) {
+    if (!period.startsAt || !period.endsAt) continue;
+    const target = period.status === "available" ? availableByDate : busyByDate;
+    const list = target.get(period.date) ?? [];
+    list.push({ start: period.startsAt, end: period.endsAt });
+    target.set(period.date, list);
   }
 
   const merged: Array<{
@@ -144,27 +232,21 @@ export function mergeClubPeriods(
     status: AvailabilityPublicStatus;
   }> = [];
 
-  for (const [date, slots] of [...byDate.entries()].sort(([a], [b]) => a.localeCompare(b))) {
-    const ordered = [...slots].sort((left, right) => left.start.localeCompare(right.start));
-    let current = ordered[0];
-    if (!current) continue;
+  const allDates = new Set([...periods.map((period) => period.date)]);
 
-    for (const slot of ordered.slice(1)) {
-      if (slot.start <= current.end) {
-        if (slot.end > current.end) current = { start: current.start, end: slot.end };
-      } else {
-        merged.push({ date, startsAt: current.start, endsAt: current.end, status: "available" });
-        current = slot;
-      }
-    }
-    merged.push({ date, startsAt: current.start, endsAt: current.end, status: "available" });
-  }
+  for (const date of [...allDates].sort()) {
+    const available = mergeIntervals(availableByDate.get(date) ?? []);
+    const busy = subtractIntervals(mergeIntervals(busyByDate.get(date) ?? []), available);
 
-  const datesWithAvailability = new Set(merged.map((item) => item.date));
-  for (const date of new Set(periods.map((period) => period.date))) {
-    if (!datesWithAvailability.has(date)) {
-      merged.push({ date, startsAt: null, endsAt: null, status: "unavailable" });
+    for (const interval of available) {
+      merged.push({ date, startsAt: interval.start, endsAt: interval.end, status: "available" });
     }
+    for (const interval of busy) {
+      merged.push({ date, startsAt: interval.start, endsAt: interval.end, status: "unavailable" });
+    }
+
+    // Um dia sem nada a dizer não produz linha nenhuma: sem janela positiva,
+    // o dia inteiro é "fora do horário", e não "indisponível".
   }
 
   return merged.sort(

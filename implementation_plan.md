@@ -736,7 +736,20 @@ Gravar o mesmo valor devolve `false` e não repete a auditoria, que regista apen
 
 `get_club_availability_calendar(p_organization_id, p_start_date, p_end_date, p_membership_id)` devolve exatamente seis colunas: `membership_id`, `teacher_name`, `date`, `starts_at`, `ends_at`, `status`.
 
-Reaproveita o motor `resolve_teacher_availability_calendar_core()` da 5A/5B, mas só sobrevivem as linhas `available`. **Um bloqueio pessoal chega ao colega como ausência de disponibilidade** — indistinguível de não ter horário nesse período. Nunca são devolvidos `source`, `source_id`, `reason`, `category`, `all_day`, IDs de regra/exceção/bloqueio, `teacher_id`, `profile_id`, organização pessoal, autoria, email ou telefone.
+Nunca são devolvidos `source`, `source_id`, `reason`, `category`, `all_day`, IDs de regra/exceção/bloqueio, `teacher_id`, `profile_id`, organização pessoal, autoria, email ou telefone.
+
+**Os quatro estados:**
+
+| Estado | Representação |
+|---|---|
+| `available` | Linha `available` com horas |
+| `unavailable` | Linha `unavailable` com horas, só onde o servidor prova janela positiva ∩ bloqueio ativo |
+| `outside_hours` | Ausência de linha, incluindo dias inteiros sem rotina |
+| `not_shared` | Nenhuma linha, e `calendar_sharing_enabled = false` no diretório |
+
+A primeira versão devolvia apenas linhas `available`, e por isso um bloqueio privado e uma pausa de almoço ficavam representados da mesma maneira: ausência. Como a Etapa 5A representa a pausa de almoço exatamente como o espaço entre `09:00–13:00` e `15:00–20:00`, deduzir "buraco = ocupado" no cliente marcaria almoços como indisponibilidade — inventaria informação. A correção calcula a interseção no servidor, que é o único sítio onde as fronteiras das janelas são conhecidas.
+
+Para não duplicar regras, a precedência e o recorte de fuso passaram a viver em `resolve_teacher_availability_windows()` e `resolve_teacher_block_segments()`, e o motor original é construído a partir delas — comportamento público inalterado, confirmado pelas garantias já existentes do calendário do professor e do aluno.
 
 O contrato é próprio e não herda o contrato privado do professor, que transporta motivo e categoria: reaproveitá-lo seria arriscar que uma coluna futura passasse a ser partilhada por acidente.
 
@@ -752,9 +765,13 @@ Professor global ativo + membership `active` + `kind = 'club'` + `status = 'acti
 
 Reutiliza `AvailabilityCalendar` em vez de duplicar o calendário: o componente ganhou a audiência `club` e as verificações de privacidade passaram de `audience === "student"` para `audience !== "teacher"`, para que uma audiência futura nasça segura. `calendarHref()` passou a preservar a query já presente no `basePath` — uma alteração num único ponto, em vez de arrastar o filtro por seis subcomponentes de um ficheiro de 1229 linhas.
 
-#### Uma correção que a idempotência apanhou
+#### Duas correções que as verificações apanharam
 
 A primeira versão alargava `workspace_member_directory` com a coluna de partilha. A verificação de reaplicação falhou: a migração da 5B.2A recria essa view com `create or replace`, que recusa perder colunas. A view do calendário passou a ser própria — o que também é melhor desenho, porque o contrato do calendário deixa de herdar um contrato pensado para outra coisa.
+
+A revisão de encerramento encontrou a segunda: bloqueio e fora do horário eram indistinguíveis. Corrigida em `20260803000600_phase5_club_calendar_states.sql`, com a interseção calculada no servidor e uma legenda que nomeia os quatro estados.
+
+E a terceira, na leitura crítica do próprio relatório: a correção anterior mantinha um ramo que marcava o **dia inteiro** como `unavailable` sempre que não houvesse disponibilidade — contradizendo a regra que ela própria enunciava. Um dia sem rotina não tem janela positiva e é, por definição, fora do horário; e um dia sem rotina **com** bloqueio pessoal chegava a sinalizar ao colega que ali havia alguma coisa. `20260803000700_phase5_club_calendar_outside_hours.sql` remove esse ramo: a projeção passa a devolver exclusivamente segmentos com horas.
 
 #### Não implementado nesta etapa
 
