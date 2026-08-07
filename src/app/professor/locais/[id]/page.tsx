@@ -25,7 +25,7 @@ export default async function LocationDetailPage({ params }: { params: Promise<{
   const [locationResult, organizationResult] = await Promise.all([
     supabase
       .from("teacher_location_records")
-      .select("id, teacher_id, name, address, city, internal_reference, notes, is_active, can_manage")
+      .select("id, teacher_id, name, address, city, country, postal_code, internal_reference, notes, is_active, can_manage, visibility, moderation_status, moderation_reason")
       .eq("id", parsed.data.locationId)
       .maybeSingle(),
     user.profile.organization_id
@@ -66,7 +66,7 @@ export default async function LocationDetailPage({ params }: { params: Promise<{
 
       <div className="grid items-start gap-6 xl:grid-cols-2">
         {location.can_manage ? (
-          <LocationForm mode="edit" values={{ id: location.id, name: location.name, address: location.address, city: location.city, internalReference: location.internal_reference, notes: location.notes }} />
+          <LocationForm mode="edit" values={{ id: location.id, name: location.name, address: location.address, city: location.city, country: location.country, postalCode: location.postal_code, internalReference: location.internal_reference, notes: location.notes }} />
         ) : (
           <Card variant="plain">
             <CardHeader title="Dados do local" description="Informação partilhada na organização, em modo de consulta." />

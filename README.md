@@ -57,14 +57,14 @@ Instruções completas — incluindo a configuração do Supabase — em [`AGENT
 - Pacotes, saldos disponíveis/reservados/utilizados e livro-razão append-only
 - RPCs PostgreSQL para atribuir, reservar, consumir, libertar, reagendar, ajustar e corrigir créditos
 - RPCs PostgreSQL para guardar preferências, horários semanais, exceções, bloqueios e resolução segura de disponibilidade
-- Regras e validação com 349 testes de unidade/regressão
-- 491 verificações PostgreSQL sobre migrações, permissões, RLS, gestão, claim, modelos, atribuição, consulta, ajustes administrativos, disponibilidade, calendário seguro, clubes, memberships, convites, contexto ativo, consentimento de partilha, calendário partilhado, grants de views e saldos
-- 184 verificações Auth/PostgREST reais no Supabase de desenvolvimento
+- Regras e validação com 373 testes de unidade/regressão
+- 537 verificações PostgreSQL sobre migrações, permissões, RLS, gestão, claim, modelos, atribuição, consulta, ajustes administrativos, disponibilidade, calendário seguro, clubes, memberships, convites, contexto ativo, consentimento de partilha, calendário partilhado, grants de views e saldos
+- 209 verificações Auth/PostgREST reais no Supabase de desenvolvimento
 - Estrutura responsiva das áreas de professor, aluno e administração, com manifesto e ícones PWA
 
 `/professor/clubes` gere contextos, clubes e membros; `/professor/clubes/[id]/calendario` mostra a disponibilidade partilhada do clube; `/professor/convites` mostra os convites recebidos. `/professor/pacotes` gere modelos reutilizáveis, atribuição, consulta e ajustes administrativos dos pacotes atribuídos. `/professor/pacotes/historico` mostra a auditoria global. `/professor/definicoes/disponibilidade` guarda a fonte de verdade da agenda do professor. `/professor/calendario` e `/aluno/calendario` mostram disponibilidade calculada em Dia/Semana/Mês; ainda não criam aulas. `/aluno/pacotes` mostra apenas os próprios pacotes e movimentos básicos.
 
-O próximo passo planeado da Fase 5 é a **Etapa 5B.3 — locais, campos e Google Places**. O professor independente continua totalmente suportado, com workspace pessoal privado e agenda própria, e não precisa criar clube nenhum.
+O próximo passo planeado da Fase 5 é a **Etapa 5B.3B — campos e recursos**. O professor independente continua totalmente suportado, com workspace pessoal privado e agenda própria, e não precisa criar clube nenhum.
 
 Entrar num clube **não** partilha a agenda: `calendar_sharing_enabled` nasce desativado e só o próprio membro o altera — proprietários, gestores e a administração da plataforma não têm caminho para forçar a partilha de outra pessoa. Mudar de contexto também ainda **não** torna alunos, pacotes, turmas, locais e disponibilidade multi-clube; esses módulos continuam ligados ao workspace pessoal, e a interface diz isso explicitamente em vez de o esconder. Não existem aulas, participantes, reservas nem conflitos nesta etapa.
 

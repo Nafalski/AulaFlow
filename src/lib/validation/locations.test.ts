@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  LOCATION_FORM_FIELDS,
+  locationCreateSchema,
+  locationModerationSchema,
   locationFiltersSchema,
   locationFormSchema,
   locationStatusSchema,
   readLocationFormData,
-  unexpectedLocationFormFields,
+  unexpectedLocationFields,
 } from "./locations";
 
 describe("locationFormSchema", () => {
@@ -20,6 +23,8 @@ describe("locationFormSchema", () => {
       }),
     ).toEqual({
       name: "Clube Praia",
+      country: null,
+      postalCode: null,
       address: "Rua do Mar 1",
       city: "Costa da Caparica",
       internalReference: "Campo B",
@@ -56,7 +61,7 @@ describe("locationFormSchema", () => {
     formData.set("isActive", "false");
 
     expect(readLocationFormData(formData).name).toBe("Local");
-    expect(unexpectedLocationFormFields(formData, false)).toEqual([
+    expect(unexpectedLocationFields(formData, LOCATION_FORM_FIELDS)).toEqual([
       "organizationId",
       "teacherId",
       "isActive",
@@ -69,6 +74,7 @@ describe("locationFiltersSchema", () => {
     expect(locationFiltersSchema.parse({ search: "  campo   azul ", status: "inactive" })).toEqual({
       search: "campo azul",
       status: "inactive",
+      scope: "all",
     });
     expect(locationFiltersSchema.safeParse({ search: "", status: "deleted" }).success).toBe(false);
     expect(
@@ -85,5 +91,125 @@ describe("locationFiltersSchema", () => {
         confirmed: true,
       }).success,
     ).toBe(false);
+  });
+});
+
+describe("locationCreateSchema", () => {
+  const KEY = "11111111-1111-4111-8111-111111111111";
+  const CLUB = "22222222-2222-4222-8222-222222222222";
+
+  it("aceita um local privado sem clube", () => {
+    const parsed = locationCreateSchema.parse({
+      name: "Campo A",
+      visibility: "private",
+      organizationId: "",
+      idempotencyKey: KEY,
+    });
+    expect(parsed.visibility).toBe("private");
+    expect(parsed.organizationId).toBeNull();
+  });
+
+  it("exige clube quando a visibilidade é «do clube»", () => {
+    expect(
+      locationCreateSchema.safeParse({
+        name: "Campo A",
+        visibility: "club",
+        organizationId: "",
+        idempotencyKey: KEY,
+      }).success,
+    ).toBe(false);
+
+    expect(
+      locationCreateSchema.safeParse({
+        name: "Campo A",
+        visibility: "club",
+        organizationId: CLUB,
+        idempotencyKey: KEY,
+      }).success,
+    ).toBe(true);
+  });
+
+  it("exige chave de idempotência válida", () => {
+    expect(
+      locationCreateSchema.safeParse({ name: "Campo A", visibility: "private", idempotencyKey: "x" })
+        .success,
+    ).toBe(false);
+  });
+
+  it("recusa visibilidades inventadas", () => {
+    expect(
+      locationCreateSchema.safeParse({
+        name: "Campo A",
+        visibility: "secreto",
+        idempotencyKey: KEY,
+      }).success,
+    ).toBe(false);
+  });
+
+  // Autoria, moderação e proprietário são derivados no servidor.
+  it("recusa campos protegidos vindos do formulário", () => {
+    for (const extra of [
+      { createdBy: KEY },
+      { teacherId: KEY },
+      { moderationStatus: "approved" },
+      { moderatedBy: KEY },
+      { addressSource: "google" },
+      { isActive: "true" },
+    ]) {
+      expect(
+        locationCreateSchema.safeParse({
+          name: "Campo A",
+          visibility: "private",
+          idempotencyKey: KEY,
+          ...extra,
+        }).success,
+      ).toBe(false);
+    }
+  });
+});
+
+describe("locationModerationSchema", () => {
+  const ID = "33333333-3333-4333-8333-333333333333";
+
+  it("aprova sem motivo", () => {
+    expect(
+      locationModerationSchema.safeParse({ locationId: ID, decision: "approved", confirmed: true })
+        .success,
+    ).toBe(true);
+  });
+
+  it("exige motivo ao rejeitar", () => {
+    expect(
+      locationModerationSchema.safeParse({
+        locationId: ID,
+        decision: "rejected",
+        reason: "",
+        confirmed: true,
+      }).success,
+    ).toBe(false);
+
+    expect(
+      locationModerationSchema.safeParse({
+        locationId: ID,
+        decision: "rejected",
+        reason: "Morada insuficiente",
+        confirmed: true,
+      }).success,
+    ).toBe(true);
+  });
+
+  it("exige confirmação explícita", () => {
+    expect(
+      locationModerationSchema.safeParse({ locationId: ID, decision: "approved", confirmed: false })
+        .success,
+    ).toBe(false);
+  });
+
+  it("só aceita aprovar ou rejeitar", () => {
+    for (const decision of ["pending", "not_required", "verified"]) {
+      expect(
+        locationModerationSchema.safeParse({ locationId: ID, decision, confirmed: true }).success,
+      ).toBe(false);
+    }
   });
 });

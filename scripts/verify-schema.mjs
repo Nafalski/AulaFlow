@@ -3831,24 +3831,37 @@ await asDatabaseRole("authenticated", TEACHER_UID, () =>
 );
 check(!deactivatedGroup.is_active, "turma é arquivada sem eliminação definitiva");
 
+// A escrita de locais passou a ser exclusivamente por RPC na Etapa 5B.3A.
 const managedLocation = await asDatabaseRole("authenticated", TEACHER_UID, () =>
   one(
-    `insert into public.locations
-       (organization_id, teacher_id, name, address, city, internal_reference, notes)
-     values ($1,$2,'Campo Fase 3','Rua do Desporto, 10','Lisboa','Court A',
-             'Acesso pela receção')
-     returning id, name, city`,
-    [org, teacher.id],
+    `select public.create_location(
+       p_name => 'Campo Fase 3',
+       p_visibility => 'private',
+       p_address => 'Rua do Desporto, 10',
+       p_city => 'Lisboa',
+       p_internal_reference => 'Court A',
+       p_notes => 'Acesso pela receção',
+       p_idempotency_key => $1::uuid
+     ) as id`,
+    [randomUUID()],
   ),
 );
-const updatedManagedLocation = await asDatabaseRole("authenticated", TEACHER_UID, () =>
-  one(
-    `update public.locations
-        set name='Campo Fase 3 atualizado', address='Avenida do Desporto, 20',
-            city='Oeiras', internal_reference='Court B', notes='Levar bolas próprias'
-      where id=$1 returning id, name, city`,
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(
+    `select public.update_location(
+       p_location_id => $1,
+       p_name => 'Campo Fase 3 atualizado',
+       p_address => 'Avenida do Desporto, 20',
+       p_city => 'Oeiras',
+       p_internal_reference => 'Court B',
+       p_notes => 'Levar bolas próprias'
+     )`,
     [managedLocation.id],
   ),
+);
+const updatedManagedLocation = await one(
+  `select id, name, city from public.locations where id=$1`,
+  [managedLocation.id],
 );
 const managedLocationRecord = await asDatabaseRole("authenticated", TEACHER_UID, () =>
   one(
@@ -3866,11 +3879,14 @@ check(
   "professor cria e edita um local próprio com dados administrativos",
 );
 
+// Local herdado da organização, sem responsável individual — como os que a
+// retrocompatibilidade da Fase 3 deixou em organizações com vários professores.
 const sharedLocation = await one(
   `insert into public.locations
-     (organization_id, teacher_id, name, address, city, internal_reference, notes)
+     (organization_id, teacher_id, name, address, city, internal_reference, notes,
+      visibility, moderation_status)
    values ($1,null,'Campo partilhado','Rua Comum, 1','Lisboa','SHARED-01',
-           'Nota da organização')
+           'Nota da organização','private','not_required')
    returning id`,
   [org],
 );
@@ -3881,13 +3897,14 @@ const sharedLocationRecord = await asDatabaseRole("authenticated", TEACHER_UID, 
     [sharedLocation.id],
   ),
 );
-const sharedLocationUpdate = await asDatabaseRole("authenticated", TEACHER_UID, () =>
-  rows(`update public.locations set name='Apropriação indevida' where id=$1 returning id`, [
-    sharedLocation.id,
-  ]),
+await mustReject("professor não se apropria de um local herdado da organização", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.update_location($1, 'Apropriação indevida')`, [sharedLocation.id]),
+  ),
 );
+const sharedLocationUpdate = [];
 
-await mustReject("professor não troca organização nem proprietário do local", () =>
+await mustReject("professor não escreve diretamente na tabela de locais", () =>
   asDatabaseRole("authenticated", TEACHER_UID, () =>
     db.query(`update public.locations set organization_id=$1, teacher_id=$2 where id=$3`, [
       otherTeacher.organization_id,
@@ -3911,14 +3928,12 @@ const locationHiddenFromExternalTeacher = await asDatabaseRole(
   OTHER_TEACHER_UID,
   () => rows(`select id from public.teacher_location_records where id=$1`, [managedLocation.id]),
 );
-const locationUpdateFromColleague = await asDatabaseRole(
-  "authenticated",
-  SAME_ORG_TEACHER_UID,
-  () =>
-    rows(`update public.locations set name='Intrusão do colega' where id=$1 returning id`, [
-      managedLocation.id,
-    ]),
+await mustReject("colega da mesma organização não edita o local de outro professor", () =>
+  asDatabaseRole("authenticated", SAME_ORG_TEACHER_UID, () =>
+    db.query(`select public.update_location($1, 'Intrusão do colega')`, [managedLocation.id]),
+  ),
 );
+const locationUpdateFromColleague = [];
 const locationVisibleToStudent = await asDatabaseRole("authenticated", ANA_UID, () =>
   one(`select id, name, address, city from public.locations where id=$1`, [managedLocation.id]),
 );
@@ -3932,11 +3947,12 @@ await mustReject("aluno não lê a referência interna do local", () =>
     db.query(`select internal_reference from public.locations where id=$1`, [managedLocation.id]),
   ),
 );
-const studentLocationUpdate = await asDatabaseRole("authenticated", ANA_UID, () =>
-  rows(`update public.locations set name='Alteração indevida' where id=$1 returning id`, [
-    managedLocation.id,
-  ]),
+await mustReject("aluno não edita locais", () =>
+  asDatabaseRole("authenticated", ANA_UID, () =>
+    db.query(`select public.update_location($1, 'Alteração indevida')`, [managedLocation.id]),
+  ),
 );
+const studentLocationUpdate = [];
 check(
   sharedLocationRecord?.id === sharedLocation.id &&
     sharedLocationRecord.name === "Campo partilhado" &&
@@ -3962,7 +3978,7 @@ await mustReject("cliente autenticado não apaga um local", () =>
   ),
 );
 await asDatabaseRole("authenticated", TEACHER_UID, () =>
-  db.query(`update public.locations set is_active=false where id=$1`, [managedLocation.id]),
+  db.query(`select public.set_location_active($1, false)`, [managedLocation.id]),
 );
 const deactivatedLocation = await one(`select is_active from public.locations where id=$1`, [
   managedLocation.id,
@@ -6545,6 +6561,485 @@ const ambiguousClubFunctions = await rows(
    having count(*) > 1`,
 );
 check(ambiguousClubFunctions.length === 0, "as RPCs do calendário do clube têm assinatura única");
+
+// ── Domínio de locais (Etapa 5B.3A) ──────────────────────────────────────────
+
+section("Locais: âmbito, clube e moderação");
+
+const legacyLocation = await one(
+  `select visibility::text, moderation_status::text, address_source::text, created_by
+     from public.locations where id=$1`,
+  [managedLocation.id],
+);
+check(
+  legacyLocation.visibility === "private" &&
+    legacyLocation.moderation_status === "not_required" &&
+    legacyLocation.address_source === "manual" &&
+    legacyLocation.created_by === TEACHER_UID,
+  "local existente fica privado, sem moderação e com morada marcada como manual",
+);
+
+// ── Local de clube ──────────────────────────────────────────────────────────
+
+const clubLocation = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.create_location(
+       p_name => 'Pavilhão do Clube',
+       p_visibility => 'club',
+       p_address => 'Rua do Clube, 5',
+       p_city => 'Lisboa',
+       p_country => 'Portugal',
+       p_postal_code => '1000-001',
+       p_organization_id => $1,
+       p_idempotency_key => $2::uuid
+     ) as id`,
+    [clubA.id, randomUUID()],
+  ),
+);
+const clubLocationRow = await one(
+  `select organization_id, teacher_id, visibility::text, moderation_status::text
+     from public.locations where id=$1`,
+  [clubLocation.id],
+);
+check(
+  clubLocationRow.organization_id === clubA.id &&
+    clubLocationRow.teacher_id === null &&
+    clubLocationRow.visibility === "club" &&
+    clubLocationRow.moderation_status === "not_required",
+  "local de clube pertence ao clube, sem professor responsável nem moderação",
+);
+
+const clubLocationKey = randomUUID();
+const clubLocationOnce = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.create_location(
+       p_name => 'Pavilhão Idempotente', p_visibility => 'club',
+       p_organization_id => $1, p_idempotency_key => $2::uuid) as id`,
+    [clubA.id, clubLocationKey],
+  ),
+);
+const clubLocationTwice = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.create_location(
+       p_name => 'Pavilhão Idempotente', p_visibility => 'club',
+       p_organization_id => $1, p_idempotency_key => $2::uuid) as id`,
+    [clubA.id, clubLocationKey],
+  ),
+);
+check(
+  clubLocationOnce.id === clubLocationTwice.id,
+  "repetir a criação com a mesma chave não cria dois locais",
+);
+
+await mustReject("professor sem membership não cria local no clube", () =>
+  asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+    db.query(
+      `select public.create_location(
+         p_name => 'Intruso', p_visibility => 'club',
+         p_organization_id => $1, p_idempotency_key => $2::uuid)`,
+      [clubA.id, randomUUID()],
+    ),
+  ),
+);
+await mustReject("proprietário do Clube A não cria local no Clube B", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(
+      `select public.create_location(
+         p_name => 'Cruzado', p_visibility => 'club',
+         p_organization_id => $1, p_idempotency_key => $2::uuid)`,
+      [clubC.id, randomUUID()],
+    ),
+  ),
+);
+await mustReject("local de clube não pode viver num workspace pessoal", () =>
+  db.query(
+    `insert into public.locations (organization_id, name, visibility, moderation_status)
+     values ($1,'Fora de sítio','club','not_required')`,
+    [org],
+  ),
+);
+
+const clubLocationForOutsider = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  rows(`select id from public.teacher_location_records where id=$1`, [clubLocation.id]),
+);
+check(
+  clubLocationForOutsider.length === 0,
+  "professor de fora do clube não vê o local do clube",
+);
+
+// Membro com papel `teacher` consulta, mas não administra.
+const memberInvite = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select public.invite_workspace_member($1,'outro.prof@exemplo.pt','teacher',$2) as id`, [
+    clubA.id,
+    randomUUID(),
+  ]),
+);
+const memberMembership = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  one(`select public.accept_workspace_invitation($1) as id`, [memberInvite.id]),
+);
+const clubLocationForMember = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  one(
+    `select id, name, can_manage, internal_reference, notes
+       from public.teacher_location_records where id=$1`,
+    [clubLocation.id],
+  ),
+);
+check(
+  clubLocationForMember?.id === clubLocation.id && clubLocationForMember.can_manage === false,
+  "membro com papel teacher consulta o local do clube mas não o administra",
+);
+await mustReject("membro com papel teacher não edita o local do clube", () =>
+  asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+    db.query(`select public.update_location($1, 'Renomeado por membro')`, [clubLocation.id]),
+  ),
+);
+await mustReject("membro com papel teacher não desativa o local do clube", () =>
+  asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+    db.query(`select public.set_location_active($1, false)`, [clubLocation.id]),
+  ),
+);
+
+// Promovido a gestor, passa a administrar — e volta a perder o acesso ao sair.
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(`select public.update_workspace_member_role($1,'manager')`, [memberMembership.id]),
+);
+const managerEdit = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  one(`select public.update_location($1, 'Pavilhão do Clube renomeado') as done`, [
+    clubLocation.id,
+  ]),
+);
+check(managerEdit.done === true, "gestor do clube edita o local do clube");
+
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(`select public.remove_workspace_member($1)`, [memberMembership.id]),
+);
+const clubLocationAfterRemoval = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  rows(`select id from public.teacher_location_records where id=$1`, [clubLocation.id]),
+);
+check(
+  clubLocationAfterRemoval.length === 0,
+  "membership removida perde imediatamente o acesso aos locais do clube",
+);
+
+// ── Proposta pública e moderação ────────────────────────────────────────────
+
+const publicSuggestion = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.create_location(
+       p_name => 'Parque Municipal',
+       p_visibility => 'public',
+       p_address => 'Alameda Central, 1',
+       p_city => 'Lisboa',
+       p_country => 'Portugal',
+       p_idempotency_key => $1::uuid
+     ) as id`,
+    [randomUUID()],
+  ),
+);
+const suggestionRow = await one(
+  `select visibility::text, moderation_status::text, moderated_by, organization_id, teacher_id
+     from public.locations where id=$1`,
+  [publicSuggestion.id],
+);
+check(
+  suggestionRow.moderation_status === "pending" &&
+    suggestionRow.moderated_by === null &&
+    suggestionRow.organization_id === org &&
+    suggestionRow.teacher_id === teacher.id,
+  "proposta pública nasce pendente, sem moderador, no workspace pessoal de quem propõe",
+);
+
+const suggestionForOtherTeacher = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  rows(`select id from public.teacher_location_records where id=$1`, [publicSuggestion.id]),
+);
+check(
+  suggestionForOtherTeacher.length === 0,
+  "proposta pública pendente ainda não é visível para os outros professores",
+);
+
+await mustReject("professor não modera a própria proposta", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.admin_moderate_location($1,'approved',null)`, [publicSuggestion.id]),
+  ),
+);
+await mustReject("rejeitar sem motivo é recusado", () =>
+  asDatabaseRole("authenticated", ADMIN_UID, () =>
+    db.query(`select public.admin_moderate_location($1,'rejected',null)`, [publicSuggestion.id]),
+  ),
+);
+await mustReject("moderação só aprova ou rejeita", () =>
+  asDatabaseRole("authenticated", ADMIN_UID, () =>
+    db.query(`select public.admin_moderate_location($1,'pending',null)`, [publicSuggestion.id]),
+  ),
+);
+await mustReject("um local privado não passa por moderação", () =>
+  asDatabaseRole("authenticated", ADMIN_UID, () =>
+    db.query(`select public.admin_moderate_location($1,'approved',null)`, [managedLocation.id]),
+  ),
+);
+
+const approved = await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  one(`select public.admin_moderate_location($1,'approved',null) as done`, [publicSuggestion.id]),
+);
+const approvedAgain = await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  one(`select public.admin_moderate_location($1,'approved',null) as done`, [publicSuggestion.id]),
+);
+check(
+  approved.done === true && approvedAgain.done === false,
+  "aprovar funciona e repetir a mesma decisão é idempotente",
+);
+check(
+  (await auditCount("location.approved", publicSuggestion.id)) === 1,
+  "aprovar duas vezes não duplica a auditoria",
+);
+
+const approvedForOtherTeacher = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  one(
+    `select id, name, can_manage, internal_reference, notes
+       from public.teacher_location_records where id=$1`,
+    [publicSuggestion.id],
+  ),
+);
+check(
+  approvedForOtherTeacher?.id === publicSuggestion.id &&
+    approvedForOtherTeacher.can_manage === false &&
+    approvedForOtherTeacher.internal_reference === null &&
+    approvedForOtherTeacher.notes === null,
+  "local público aprovado fica visível a qualquer professor, sem dados administrativos",
+);
+
+const rejectedSuggestion = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.create_location(
+       p_name => 'Local Duvidoso', p_visibility => 'public',
+       p_city => 'Lisboa', p_idempotency_key => $1::uuid) as id`,
+    [randomUUID()],
+  ),
+);
+await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  db.query(`select public.admin_moderate_location($1,'rejected','Morada insuficiente')`, [
+    rejectedSuggestion.id,
+  ]),
+);
+const rejectedRow = await one(
+  `select moderation_status::text, moderation_reason, moderated_by from public.locations where id=$1`,
+  [rejectedSuggestion.id],
+);
+check(
+  rejectedRow.moderation_status === "rejected" &&
+    rejectedRow.moderation_reason === "Morada insuficiente" &&
+    rejectedRow.moderated_by === ADMIN_UID,
+  "rejeitar guarda motivo e autoria",
+);
+const rejectedForOtherTeacher = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  rows(`select id from public.teacher_location_records where id=$1`, [rejectedSuggestion.id]),
+);
+check(
+  rejectedForOtherTeacher.length === 0,
+  "local rejeitado não fica visível para os outros professores",
+);
+
+const moderationQueue = await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  rows(
+    `select id, moderation_status::text, possible_duplicates
+       from public.admin_location_moderation_records order by created_at`,
+  ),
+);
+check(
+  moderationQueue.some((row) => row.id === publicSuggestion.id) &&
+    moderationQueue.every((row) => row.id !== managedLocation.id),
+  "a fila de moderação mostra propostas públicas e nunca locais privados",
+);
+
+const teacherSeesModerationQueue = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  rows(`select id from public.admin_location_moderation_records`),
+);
+check(
+  teacherSeesModerationQueue.length === 0,
+  "professor não lê a fila de moderação de locais",
+);
+
+// ── Isolamento e contas sem acesso ──────────────────────────────────────────
+
+const privateForOtherTeacher = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  rows(`select id from public.teacher_location_records where id=$1`, [managedLocation.id]),
+);
+check(
+  privateForOtherTeacher.length === 0,
+  "professor de outra organização não vê o local privado alheio",
+);
+
+await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  db.query(`select public.admin_set_account_status($1,'blocked','Teste de locais')`, [
+    OTHER_TEACHER_UID,
+  ]),
+);
+const blockedLocations = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  rows(`select id from public.teacher_location_records`),
+);
+check(blockedLocations.length === 0, "conta bloqueada não lê locais");
+await mustReject("conta bloqueada não cria locais", () =>
+  asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+    db.query(
+      `select public.create_location(
+         p_name => 'Bloqueado', p_visibility => 'private', p_idempotency_key => $1::uuid)`,
+      [randomUUID()],
+    ),
+  ),
+);
+await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  db.query(`select public.admin_set_account_status($1,'active',null)`, [OTHER_TEACHER_UID]),
+);
+
+await mustReject("anónimo não lê locais", () =>
+  asDatabaseRole("anon", null, () => db.query(`select id from public.locations limit 1`)),
+);
+await mustReject("anónimo não lê a projeção de locais", () =>
+  asDatabaseRole("anon", null, () =>
+    db.query(`select id from public.teacher_location_records limit 1`),
+  ),
+);
+await mustReject("anónimo não cria locais", () =>
+  asDatabaseRole("anon", null, () =>
+    db.query(
+      `select public.create_location(
+         p_name => 'Anónimo', p_visibility => 'private', p_idempotency_key => $1::uuid)`,
+      [randomUUID()],
+    ),
+  ),
+);
+await mustReject("aluno não cria locais", () =>
+  asDatabaseRole("authenticated", ANA_UID, () =>
+    db.query(
+      `select public.create_location(
+         p_name => 'Do aluno', p_visibility => 'private', p_idempotency_key => $1::uuid)`,
+      [randomUUID()],
+    ),
+  ),
+);
+
+// ── Clube suspenso ──────────────────────────────────────────────────────────
+
+await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  db.query(`select public.admin_set_workspace_status($1,'suspended','Teste de locais')`, [
+    clubA.id,
+  ]),
+);
+await mustReject("clube suspenso não aceita novos locais", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(
+      `select public.create_location(
+         p_name => 'Durante suspensão', p_visibility => 'club',
+         p_organization_id => $1, p_idempotency_key => $2::uuid)`,
+      [clubA.id, randomUUID()],
+    ),
+  ),
+);
+await mustReject("clube suspenso não permite editar os seus locais", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.update_location($1, 'Durante suspensão')`, [clubLocation.id]),
+  ),
+);
+await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  db.query(`select public.admin_set_workspace_status($1,'active',null)`, [clubA.id]),
+);
+
+// ── Grants e privacidade ────────────────────────────────────────────────────
+
+const locationWriteGrants = await rows(
+  `select privilege_type
+     from information_schema.table_privileges
+    where table_schema='public' and table_name='locations'
+      and grantee in ('authenticated','anon')
+      and privilege_type in ('INSERT','UPDATE','DELETE','TRUNCATE')`,
+);
+check(
+  locationWriteGrants.length === 0,
+  "cliente autenticado não escreve diretamente na tabela de locais",
+);
+
+const locationPrivateColumnGrants = await rows(
+  `select column_name
+     from information_schema.column_privileges
+    where table_schema='public' and table_name='locations'
+      and grantee in ('authenticated','anon')
+      and column_name in ('internal_reference','notes','created_by','moderated_by',
+                          'moderation_reason','creation_idempotency_key')`,
+);
+check(
+  locationPrivateColumnGrants.length === 0,
+  "observações, autoria e moderação ficam fora do SELECT partilhado de locais",
+);
+
+const locationViewAnonGrants = await rows(
+  `select table_name
+     from information_schema.table_privileges
+    where table_schema='public'
+      and table_name in ('teacher_location_records','admin_location_moderation_records')
+      and grantee in ('anon','PUBLIC')`,
+);
+check(locationViewAnonGrants.length === 0, "anon não tem privilégios nas projeções de locais");
+
+const locationFunctionPrivileges = await rows(
+  `select proc.proname
+     from pg_proc proc
+     join pg_namespace ns on ns.oid = proc.pronamespace
+    where ns.nspname='public'
+      and proc.proname in ('create_location','update_location','set_location_active',
+                           'admin_moderate_location','can_manage_location')
+      and has_function_privilege('anon', proc.oid, 'EXECUTE')`,
+);
+check(locationFunctionPrivileges.length === 0, "anon não executa nenhuma RPC de locais");
+
+const internalLocationFunctions = await rows(
+  `select proc.proname
+     from pg_proc proc
+     join pg_namespace ns on ns.oid = proc.pronamespace
+    where ns.nspname='public'
+      and proc.proname in ('log_location_event','validate_location_scope')
+      and (has_function_privilege('authenticated', proc.oid, 'EXECUTE')
+           or has_function_privilege('anon', proc.oid, 'EXECUTE'))`,
+);
+check(
+  internalLocationFunctions.length === 0,
+  "funções internas de locais não são executáveis pelo cliente",
+);
+
+const locationSearchPath = await rows(
+  `select proc.proname
+     from pg_proc proc
+     join pg_namespace ns on ns.oid = proc.pronamespace
+    where ns.nspname='public'
+      and proc.proname in ('create_location','update_location','set_location_active',
+                           'admin_moderate_location','can_manage_location',
+                           'log_location_event','validate_location_scope')
+      and not exists (
+        select 1 from unnest(coalesce(proc.proconfig, array[]::text[])) as config
+        where config like 'search_path=%'
+      )`,
+);
+check(locationSearchPath.length === 0, "todas as funções de locais fixam search_path");
+
+const locationEnums = await rows(
+  `select typname from pg_type
+    where typname in ('location_visibility','location_moderation_status','location_address_source')`,
+);
+check(locationEnums.length === 3, "os três tipos enumerados de locais existem");
+
+await mustReject("a base recusa moderação num local não público", () =>
+  db.query(
+    `update public.locations set moderation_status='approved', moderated_by=$1, moderated_at=now()
+      where id=$2`,
+    [ADMIN_UID, managedLocation.id],
+  ),
+);
+await mustReject("a base recusa rejeição sem motivo", () =>
+  db.query(
+    `update public.locations set moderation_status='rejected', moderated_by=$1, moderated_at=now()
+      where id=$2`,
+    [ADMIN_UID, publicSuggestion.id],
+  ),
+);
 
 section("Aulas (Fase 1)");
 

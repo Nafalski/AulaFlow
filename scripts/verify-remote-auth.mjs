@@ -1597,6 +1597,250 @@ try {
       .eq("organization_id", clubId),
   );
 
+  section("Locais");
+
+  // Chave determinística: o local E2E é reutilizado entre execuções em vez de
+  // encher o ambiente de duplicados.
+  const privateLocationKey = deterministicUuid(`location-private:${runId}`);
+  const clubLocationKey = deterministicUuid(`location-club:${runId}`);
+
+  const { data: privateLocationId, error: privateLocationError } = await teacherClient.rpc(
+    "create_location",
+    {
+      p_name: `Campo privado E2E ${runId}`,
+      p_visibility: "private",
+      p_address: "Rua do Desporto, 10",
+      p_city: "Lisboa",
+      p_country: "Portugal",
+      p_postal_code: "1000-001",
+      p_internal_reference: "Court A",
+      p_notes: "Nota administrativa E2E",
+      p_organization_id: null,
+      p_idempotency_key: privateLocationKey,
+    },
+  );
+  if (privateLocationError) {
+    throw new Error(`Criar local privado: ${summarizeError(privateLocationError)}`);
+  }
+  ok(`Professor A criou ou reutilizou o local privado E2E (${maskId(privateLocationId)})`);
+  void clubLocationKey;
+
+  const { data: privateLocationRepeat } = await teacherClient.rpc("create_location", {
+    p_name: `Campo privado E2E ${runId}`,
+    p_visibility: "private",
+    p_organization_id: null,
+    p_idempotency_key: privateLocationKey,
+  });
+  check(
+    privateLocationRepeat === privateLocationId,
+    "Criar local com a mesma chave e idempotente",
+  );
+
+  const privateLocationRecord = await getSingle(
+    "local privado",
+    teacherClient
+      .from("teacher_location_records")
+      .select(
+        "id, name, visibility, moderation_status, address_source, can_manage, is_mine, internal_reference, notes",
+      )
+      .eq("id", privateLocationId),
+  );
+  check(
+    privateLocationRecord.visibility === "private" &&
+      privateLocationRecord.moderation_status === "not_required" &&
+      privateLocationRecord.address_source === "manual" &&
+      privateLocationRecord.can_manage === true,
+    "Local privado nasce sem moderacao, com morada manual e gerivel pelo dono",
+  );
+
+  await mustReturnNoRows("Professor B nao ve o local privado do Professor A", () =>
+    teacherBClient.from("teacher_location_records").select("id").eq("id", privateLocationId),
+  );
+  await mustReject("Professor B nao edita o local privado do Professor A", async () =>
+    teacherBClient.rpc("update_location", {
+      p_location_id: privateLocationId,
+      p_name: "Apropriacao indevida",
+    }),
+  );
+  await mustReject("Professor nao escreve diretamente na tabela de locais", async () =>
+    teacherClient.from("locations").update({ name: "Escrita direta" }).eq("id", privateLocationId),
+  );
+  await mustReject("Professor nao insere diretamente na tabela de locais", async () =>
+    teacherClient.from("locations").insert({ name: "Insercao direta" }),
+  );
+
+  // Local de clube: o Professor A e proprietario do clube E2E.
+  const { data: clubLocationId, error: clubLocationError } = await teacherClient.rpc(
+    "create_location",
+    {
+      p_name: `Pavilhao do clube E2E ${runId}`,
+      p_visibility: "club",
+      p_city: "Lisboa",
+      p_organization_id: clubId,
+      p_idempotency_key: clubLocationKey,
+    },
+  );
+  if (clubLocationError) {
+    throw new Error(`Criar local do clube: ${summarizeError(clubLocationError)}`);
+  }
+
+  await mustReject("Professor sem membership nao cria local no clube", async () =>
+    teacherBClient.rpc("create_location", {
+      p_name: "Intruso",
+      p_visibility: "club",
+      p_organization_id: clubId,
+      p_idempotency_key: deterministicUuid(`location-club-forbidden:${runId}`),
+    }),
+  );
+  await mustReturnNoRows("Professor de fora do clube nao ve o local do clube", () =>
+    teacherBClient.from("teacher_location_records").select("id").eq("id", clubLocationId),
+  );
+
+  // Proposta publica e moderacao real.
+  //
+  // Chave e nome deterministicos: `unique (organization_id, name)` recusaria um
+  // nome repetido, e uma chave nova por execucao criaria um local novo com o
+  // mesmo nome. A proposta e reutilizada entre execucoes, e a asercao do estado
+  // inicial so corre quando ela e mesmo criada agora.
+  const suggestionKey = deterministicUuid(`location-public:${runId}`);
+  const suggestionName = `Parque publico E2E ${runId}`;
+
+  // `unique (organization_id, name)` impede recriar a proposta. Reutiliza-se a
+  // existente — o mesmo padrao ja usado para o modelo de pacote E2E.
+  const existingSuggestion = await maybeSingle(
+    "proposta publica existente",
+    teacherClient
+      .from("teacher_location_records")
+      .select("id, moderation_status")
+      .eq("name", suggestionName),
+  );
+
+  let suggestionId = existingSuggestion?.id ?? null;
+  if (!suggestionId) {
+    const { data, error: suggestionError } = await teacherClient.rpc("create_location", {
+      p_name: suggestionName,
+      p_visibility: "public",
+      p_city: "Lisboa",
+      p_country: "Portugal",
+      p_organization_id: null,
+      p_idempotency_key: suggestionKey,
+    });
+    if (suggestionError) throw new Error(`Propor local publico: ${summarizeError(suggestionError)}`);
+    suggestionId = data;
+    ok("Professor A propos um local publico");
+  } else {
+    ok("Proposta publica E2E reutilizada de uma execucao anterior");
+  }
+
+  const suggestionRecord = await getSingle(
+    "proposta publica",
+    teacherClient
+      .from("teacher_location_records")
+      .select("id, visibility, moderation_status")
+      .eq("id", suggestionId),
+  );
+  if (suggestionRecord.moderation_status === "pending") {
+    ok("Proposta publica esta pendente de aprovacao");
+    await mustReturnNoRows("Proposta pendente ainda nao e visivel para outros professores", () =>
+      teacherBClient.from("teacher_location_records").select("id").eq("id", suggestionId),
+    );
+  } else {
+    ok("Proposta publica E2E ja foi moderada numa execucao anterior");
+  }
+  await mustReject("Professor nao modera a propria proposta", async () =>
+    teacherClient.rpc("admin_moderate_location", {
+      p_location_id: suggestionId,
+      p_decision: "approved",
+      p_reason: null,
+    }),
+  );
+  await mustReturnNoRows("Professor nao le a fila de moderacao de locais", () =>
+    teacherClient.from("admin_location_moderation_records").select("id").limit(1),
+  );
+  await mustReject("Aluno nao cria locais", async () =>
+    studentClient.rpc("create_location", {
+      p_name: "Do aluno",
+      p_visibility: "private",
+      p_organization_id: null,
+      p_idempotency_key: deterministicUuid(`location-student:${runId}`),
+    }),
+  );
+
+  const { error: approveError } = await adminClient.rpc("admin_moderate_location", {
+    p_location_id: suggestionId,
+    p_decision: "approved",
+    p_reason: null,
+  });
+  check(!approveError, "Administrador aprova a proposta publica");
+
+  const approvedForTeacherB = await getSingle(
+    "local publico aprovado",
+    teacherBClient
+      .from("teacher_location_records")
+      .select("id, can_manage, internal_reference, notes")
+      .eq("id", suggestionId),
+  );
+  check(
+    approvedForTeacherB.can_manage === false &&
+      approvedForTeacherB.internal_reference === null &&
+      approvedForTeacherB.notes === null,
+    "Local publico aprovado fica visivel sem dados administrativos",
+  );
+
+  await mustReject("Rejeitar sem motivo e recusado", async () =>
+    adminClient.rpc("admin_moderate_location", {
+      p_location_id: suggestionId,
+      p_decision: "rejected",
+      p_reason: null,
+    }),
+  );
+
+  const { data: rejected } = await adminClient.rpc("admin_moderate_location", {
+    p_location_id: suggestionId,
+    p_decision: "rejected",
+    p_reason: `Rejeicao E2E ${runId}`,
+  });
+  await mustReturnNoRows("Local rejeitado deixa de estar visivel para outros professores", () =>
+    teacherBClient.from("teacher_location_records").select("id").eq("id", suggestionId),
+  );
+  const { data: reapproved } = await adminClient.rpc("admin_moderate_location", {
+    p_location_id: suggestionId,
+    p_decision: "approved",
+    p_reason: null,
+  });
+  const { data: reapprovedAgain } = await adminClient.rpc("admin_moderate_location", {
+    p_location_id: suggestionId,
+    p_decision: "approved",
+    p_reason: null,
+  });
+  check(
+    rejected === true && reapproved === true && reapprovedAgain === false,
+    "Rejeitar e voltar a aprovar funciona, e repetir a mesma decisao e idempotente",
+  );
+
+  const moderationQueue = await adminClient
+    .from("admin_location_moderation_records")
+    .select("id, moderation_status, possible_duplicates");
+  check(
+    !moderationQueue.error &&
+      (moderationQueue.data ?? []).some((row) => row.id === suggestionId) &&
+      (moderationQueue.data ?? []).every((row) => row.id !== privateLocationId),
+    "Fila de moderacao mostra propostas publicas e nunca locais privados",
+  );
+
+  // Nenhum campo de fornecedor externo existe nesta etapa.
+  check(
+    forbiddenColumns(privateLocationRecord, [
+      "google_place_id",
+      "place_id",
+      "latitude",
+      "longitude",
+      "provider",
+      "google_formatted_address",
+    ]).length === 0,
+    "Locais nao expoem nenhum campo de fornecedor externo",
+  );
+
   section("Conta bloqueada e anonimo");
   await signIn(blockedClient, credentials.blocked.email, credentials.blocked.password, "Conta bloqueada");
   await mustReturnNoRows("Conta bloqueada nao le views de pacotes", () =>
@@ -1659,6 +1903,17 @@ try {
   await mustReturnNoRows("Conta bloqueada nao le o diretorio do calendario do clube", () =>
     blockedClient.from("club_calendar_member_directory").select("membership_id").limit(1),
   );
+  await mustReturnNoRows("Conta bloqueada nao le locais", () =>
+    blockedClient.from("teacher_location_records").select("id").limit(1),
+  );
+  await mustReject("Conta bloqueada nao cria locais", async () =>
+    blockedClient.rpc("create_location", {
+      p_name: "Bloqueado",
+      p_visibility: "private",
+      p_organization_id: null,
+      p_idempotency_key: deterministicUuid(`location-blocked:${runId}`),
+    }),
+  );
 
   await mustReject("Anonimo nao le view de pacotes", async () =>
     anonClient.from("student_package_records").select("id").limit(1),
@@ -1695,6 +1950,17 @@ try {
   );
   await mustReject("Anonimo nao le o diretorio do calendario do clube", async () =>
     anonClient.from("club_calendar_member_directory").select("membership_id").limit(1),
+  );
+  await mustReject("Anonimo nao le locais", async () =>
+    anonClient.from("teacher_location_records").select("id").limit(1),
+  );
+  await mustReject("Anonimo nao cria locais", async () =>
+    anonClient.rpc("create_location", {
+      p_name: "Anonimo",
+      p_visibility: "private",
+      p_organization_id: null,
+      p_idempotency_key: deterministicUuid(`location-anon:${runId}`),
+    }),
   );
   await mustReject("Anonimo nao executa RPC", async () =>
     anonClient.rpc("assign_student_package", {

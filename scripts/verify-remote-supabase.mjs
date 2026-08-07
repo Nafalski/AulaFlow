@@ -89,6 +89,7 @@ const expectedViews = [
   "workspace_received_invitation_records",
   "admin_workspace_directory",
   "club_calendar_member_directory",
+  "admin_location_moderation_records",
 ];
 
 const expectedEnums = [
@@ -106,6 +107,9 @@ const expectedEnums = [
   "workspace_member_role",
   "workspace_member_status",
   "workspace_invitation_status",
+  "location_visibility",
+  "location_moderation_status",
+  "location_address_source",
 ];
 
 const expectedIndexes = [
@@ -138,6 +142,9 @@ const expectedIndexes = [
   "organization_invitations_email_idx",
   "organization_invitations_organization_idx",
   "organization_members_calendar_sharing_idx",
+  "locations_visibility_idx",
+  "locations_moderation_queue_idx",
+  "locations_creation_idempotency_unique",
 ];
 
 const expectedConstraints = [
@@ -165,6 +172,12 @@ const expectedConstraints = [
   "organization_invitations_email_format",
   "organization_invitations_role_allowed",
   "organization_invitations_status_coherent",
+  "locations_country_length",
+  "locations_postal_code_length",
+  "locations_moderation_reason_length",
+  "locations_moderation_matches_visibility",
+  "locations_moderation_decision_coherent",
+  "locations_rejection_needs_reason",
 ];
 
 const expectedFunctions = [
@@ -224,6 +237,13 @@ const expectedFunctions = [
   "get_club_availability_calendar",
   "resolve_teacher_availability_windows",
   "resolve_teacher_block_segments",
+  "can_manage_location",
+  "validate_location_scope",
+  "log_location_event",
+  "create_location",
+  "update_location",
+  "set_location_active",
+  "admin_moderate_location",
 ];
 
 const authenticatedRpc = [
@@ -263,6 +283,11 @@ const authenticatedRpc = [
   "auth_confirmed_email",
   "set_workspace_calendar_sharing",
   "get_club_availability_calendar",
+  "can_manage_location",
+  "create_location",
+  "update_location",
+  "set_location_active",
+  "admin_moderate_location",
 ];
 
 const internalFunctions = [
@@ -279,6 +304,8 @@ const internalFunctions = [
   "log_workspace_event",
   "resolve_teacher_availability_windows",
   "resolve_teacher_block_segments",
+  "validate_location_scope",
+  "log_location_event",
 ];
 
 const sql = `
@@ -639,6 +666,79 @@ checks as (
         and column_default like '%false%'
     ),
     'ok'
+
+  union all
+  select
+    'seguranca',
+    'cliente autenticado nao escreve diretamente na tabela de locais',
+    not exists (
+      select 1
+      from information_schema.table_privileges
+      where table_schema = 'public'
+        and table_name = 'locations'
+        and grantee in ('authenticated', 'anon')
+        and privilege_type in ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE')
+    ),
+    'ok'
+
+  union all
+  select
+    'privacidade',
+    'observacoes, autoria e moderacao de locais ficam fora do SELECT partilhado',
+    not exists (
+      select 1
+      from information_schema.column_privileges
+      where table_schema = 'public'
+        and table_name = 'locations'
+        and grantee in ('authenticated', 'anon')
+        and column_name in (
+          'internal_reference', 'notes', 'created_by', 'moderated_by',
+          'moderation_reason', 'creation_idempotency_key'
+        )
+    ),
+    coalesce((
+      select string_agg(column_name, ', ')
+      from information_schema.column_privileges
+      where table_schema = 'public'
+        and table_name = 'locations'
+        and grantee in ('authenticated', 'anon')
+        and column_name in (
+          'internal_reference', 'notes', 'created_by', 'moderated_by',
+          'moderation_reason', 'creation_idempotency_key'
+        )
+    ), 'ok')
+
+  union all
+  select
+    'privacidade',
+    'fila de moderacao de locais nao expoe locais privados nem de clube',
+    exists (
+      select 1
+      from pg_views
+      where schemaname = 'public'
+        and viewname = 'admin_location_moderation_records'
+        and definition like '%public%'
+    ),
+    'ok'
+
+  union all
+  select
+    'estrutura',
+    'locais nao guardam nenhum campo de fornecedor externo',
+    not exists (
+      select 1
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'locations'
+        and column_name ~* '(google|place_id|latitude|longitude|provider)'
+    ),
+    coalesce((
+      select string_agg(column_name, ', ')
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'locations'
+        and column_name ~* '(google|place_id|latitude|longitude|provider)'
+    ), 'ok')
 
   union all
   select

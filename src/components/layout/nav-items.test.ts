@@ -84,6 +84,7 @@ describe("navItemsForRole", () => {
       "/admin/professores",
       "/admin/utilizadores",
       "/admin/clubes",
+      "/admin/locais",
     ]);
   });
 });

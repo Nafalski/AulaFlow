@@ -178,6 +178,25 @@ export type WorkspaceMemberStatus = "pending" | "active" | "revoked" | "declined
 
 export type WorkspaceInvitationStatus = "pending" | "accepted" | "declined" | "revoked";
 
+/** `private` = do professor; `club` = do clube; `public` = proposto a todos. */
+export type LocationVisibility = "private" | "club" | "public";
+
+/**
+ * Decisão do AulaFlow sobre a FICHA de um local público.
+ *
+ * `not_required` é o estado dos locais privados e de clube, que não passam por
+ * moderação nenhuma. Nada aqui diz respeito à exatidão da morada.
+ */
+export type LocationModerationStatus = "not_required" | "pending" | "approved" | "rejected";
+
+/**
+ * Origem da morada. `manual` = escrita por uma pessoa, sem validação externa.
+ *
+ * Um único valor de propósito: existe para tornar a origem explícita e para
+ * que uma etapa futura possa acrescentar outra sem migrar dados.
+ */
+export type LocationAddressSource = "manual";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Linhas
 // ─────────────────────────────────────────────────────────────────────────────
@@ -373,14 +392,27 @@ export type TeacherSport = {
   created_at: Timestamp;
 }
 
+/**
+ * Local administrável.
+ *
+ * `created_by`, `moderated_by`, `moderation_reason` e `creation_idempotency_key`
+ * existem na tabela mas estão FORA do GRANT de `authenticated` — aparecem
+ * apenas na projeção de moderação. Por isso não fazem parte desta linha.
+ */
 export type Location = {
   id: UUID;
   organization_id: UUID;
-  /** Responsável pela gestão. `null` apenas para dados históricos/partilhados. */
+  /** Responsável pela gestão. `null` em locais herdados da organização. */
   teacher_id: UUID | null;
   name: string;
+  /** Morada escrita pelo utilizador. NÃO é validada por nenhum fornecedor. */
   address: string | null;
+  address_source: LocationAddressSource;
   city: string | null;
+  country: string | null;
+  postal_code: string | null;
+  visibility: LocationVisibility;
+  moderation_status: LocationModerationStatus;
   /** Referência interna, fora da projeção comum do local. */
   internal_reference: string | null;
   /** Observações administrativas, fora da projeção comum do local. */
@@ -769,8 +801,30 @@ export type TeacherGroupRecord = Group & {
 };
 
 export type TeacherLocationRecord = Location & {
-  /** Só o professor responsável pode alterar; restantes professores consultam os dados públicos. */
+  organization_name: string;
+  belongs_to_club: boolean;
+  moderation_reason: string | null;
+  /** Quem administra: o responsável pessoal, ou owner/manager no caso do clube. */
   can_manage: boolean;
+  is_mine: boolean;
+};
+
+/** Fila de moderação de locais públicos. Nunca inclui locais privados ou de clube. */
+export type AdminLocationModerationRecord = {
+  id: UUID;
+  name: string;
+  address: string | null;
+  city: string | null;
+  country: string | null;
+  postal_code: string | null;
+  moderation_status: LocationModerationStatus;
+  moderation_reason: string | null;
+  is_active: boolean;
+  created_at: Timestamp;
+  moderated_at: Timestamp | null;
+  created_by_name: string | null;
+  moderated_by_name: string | null;
+  possible_duplicates: number;
 };
 
 export type TeacherStudentPackageSummary = {
@@ -1244,19 +1298,11 @@ export type Database = {
       };
       locations: {
         Row: Location;
-        Insert: {
-          organization_id: UUID;
-          teacher_id: UUID;
-          name: string;
-          address?: string | null;
-          city?: string | null;
-          internal_reference?: string | null;
-          notes?: string | null;
-          is_active?: boolean;
-        };
-        Update: Partial<
-          Pick<Location, "name" | "address" | "city" | "internal_reference" | "notes" | "is_active">
-        >;
+        // Escrita exclusivamente por RPC desde a Etapa 5B.3A: com colunas de
+        // moderação e autoria, a escrita direta deixaria o cliente aprovar-se
+        // a si próprio ou trocar o dono de um local.
+        Insert: never;
+        Update: never;
         Relationships: [];
       };
       groups: {
@@ -1493,6 +1539,10 @@ export type Database = {
       };
       teacher_location_records: {
         Row: TeacherLocationRecord;
+        Relationships: [];
+      };
+      admin_location_moderation_records: {
+        Row: AdminLocationModerationRecord;
         Relationships: [];
       };
       teacher_student_package_summary: {
@@ -1864,6 +1914,46 @@ export type Database = {
         Args: { p_organization_id: UUID; p_enabled: boolean };
         Returns: boolean;
       };
+      create_location: {
+        Args: {
+          p_name: string;
+          p_visibility: LocationVisibility;
+          p_address?: string | null;
+          p_city?: string | null;
+          p_country?: string | null;
+          p_postal_code?: string | null;
+          p_internal_reference?: string | null;
+          p_notes?: string | null;
+          p_organization_id?: UUID | null;
+          p_idempotency_key?: UUID | null;
+        };
+        Returns: UUID;
+      };
+      update_location: {
+        Args: {
+          p_location_id: UUID;
+          p_name: string;
+          p_address?: string | null;
+          p_city?: string | null;
+          p_country?: string | null;
+          p_postal_code?: string | null;
+          p_internal_reference?: string | null;
+          p_notes?: string | null;
+        };
+        Returns: boolean;
+      };
+      set_location_active: {
+        Args: { p_location_id: UUID; p_is_active: boolean };
+        Returns: boolean;
+      };
+      admin_moderate_location: {
+        Args: {
+          p_location_id: UUID;
+          p_decision: LocationModerationStatus;
+          p_reason?: string | null;
+        };
+        Returns: boolean;
+      };
       get_club_availability_calendar: {
         Args: {
           p_organization_id: UUID;
@@ -1902,6 +1992,9 @@ export type Database = {
       workspace_member_role: WorkspaceMemberRole;
       workspace_member_status: WorkspaceMemberStatus;
       workspace_invitation_status: WorkspaceInvitationStatus;
+      location_visibility: LocationVisibility;
+      location_moderation_status: LocationModerationStatus;
+      location_address_source: LocationAddressSource;
     };
     CompositeTypes: Record<never, never>;
   };

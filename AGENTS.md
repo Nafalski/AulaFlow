@@ -153,7 +153,10 @@ update public.profiles set role = 'admin' where email = 'voce@exemplo.pt';
 │   ├── ..._phase5_workspace_grants.sql grants explícitos das views e funções da Etapa 5B.2A
 │   ├── ..._phase5_club_calendar.sql Etapa 5B.2B: consentimento por membership e calendário do clube
 │   ├── ..._phase5_club_calendar_states.sql Etapa 5B.2B: distinguir indisponível de fora do horário
-│   └── ..._phase5_club_calendar_outside_hours.sql Etapa 5B.2B: dia sem janela positiva é fora do horário
+│   ├── ..._phase5_club_calendar_outside_hours.sql Etapa 5B.2B: dia sem janela positiva é fora do horário
+│   ├── ..._phase5_location_domain.sql Etapa 5B.3A: visibilidade, moderação e morada manual
+│   ├── ..._phase5_location_security.sql Etapa 5B.3A: RLS, grants e projeções de locais
+│   └── ..._phase5_location_functions.sql Etapa 5B.3A: RPCs atómicas de locais
 │
 └── src/
     ├── proxy.ts             Renova a sessão e protege rotas (era middleware.ts)
@@ -293,6 +296,34 @@ Alvo: WCAG 2.1 AA. Os componentes de `components/ui/` já resolvem o essencial �
 - Membros de turmas são alterados apenas por `add_group_member()` e `remove_group_member()`. A remoção fecha o período com `left_at`; uma reentrada cria uma nova linha e não apaga o período anterior.
 - A política própria do professor é guardada por `save_teacher_cancellation_policy()` e resolvida por `resolve_cancellation_policy()`; desativá-la faz usar o fallback ativo da organização.
 
+### Locais e moradas manuais (Etapa 5B.3A)
+
+**Sem integração externa.** Nenhuma chave, API, faturação, `google_place_id`, coordenada ou mapa. A morada é **escrita por uma pessoa** e é tratada em todo o lado como não validada por terceiros. Não escrever "morada verificada" nem sugerir validação externa.
+
+**Um eixo, não dois.** `visibility` (`private`/`club`/`public`) determina também a propriedade. Não acrescentar um "tipo" paralelo: seriam os mesmos três valores duas vezes, com combinações impossíveis.
+
+**`is_active` é o ciclo de vida; a moderação tem enum próprio.** `location_moderation_status` = `not_required`/`pending`/`approved`/`rejected`. Juntar "inactive" ao mesmo enum criaria o par contraditório `status='inactive'` com `is_active=true`.
+
+**Aprovar ≠ morada correta.** `moderation_status='approved'` diz que um administrador aprovou a **ficha pública**. Não diz nada sobre a morada. `address_source='manual'` deixa a origem explícita no esquema.
+
+| Âmbito | Onde vive | Quem administra |
+|---|---|---|
+| `private` | workspace pessoal, `teacher_id` do dono | o próprio professor |
+| `club` | organização do clube, sem `teacher_id` | `owner`/`manager` do clube |
+| `public` | workspace pessoal de quem propõe | o proponente; a decisão é do admin |
+
+Um membro com papel interno `teacher` **consulta** os locais do clube mas não os administra.
+
+**Escrita só por RPC.** `create_location`, `update_location`, `set_location_active` e `admin_moderate_location`. A tabela não tem GRANT de INSERT/UPDATE/DELETE: com colunas de moderação e autoria, a escrita direta deixaria o cliente aprovar-se a si próprio. `update_location` **não** muda visibilidade nem estado — promover um local a público tem de passar pela fila de moderação.
+
+**SELECT por lista de colunas.** `internal_reference`, `notes`, `created_by`, `moderated_by`, `moderation_reason` e `creation_idempotency_key` ficam fora do GRANT partilhado; um `grant select` de tabela deixaria qualquer colega de clube — ou qualquer aluno da organização — lê-las por PostgREST.
+
+Views: `teacher_location_records` (os seus, os do clube, os públicos aprovados) e `admin_location_moderation_records` (só propostas públicas).
+
+**Retrocompatibilidade:** locais anteriores ficam `private`/`not_required`/`manual`. `teacher_id` **não** é exigido pelo trigger — a Fase 3 só atribuiu responsável em organizações com um professor, e editar os restantes não pode passar a ser impossível.
+
+**Não implementado:** campos, quadras, salas, recursos (5B.3B), aulas (5C), conflitos e créditos (5D).
+
 ### Ao criar uma tabela nova
 
 ```sql
@@ -323,7 +354,7 @@ npm run typecheck
 
 ### `npm run db:verify`
 
-Executa **todas** as migrações, a partir de uma base vazia, contra PostgreSQL compilado para WebAssembly (PGlite), e volta a aplicá-las para confirmar idempotência. Depois exerce 491 garantias: RLS com papéis `authenticated`/`anon`, isolamento entre organizações e professores, privilégios das RPCs, perfis/claim/bloqueio, convites sem segredo, alunos, turmas, locais, modelos, atribuição, consulta e ajustes administrativos de pacotes, disponibilidade do professor, calendário seguro, clubes, memberships, convites de workspace, papéis internos, contexto ativo, suspensão, consentimento de partilha por clube, projeção do calendário partilhado, grants estritos das views, políticas, reserva, consumo, libertação, reagendamento, exceções, correções, imutabilidade do livro-razão e constraints herdadas das aulas.
+Executa **todas** as migrações, a partir de uma base vazia, contra PostgreSQL compilado para WebAssembly (PGlite), e volta a aplicá-las para confirmar idempotência. Depois exerce 537 garantias: RLS com papéis `authenticated`/`anon`, isolamento entre organizações e professores, privilégios das RPCs, perfis/claim/bloqueio, convites sem segredo, alunos, turmas, locais, modelos, atribuição, consulta e ajustes administrativos de pacotes, disponibilidade do professor, calendário seguro, clubes, memberships, convites de workspace, papéis internos, contexto ativo, suspensão, consentimento de partilha por clube, projeção do calendário partilhado, grants estritos das views, políticas, reserva, consumo, libertação, reagendamento, exceções, correções, imutabilidade do livro-razão e constraints herdadas das aulas.
 
 Corre em segundos, sem Docker e sem projeto na nuvem — serve para o CI.
 
@@ -613,7 +644,7 @@ Interface em `/professor/clubes/[id]/calendario`, com filtro por professor no UR
 
 **Não implementado:** aulas, participantes, locais, campos, recursos, conflitos, reservas e créditos. Os únicos estados são disponível e indisponível — não escrever "ocupado", "reservado", "lotado", "vagas" ou "conflito", porque nada disso existe ainda para ser verdade.
 
-Ordem: 5B.3 locais, campos e Google Places → 5C criação/edição de aulas → 5D recorrência, conflitos e reservas de créditos → 5E revisão integrada.
+Ordem: 5B.3B campos e recursos → 5C criação/edição de aulas → 5D recorrência, conflitos e reservas de créditos → 5E revisão integrada.
 
 ### `src/types/database.ts`
 
@@ -625,7 +656,7 @@ As linhas são declaradas com `type`, **nunca com `interface`**. Um `interface` 
 
 Vitest, ambiente Node, `TZ=Europe/Lisbon` fixo para que um teste que passa localmente passe também no CI (que corre em UTC).
 
-Cobertura atual: **349 testes** em vinte e um ficheiros — testes de domínio, regressões de respostas/autenticação do proxy, formulários da Fase 2, validação/normalização da gestão da Fase 3, modelos, atribuição, apresentação, navegação, ajustes administrativos de pacotes, disponibilidade do professor, calendário, permissões de clube, validação de workspaces e regras do calendário partilhado.
+Cobertura atual: **373 testes** em vinte e dois ficheiros — testes de domínio, regressões de respostas/autenticação do proxy, formulários da Fase 2, validação/normalização da gestão da Fase 3, modelos, atribuição, apresentação, navegação, ajustes administrativos de pacotes, disponibilidade do professor, calendário, permissões de clube, validação de workspaces, regras do calendário partilhado e domínio de locais.
 
 Os testes de domínio exercem funções puras, sem base de dados nem mocks. Os testes de validação garantem normalização, limites, identificadores, estados, valores monetários em cêntimos, datas civis e rejeição de campos extra/protegidos. A integração SQL fica separada em `db:verify`.
 
@@ -648,7 +679,7 @@ Não existe um comando de formatação separado. Use `npm run lint:fix` apenas p
 | 2 | Perfis, definições e gestão administrativa básica de contas | **Concluído** |
 | 3 | Alunos, turmas, locais, política de cancelamento | **Concluído** |
 | 4 | Interfaces de modelos, atribuição, ajustes e saldos | **Concluído** — Etapas 1A, 1B, 1C, 1D e 1E validadas com Auth/PostgREST reais e browser desktop/mobile |
-| 5 | Calendário e criação de aulas com reserva | **Parcialmente concluído** — Etapas 5A, 5B, 5B.1, 5B.2A e 5B.2B: disponibilidade, projeção segura, refinamento visual, fundação de clubes/membros e calendário partilhado com consentimento |
+| 5 | Calendário e criação de aulas com reserva | **Parcialmente concluído** — Etapas 5A, 5B, 5B.1, 5B.2A, 5B.2B e 5B.3A: disponibilidade, projeção segura, refinamento visual, clubes/membros, calendário partilhado e domínio de locais com moradas manuais |
 | 6 | Cancelamento, reagendamento, presenças e histórico | **Planeado** |
 | 7 | Área do aluno: aulas, créditos e confirmação | **Planeado** |
 | 8 | Notificações, lembretes e expiração agendada | **Planeado** |

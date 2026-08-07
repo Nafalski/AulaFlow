@@ -6,7 +6,7 @@
 
 **Documento vivo.** Atualizado no fim de cada fase com o que foi realmente construído.
 
-- **Estado atual:** Fases 1, 1.5, 2, 3 e 4 concluídas. A Fase 5 tem as **Etapas 5A, 5B, 5B.1, 5B.2A e 5B.2B** concluídas — disponibilidade, projeção segura, calendário visual refinado, fundação de clubes/workspaces/membros e calendário partilhado com consentimento. **Locais/campos (5B.3)** e a criação de aulas continuam pendentes.
+- **Estado atual:** Fases 1, 1.5, 2, 3 e 4 concluídas. A Fase 5 tem as **Etapas 5A, 5B, 5B.1, 5B.2A, 5B.2B e 5B.3A** concluídas — disponibilidade, projeção segura, calendário visual refinado, clubes/workspaces/membros, calendário partilhado com consentimento e domínio de locais com moradas manuais. **Campos e recursos (5B.3B)** e a criação de aulas continuam pendentes.
 - **Timezone do sistema:** `Europe/Lisbon`
 - **Idioma da interface:** Português (pt-PT)
 
@@ -811,10 +811,57 @@ Ordem da Fase 5:
 1. 5B.1 — Refinamento visual. **Concluída.**
 2. 5B.2A — Clubes, workspaces e membros. **Concluída.**
 3. 5B.2B — Calendário partilhado do clube. **Concluída.**
-4. 5B.3 — Locais, campos e Google Places. **Próxima.**
+4. 5B.3A — Locais e moradas manuais. **Concluída.**
+5. 5B.3B — Campos e recursos. **Próxima.**
 5. 5C — Criação e edição de aulas.
 6. 5D — Recorrência, conflitos e reservas de créditos.
 7. 5E — Revisão integrada.
+
+### Concluído na Fase 5 — Etapa 5B.3A: locais e moradas manuais
+
+Estado: **concluída**. Âmbito revisto com o utilizador antes de implementar: **sem qualquer integração externa**.
+
+#### Por que não há Google Places nesta etapa
+
+A auditoria à documentação oficial do Google Maps Platform, feita antes de escrever esquema, encontrou duas coisas decisivas:
+
+1. O autocomplete legado (`AutocompleteService`, widget `Autocomplete`) **não está disponível a novos clientes desde 1 de março de 2025**. Os substitutos são `AutocompleteSuggestion`, `PlaceAutocompleteElement` e o REST Autocomplete (New).
+2. Sobre armazenamento: o **`place_id` é isento** das restrições de cache e pode ser guardado indefinidamente; **latitude e longitude só até 30 dias consecutivos**; morada formatada e componentes são Places content sujeito à cláusula *No Caching*. O princípio é o mesmo nos termos padrão e nos EEA Service Specific Terms.
+
+Isto contradizia a lista de campos originalmente planeada (latitude, longitude, morada formatada, localidade, país, código postal persistidos). Perante a alternativa, o utilizador decidiu — de forma definitiva para esta etapa — **não usar Google de todo**: sem chave, sem conta de faturação, sem API ativada, sem variáveis `GOOGLE_*`, sem autocomplete, sem Place Details, sem `google_place_id`, sem coordenadas e sem mapa. A razão foi explícita: evitar qualquer risco de custo.
+
+O âmbito da 5B.3A passou a ser **domínio de locais e moradas manuais**. A integração externa fica para uma etapa posterior e **opcional**.
+
+#### Modelo
+
+Duas decisões tomadas depois da auditoria, ambas para evitar estados impossíveis:
+
+- **Um eixo, não dois.** O plano falava de um "tipo" e de uma "visibilidade" com os mesmos três valores. Ficou só `visibility` (`private`/`club`/`public`), que também determina a propriedade.
+- **`is_active` continua a ser o ciclo de vida.** Os estados de moderação vivem em `location_moderation_status` (`not_required`/`pending`/`approved`/`rejected`). Juntar "inactive" ao mesmo enum criaria o par contraditório `status='inactive'` com `is_active=true`.
+
+`address_source = 'manual'` torna explícito no esquema que a morada foi escrita por uma pessoa. **Aprovar um local público não valida a morada** — e nenhuma string da interface o sugere.
+
+| Âmbito | Onde vive | Quem administra | Moderação |
+|---|---|---|---|
+| `private` | workspace pessoal, com `teacher_id` | o próprio professor | nenhuma |
+| `club` | organização do clube, sem `teacher_id` | `owner`/`manager` | nenhuma |
+| `public` | workspace pessoal de quem propõe | o proponente | admin aprova ou rejeita |
+
+Um membro com papel interno `teacher` consulta os locais do clube mas não os administra.
+
+#### Segurança
+
+A escrita passou a ser **exclusivamente por RPC** (`create_location`, `update_location`, `set_location_active`, `admin_moderate_location`): com colunas de moderação e autoria, deixar o cliente escrever a tabela significaria deixá-lo aprovar-se a si próprio. O `SELECT` continua por lista de colunas — `internal_reference`, `notes`, `created_by`, `moderated_by`, `moderation_reason` e a chave de idempotência ficam fora do GRANT partilhado.
+
+`update_location` **não** altera visibilidade nem moderação: promover um local a público tem de passar pela fila, e misturar as duas operações permitiria saltá-la.
+
+#### Retrocompatibilidade
+
+Locais existentes ficam `private`/`not_required`/`manual`, com `created_by` derivado do professor responsável. Nenhum id é recriado e nenhuma linha apagada. O trigger de âmbito **não** exige `teacher_id`: a Fase 3 só atribuiu responsável em organizações com um único professor, e tornar os restantes ineditáveis seria uma regressão.
+
+#### Não implementado
+
+Campos, quadras, salas e recursos (5B.3B); aulas (5C); conflitos e créditos (5D); qualquer integração externa, mapa ou cálculo de distância.
 
 ### Fase 2 — estado por item
 

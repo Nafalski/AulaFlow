@@ -94,6 +94,7 @@ const ADMIN_NAV = [
     primary: true,
   },
   { href: "/admin/clubes", label: "Clubes", iconKey: "clubs", primary: true },
+  { href: "/admin/locais", label: "Locais", iconKey: "locations" },
 ] as const satisfies readonly NavItem[];
 
 export function navItemsForRole(role: UserRole): readonly NavItem[] {
