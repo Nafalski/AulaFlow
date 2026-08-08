@@ -1,15 +1,22 @@
+import { randomUUID } from "node:crypto";
+
 import { ArrowLeft, Building2, MapPin, ShieldCheck } from "lucide-react";
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 
 import { LocationForm } from "@/components/locations/location-form";
+import { LocationResourceSection } from "@/components/locations/location-resource-section";
 import { LocationStatusForm } from "@/components/locations/location-status-form";
 import { Alert } from "@/components/ui/alert";
 import { buttonClasses } from "@/components/ui/button";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { Badge } from "@/components/ui/status-badge";
 import { requireRole } from "@/lib/auth/session";
+import {
+  resourceCreationBlockedReason,
+  showsResourceSection,
+} from "@/lib/domain/location-resources";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { locationIdSchema } from "@/lib/validation/locations";
 
@@ -22,7 +29,7 @@ export default async function LocationDetailPage({ params }: { params: Promise<{
   if (!parsed.success) notFound();
   const user = await requireRole("teacher", `/professor/locais/${id}`);
   const supabase = await createSupabaseServerClient();
-  const [locationResult, organizationResult] = await Promise.all([
+  const [locationResult, organizationResult, resourcesResult] = await Promise.all([
     supabase
       .from("teacher_location_records")
       .select("id, teacher_id, name, address, city, country, postal_code, internal_reference, notes, is_active, can_manage, visibility, moderation_status, moderation_reason")
@@ -35,6 +42,10 @@ export default async function LocationDetailPage({ params }: { params: Promise<{
           .eq("id", user.profile.organization_id)
           .maybeSingle()
       : Promise.resolve({ data: null, error: null }),
+    supabase
+      .from("teacher_location_resource_records")
+      .select("id, name, kind, is_active, display_order")
+      .eq("location_id", parsed.data.locationId),
   ]);
 
   if (locationResult.error) {
@@ -48,6 +59,19 @@ export default async function LocationDetailPage({ params }: { params: Promise<{
     console.error("[AulaFlow] Falha ao carregar a organização do local.", organizationResult.error);
     throw new Error("Não foi possível carregar a organização do local.");
   }
+
+  if (resourcesResult.error) {
+    console.error("[AulaFlow] Falha ao carregar os recursos de um local.", resourcesResult.error);
+    throw new Error("Não foi possível carregar os campos e salas do local.");
+  }
+
+  const resources = (resourcesResult.data ?? []).map((resource) => ({
+    id: resource.id,
+    name: resource.name,
+    kind: resource.kind,
+    isActive: resource.is_active,
+    displayOrder: resource.display_order,
+  }));
 
   return (
     <div className="flex flex-col gap-6">
@@ -83,6 +107,20 @@ export default async function LocationDetailPage({ params }: { params: Promise<{
           {location.can_manage && <Card variant="plain"><CardHeader title="Estado do local" description="Desativar impede apenas a seleção futura." /><CardBody><LocationStatusForm locationId={location.id} locationName={location.name} isActive={location.is_active} /></CardBody></Card>}
         </div>
       </div>
+
+      {showsResourceSection(location) && (
+        <LocationResourceSection
+          locationId={location.id}
+          resources={resources}
+          canManage={location.can_manage}
+          blockedReason={resourceCreationBlockedReason({
+            visibility: location.visibility,
+            isActive: location.is_active,
+            canManage: location.can_manage,
+          })}
+          idempotencyKey={randomUUID()}
+        />
+      )}
     </div>
   );
 }

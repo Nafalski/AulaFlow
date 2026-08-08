@@ -71,6 +71,8 @@ const expectedTables = [
   "teacher_schedule_blocks",
   "organization_members",
   "organization_invitations",
+  "locations",
+  "location_resources",
 ];
 
 const expectedViews = [
@@ -90,6 +92,8 @@ const expectedViews = [
   "admin_workspace_directory",
   "club_calendar_member_directory",
   "admin_location_moderation_records",
+  "teacher_location_records",
+  "teacher_location_resource_records",
 ];
 
 const expectedEnums = [
@@ -110,6 +114,7 @@ const expectedEnums = [
   "location_visibility",
   "location_moderation_status",
   "location_address_source",
+  "location_resource_kind",
 ];
 
 const expectedIndexes = [
@@ -145,6 +150,9 @@ const expectedIndexes = [
   "locations_visibility_idx",
   "locations_moderation_queue_idx",
   "locations_creation_idempotency_unique",
+  "location_resources_location_idx",
+  "location_resources_active_name_unique",
+  "location_resources_idempotency_unique",
 ];
 
 const expectedConstraints = [
@@ -178,6 +186,8 @@ const expectedConstraints = [
   "locations_moderation_matches_visibility",
   "locations_moderation_decision_coherent",
   "locations_rejection_needs_reason",
+  "location_resources_name_length",
+  "location_resources_display_order_range",
 ];
 
 const expectedFunctions = [
@@ -244,6 +254,13 @@ const expectedFunctions = [
   "update_location",
   "set_location_active",
   "admin_moderate_location",
+  "can_manage_location_resources",
+  "can_read_location_resources",
+  "validate_location_resource_scope",
+  "log_location_resource_event",
+  "create_location_resource",
+  "update_location_resource",
+  "set_location_resource_active",
 ];
 
 const authenticatedRpc = [
@@ -288,6 +305,11 @@ const authenticatedRpc = [
   "update_location",
   "set_location_active",
   "admin_moderate_location",
+  "can_manage_location_resources",
+  "can_read_location_resources",
+  "create_location_resource",
+  "update_location_resource",
+  "set_location_resource_active",
 ];
 
 const internalFunctions = [
@@ -306,6 +328,8 @@ const internalFunctions = [
   "resolve_teacher_block_segments",
   "validate_location_scope",
   "log_location_event",
+  "validate_location_resource_scope",
+  "log_location_resource_event",
 ];
 
 const sql = `
@@ -739,6 +763,102 @@ checks as (
         and table_name = 'locations'
         and column_name ~* '(google|place_id|latitude|longitude|provider)'
     ), 'ok')
+
+  union all
+  select
+    'seguranca',
+    'cliente autenticado nao escreve diretamente nos recursos de locais',
+    not exists (
+      select 1
+      from information_schema.table_privileges
+      where table_schema = 'public'
+        and table_name = 'location_resources'
+        and grantee in ('authenticated', 'anon')
+        and privilege_type in ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE')
+    ),
+    'ok'
+
+  union all
+  select
+    'privacidade',
+    'autoria e chave de idempotencia dos recursos ficam fora do SELECT partilhado',
+    not exists (
+      select 1
+      from information_schema.column_privileges
+      where table_schema = 'public'
+        and table_name = 'location_resources'
+        and grantee in ('authenticated', 'anon')
+        and column_name in ('created_by', 'creation_idempotency_key')
+    ),
+    coalesce((
+      select string_agg(column_name, ', ')
+      from information_schema.column_privileges
+      where table_schema = 'public'
+        and table_name = 'location_resources'
+        and grantee in ('authenticated', 'anon')
+        and column_name in ('created_by', 'creation_idempotency_key')
+    ), 'ok')
+
+  union all
+  select
+    'estrutura',
+    'recursos apontam para um local com foreign key restritiva',
+    exists (
+      select 1
+      from pg_constraint constraint_row
+      join pg_class child on child.oid = constraint_row.conrelid
+      join pg_class parent on parent.oid = constraint_row.confrelid
+      where constraint_row.contype = 'f'
+        and child.relname = 'location_resources'
+        and parent.relname = 'locations'
+        and constraint_row.confdeltype = 'r'
+    ),
+    'ok'
+
+  union all
+  select
+    'estrutura',
+    'recursos nao guardam horario, reserva, capacidade nem conflito',
+    not exists (
+      select 1
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'location_resources'
+        and column_name ~* '(capacity|starts_at|ends_at|booking|reservation|conflict|schedule)'
+    ),
+    coalesce((
+      select string_agg(column_name, ', ')
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'location_resources'
+        and column_name ~* '(capacity|starts_at|ends_at|booking|reservation|conflict|schedule)'
+    ), 'ok')
+
+  union all
+  select
+    'estrutura',
+    'tipos de recurso continuam genericos, sem valores de uma modalidade',
+    (
+      select array_agg(enum_row.enumlabel::text order by enum_row.enumsortorder)
+      from pg_enum enum_row
+      join pg_type type_row on type_row.oid = enum_row.enumtypid
+      where type_row.typname = 'location_resource_kind'
+    ) = array['court', 'room', 'area', 'other'],
+    coalesce((
+      select string_agg(enum_row.enumlabel::text, ', ' order by enum_row.enumsortorder)
+      from pg_enum enum_row
+      join pg_type type_row on type_row.oid = enum_row.enumtypid
+      where type_row.typname = 'location_resource_kind'
+    ), 'ausente')
+
+  union all
+  select
+    'seguranca',
+    'RLS esta ativo na tabela de recursos de locais',
+    coalesce((
+      select relrowsecurity from pg_class where oid = to_regclass('public.location_resources')
+    ), false),
+    'ok'
 
   union all
   select

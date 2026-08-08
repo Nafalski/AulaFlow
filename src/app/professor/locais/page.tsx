@@ -119,7 +119,8 @@ export default async function TeacherLocationsPage({
           <p className="text-sm font-bold tracking-wide text-brand uppercase">Gestão de locais</p>
           <h1 className="mt-1 text-2xl font-extrabold tracking-tight text-ink">Locais</h1>
           <p className="mt-1 text-sm text-muted">
-            Espaços onde decorrem as aulas. Sem reservas, campos ou mapas nesta etapa.
+            Espaços onde decorrem as aulas. Cada local pode ter campos, salas e áreas. Sem
+            reservas nem mapas nesta etapa.
           </p>
         </div>
         <Link href="/professor/locais/novo" className={buttonClasses({ variant: "accent" })}>

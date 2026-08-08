@@ -7041,6 +7041,482 @@ await mustReject("a base recusa rejeição sem motivo", () =>
   ),
 );
 
+// ── Recursos de um local (Etapa 5B.3B) ───────────────────────────────────────
+
+section("Recursos de locais");
+
+// `managedLocation` é privado do TEACHER_UID; `clubLocation` pertence ao clube A.
+// Ambos foram criados na secção anterior. O local privado foi desativado pelo
+// teste de ciclo de vida, por isso é reativado antes de lhe acrescentar recursos.
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(`select public.set_location_active($1, true)`, [managedLocation.id]),
+);
+
+const resourceKey = randomUUID();
+const court1 = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.create_location_resource(
+       p_location_id => $1, p_name => 'Campo 1', p_kind => 'court',
+       p_display_order => 1, p_idempotency_key => $2::uuid) as id`,
+    [managedLocation.id, resourceKey],
+  ),
+);
+const court1Again = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.create_location_resource(
+       p_location_id => $1, p_name => 'Campo 1', p_kind => 'court',
+       p_display_order => 1, p_idempotency_key => $2::uuid) as id`,
+    [managedLocation.id, resourceKey],
+  ),
+);
+const resourceCount = await one(
+  `select count(*)::int as total from public.location_resources where location_id=$1`,
+  [managedLocation.id],
+);
+check(
+  court1.id === court1Again.id && Number(resourceCount.total) === 1,
+  "repetir a criação com a mesma chave devolve o mesmo recurso",
+);
+check(
+  (await auditCount("location_resource.created", court1.id)) === 1,
+  "criação idempotente não repete a auditoria",
+);
+
+const court2 = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.create_location_resource(
+       p_location_id => $1, p_name => 'Campo 2', p_display_order => 2,
+       p_idempotency_key => $2::uuid) as id`,
+    [managedLocation.id, randomUUID()],
+  ),
+);
+check(court2.id !== court1.id, "uma chave nova cria outro recurso quando o nome é diferente");
+
+const createdRow = await one(
+  `select name, kind::text, is_active, display_order, created_by
+     from public.location_resources where id=$1`,
+  [court1.id],
+);
+check(
+  createdRow.name === "Campo 1" &&
+    createdRow.kind === "court" &&
+    createdRow.is_active === true &&
+    createdRow.display_order === 1 &&
+    createdRow.created_by === TEACHER_UID,
+  "recurso nasce ativo, com tipo, ordem e autoria derivada da sessão",
+);
+
+// ── Unicidade por local ─────────────────────────────────────────────────────
+
+await mustReject("dois recursos ativos com o mesmo nome no mesmo local", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(
+      `select public.create_location_resource(
+         p_location_id => $1, p_name => '  campo 1  ', p_idempotency_key => $2::uuid)`,
+      [managedLocation.id, randomUUID()],
+    ),
+  ),
+);
+
+// "Campo 1" noutro local é perfeitamente legítimo.
+const clubCourt1 = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.create_location_resource(
+       p_location_id => $1, p_name => 'Campo 1', p_idempotency_key => $2::uuid) as id`,
+    [clubLocation.id, randomUUID()],
+  ),
+);
+check(clubCourt1.id !== court1.id, "o mesmo nome de recurso existe em locais diferentes");
+
+// ── Ciclo de vida ───────────────────────────────────────────────────────────
+
+const deactivated = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select public.set_location_resource_active($1, false) as done`, [court2.id]),
+);
+const deactivatedAgain = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select public.set_location_resource_active($1, false) as done`, [court2.id]),
+);
+const preserved = await one(
+  `select id, is_active from public.location_resources where id=$1`,
+  [court2.id],
+);
+check(
+  deactivated.done === true &&
+    deactivatedAgain.done === false &&
+    preserved.id === court2.id &&
+    preserved.is_active === false,
+  "desativar preserva a linha e repetir é idempotente",
+);
+check(
+  (await auditCount("location_resource.deactivated", court2.id)) === 1,
+  "desativação repetida não duplica a auditoria",
+);
+
+// Um nome libertado por desativação pode voltar a ser usado.
+const reusedName = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.create_location_resource(
+       p_location_id => $1, p_name => 'Campo 2', p_idempotency_key => $2::uuid) as id`,
+    [managedLocation.id, randomUUID()],
+  ),
+);
+check(
+  reusedName.id !== court2.id,
+  "o nome de um recurso desativado fica livre para um recurso novo",
+);
+await mustReject("reativar um recurso cujo nome já está ocupado", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.set_location_resource_active($1, true)`, [court2.id]),
+  ),
+);
+
+const renamed = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select public.update_location_resource($1, 'Campo Coberto', 'room', 3) as done`, [
+    court1.id,
+  ]),
+);
+const renamedAgain = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select public.update_location_resource($1, 'Campo Coberto', 'room', 3) as done`, [
+    court1.id,
+  ]),
+);
+check(
+  renamed.done === true && renamedAgain.done === false,
+  "editar funciona e repetir os mesmos valores é idempotente",
+);
+
+// ── Local inativo ───────────────────────────────────────────────────────────
+
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(`select public.set_location_active($1, false)`, [managedLocation.id]),
+);
+await mustReject("local inativo não aceita recursos novos", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(
+      `select public.create_location_resource(
+         p_location_id => $1, p_name => 'Campo 9', p_idempotency_key => $2::uuid)`,
+      [managedLocation.id, randomUUID()],
+    ),
+  ),
+);
+const survivingResources = await one(
+  `select count(*)::int as total from public.location_resources where location_id=$1`,
+  [managedLocation.id],
+);
+check(
+  Number(survivingResources.total) >= 2,
+  "desativar o local preserva os recursos que já existiam",
+);
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(`select public.set_location_active($1, true)`, [managedLocation.id]),
+);
+
+// ── Locais públicos não têm recursos nesta etapa ────────────────────────────
+
+await mustReject("local público não aceita recursos", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(
+      `select public.create_location_resource(
+         p_location_id => $1, p_name => 'Campo do parque', p_idempotency_key => $2::uuid)`,
+      [publicSuggestion.id, randomUUID()],
+    ),
+  ),
+);
+await mustReject("a base recusa um recurso em local público", () =>
+  db.query(
+    `insert into public.location_resources (location_id, name) values ($1,'Direto')`,
+    [publicSuggestion.id],
+  ),
+);
+
+// ── Isolamento ──────────────────────────────────────────────────────────────
+
+const privateResourcesForOther = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  rows(`select id from public.teacher_location_resource_records where location_id=$1`, [
+    managedLocation.id,
+  ]),
+);
+check(
+  privateResourcesForOther.length === 0,
+  "professor de outra organização não vê os recursos privados alheios",
+);
+await mustReject("professor de fora não cria recursos no local alheio", () =>
+  asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+    db.query(
+      `select public.create_location_resource(
+         p_location_id => $1, p_name => 'Intruso', p_idempotency_key => $2::uuid)`,
+      [managedLocation.id, randomUUID()],
+    ),
+  ),
+);
+await mustReject("professor de fora não edita recursos alheios", () =>
+  asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+    db.query(`select public.update_location_resource($1, 'Renomeado')`, [court1.id]),
+  ),
+);
+
+const studentResources = await asDatabaseRole("authenticated", ANA_UID, () =>
+  rows(`select id from public.teacher_location_resource_records`),
+);
+check(studentResources.length === 0, "aluno não consulta recursos");
+await mustReject("aluno não cria recursos", () =>
+  asDatabaseRole("authenticated", ANA_UID, () =>
+    db.query(
+      `select public.create_location_resource(
+         p_location_id => $1, p_name => 'Do aluno', p_idempotency_key => $2::uuid)`,
+      [managedLocation.id, randomUUID()],
+    ),
+  ),
+);
+await mustReject("anónimo não lê recursos", () =>
+  asDatabaseRole("anon", null, () => db.query(`select id from public.location_resources limit 1`)),
+);
+await mustReject("anónimo não lê a projeção de recursos", () =>
+  asDatabaseRole("anon", null, () =>
+    db.query(`select id from public.teacher_location_resource_records limit 1`),
+  ),
+);
+
+// ── Papéis no clube ─────────────────────────────────────────────────────────
+
+const clubResourceInvite = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select public.invite_workspace_member($1,'outro.prof@exemplo.pt','teacher',$2) as id`, [
+    clubA.id,
+    randomUUID(),
+  ]),
+);
+const clubResourceMembership = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  one(`select public.accept_workspace_invitation($1) as id`, [clubResourceInvite.id]),
+);
+
+const resourceForMember = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  one(
+    `select id, name, can_manage from public.teacher_location_resource_records where id=$1`,
+    [clubCourt1.id],
+  ),
+);
+check(
+  resourceForMember?.id === clubCourt1.id && resourceForMember.can_manage === false,
+  "membro com papel teacher consulta os recursos do clube mas não os administra",
+);
+await mustReject("membro com papel teacher não cria recursos no clube", () =>
+  asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+    db.query(
+      `select public.create_location_resource(
+         p_location_id => $1, p_name => 'Do membro', p_idempotency_key => $2::uuid)`,
+      [clubLocation.id, randomUUID()],
+    ),
+  ),
+);
+await mustReject("membro com papel teacher não desativa recursos do clube", () =>
+  asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+    db.query(`select public.set_location_resource_active($1, false)`, [clubCourt1.id]),
+  ),
+);
+
+// Promovido a gestor, passa a administrar.
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(`select public.update_workspace_member_role($1,'manager')`, [clubResourceMembership.id]),
+);
+const managerResource = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  one(
+    `select public.create_location_resource(
+       p_location_id => $1, p_name => 'Campo do gestor', p_idempotency_key => $2::uuid) as id`,
+    [clubLocation.id, randomUUID()],
+  ),
+);
+check(managerResource.id !== null, "gestor do clube cria recursos no local do clube");
+
+// Clube suspenso pára as operações.
+await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  db.query(`select public.admin_set_workspace_status($1,'suspended','Teste de recursos')`, [
+    clubA.id,
+  ]),
+);
+await mustReject("clube suspenso não aceita recursos novos", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(
+      `select public.create_location_resource(
+         p_location_id => $1, p_name => 'Durante suspensão', p_idempotency_key => $2::uuid)`,
+      [clubLocation.id, randomUUID()],
+    ),
+  ),
+);
+await mustReject("clube suspenso não permite editar recursos", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.update_location_resource($1, 'Durante suspensão')`, [clubCourt1.id]),
+  ),
+);
+await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  db.query(`select public.admin_set_workspace_status($1,'active',null)`, [clubA.id]),
+);
+
+// Conta bloqueada — testada enquanto a membership ainda é de gestor, para que a
+// ausência de acesso venha do bloqueio e não de já não pertencer ao clube.
+await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  db.query(`select public.admin_set_account_status($1,'blocked','Teste de recursos')`, [
+    OTHER_TEACHER_UID,
+  ]),
+);
+const blockedResources = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  rows(`select id from public.teacher_location_resource_records`),
+);
+check(blockedResources.length === 0, "conta bloqueada não lê recursos");
+await mustReject("conta bloqueada não cria recursos", () =>
+  asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+    db.query(
+      `select public.create_location_resource(
+         p_location_id => $1, p_name => 'Bloqueado', p_idempotency_key => $2::uuid)`,
+      [clubLocation.id, randomUUID()],
+    ),
+  ),
+);
+await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  db.query(`select public.admin_set_account_status($1,'active',null)`, [OTHER_TEACHER_UID]),
+);
+
+// Membership removida perde o acesso.
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(`select public.remove_workspace_member($1)`, [clubResourceMembership.id]),
+);
+const resourcesAfterRemoval = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  rows(`select id from public.teacher_location_resource_records where location_id=$1`, [
+    clubLocation.id,
+  ]),
+);
+check(
+  resourcesAfterRemoval.length === 0,
+  "membership removida perde imediatamente o acesso aos recursos do clube",
+);
+
+// ── Grants, integridade e privacidade ───────────────────────────────────────
+
+const resourceWriteGrants = await rows(
+  `select privilege_type
+     from information_schema.table_privileges
+    where table_schema='public' and table_name='location_resources'
+      and grantee in ('authenticated','anon')
+      and privilege_type in ('INSERT','UPDATE','DELETE','TRUNCATE')`,
+);
+check(
+  resourceWriteGrants.length === 0,
+  "cliente autenticado não escreve diretamente na tabela de recursos",
+);
+await mustReject("cliente não insere recursos diretamente", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`insert into public.location_resources (location_id, name) values ($1,'Direto')`, [
+      managedLocation.id,
+    ]),
+  ),
+);
+await mustReject("cliente não altera recursos diretamente", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`update public.location_resources set name='Direto' where id=$1`, [court1.id]),
+  ),
+);
+
+const resourcePrivateColumns = await rows(
+  `select column_name
+     from information_schema.column_privileges
+    where table_schema='public' and table_name='location_resources'
+      and grantee in ('authenticated','anon')
+      and column_name in ('created_by','creation_idempotency_key')`,
+);
+check(
+  resourcePrivateColumns.length === 0,
+  "autoria e chave de idempotência ficam fora do SELECT partilhado de recursos",
+);
+
+const resourceViewAnon = await rows(
+  `select table_name from information_schema.table_privileges
+    where table_schema='public' and table_name='teacher_location_resource_records'
+      and grantee in ('anon','PUBLIC')`,
+);
+check(resourceViewAnon.length === 0, "anon não tem privilégios na projeção de recursos");
+
+const resourceFunctionAnon = await rows(
+  `select proc.proname from pg_proc proc
+     join pg_namespace ns on ns.oid = proc.pronamespace
+    where ns.nspname='public'
+      and proc.proname in ('create_location_resource','update_location_resource',
+                           'set_location_resource_active','can_manage_location_resources',
+                           'can_read_location_resources')
+      and has_function_privilege('anon', proc.oid, 'EXECUTE')`,
+);
+check(resourceFunctionAnon.length === 0, "anon não executa nenhuma RPC de recursos");
+
+const resourceInternalFunctions = await rows(
+  `select proc.proname from pg_proc proc
+     join pg_namespace ns on ns.oid = proc.pronamespace
+    where ns.nspname='public'
+      and proc.proname in ('log_location_resource_event','validate_location_resource_scope')
+      and (has_function_privilege('authenticated', proc.oid, 'EXECUTE')
+           or has_function_privilege('anon', proc.oid, 'EXECUTE'))`,
+);
+check(
+  resourceInternalFunctions.length === 0,
+  "funções internas de recursos não são executáveis pelo cliente",
+);
+
+const resourceSearchPath = await rows(
+  `select proc.proname from pg_proc proc
+     join pg_namespace ns on ns.oid = proc.pronamespace
+    where ns.nspname='public'
+      and proc.proname in ('create_location_resource','update_location_resource',
+                           'set_location_resource_active','can_manage_location_resources',
+                           'can_read_location_resources','log_location_resource_event',
+                           'validate_location_resource_scope')
+      and not exists (
+        select 1 from unnest(coalesce(proc.proconfig, array[]::text[])) as config
+        where config like 'search_path=%'
+      )`,
+);
+check(resourceSearchPath.length === 0, "todas as funções de recursos fixam search_path");
+
+await mustReject("a base recusa um recurso sem local", () =>
+  db.query(`insert into public.location_resources (location_id, name) values ($1,'Órfão')`, [
+    randomUUID(),
+  ]),
+);
+await mustReject("a base recusa apagar um local com recursos", () =>
+  db.query(`delete from public.locations where id=$1`, [managedLocation.id]),
+);
+await mustReject("a base recusa um nome de recurso vazio", () =>
+  db.query(`insert into public.location_resources (location_id, name) values ($1,'   ')`, [
+    managedLocation.id,
+  ]),
+);
+
+const resourceRls = await one(
+  `select relrowsecurity from pg_class where oid = to_regclass('public.location_resources')`,
+);
+check(resourceRls.relrowsecurity === true, "RLS está ativo na tabela de recursos");
+
+const resourceKindEnum = await rows(
+  `select enumlabel from pg_enum e join pg_type t on t.oid = e.enumtypid
+    where t.typname='location_resource_kind' order by e.enumsortorder`,
+);
+check(
+  resourceKindEnum.map((row) => row.enumlabel).join(",") === "court,room,area,other",
+  "os tipos de recurso são genéricos e não específicos de uma modalidade",
+);
+
+// O contrato que a Etapa 5C vai consumir não transporta autoria nem IDs internos.
+const resourceProjection = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select * from public.teacher_location_resource_records where id=$1`, [court1.id]),
+);
+check(
+  forbiddenColumns(resourceProjection ?? {}, [
+    "created_by",
+    "creation_idempotency_key",
+    "organization_id",
+    "teacher_id",
+    "notes",
+    "internal_reference",
+  ]).length === 0,
+  "a projeção de recursos não expõe autoria, organização nem dados administrativos",
+);
+
 section("Aulas (Fase 1)");
 
 const [generated] = await rows(

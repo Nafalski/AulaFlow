@@ -265,12 +265,16 @@ export function toWorkspaceSwitcherEntries(
  * A 5B.2A cria o modelo de contextos e a seleção; não torna alunos, pacotes,
  * disponibilidade ou calendário multi-clube. Esta lista existe para a interface
  * poder dizê-lo por palavras, em vez de fingir que já mudou.
+ *
+ * "Locais" saiu na 5B.3B: desde a 5B.3A um local pode mesmo pertencer a um
+ * clube — os membros veem-no, owner e manager administram-no — e os seus campos
+ * e salas herdam esse contexto. Manter o nome na lista passaria a ser falso na
+ * direção contrária: dizer que não mudou nada quando mudou.
  */
 export const PERSONAL_ONLY_MODULES = [
   "Alunos",
   "Pacotes e créditos",
   "Turmas",
-  "Locais",
   "Disponibilidade",
-  "Calendário",
+  "Calendário de aulas",
 ] as const;

@@ -1841,6 +1841,252 @@ try {
     "Locais nao expoem nenhum campo de fornecedor externo",
   );
 
+  section("Recursos de locais");
+
+  // Auto-cura: se uma execucao anterior tiver abortado a meio do teste de local
+  // inativo, o local E2E ficaria desativado e nada mais nesta seccao correria.
+  await teacherClient.rpc("set_location_active", {
+    p_location_id: privateLocationId,
+    p_is_active: true,
+  });
+
+  const courtKey = deterministicUuid(`resource-court:${runId}`);
+  const spareKey = deterministicUuid(`resource-spare:${runId}`);
+  const courtName = `Campo 1 E2E ${runId}`;
+  const spareName = `Campo 2 E2E ${runId}`;
+
+  const { data: courtId, error: courtError } = await teacherClient.rpc(
+    "create_location_resource",
+    {
+      p_location_id: privateLocationId,
+      p_name: courtName,
+      p_kind: "court",
+      p_display_order: 1,
+      p_idempotency_key: courtKey,
+    },
+  );
+  if (courtError) throw new Error(`Criar recurso: ${summarizeError(courtError)}`);
+  ok(`Professor A criou ou reutilizou o recurso E2E (${maskId(courtId)})`);
+
+  const { data: courtRepeat } = await teacherClient.rpc("create_location_resource", {
+    p_location_id: privateLocationId,
+    p_name: courtName,
+    p_kind: "court",
+    p_display_order: 1,
+    p_idempotency_key: courtKey,
+  });
+  check(courtRepeat === courtId, "Criar recurso com a mesma chave e idempotente");
+
+  await mustReject("Nome repetido no mesmo local e recusado", async () =>
+    teacherClient.rpc("create_location_resource", {
+      p_location_id: privateLocationId,
+      p_name: courtName.toUpperCase(),
+      p_idempotency_key: deterministicUuid(`resource-duplicate:${runId}`),
+    }),
+  );
+
+  const courtRecord = await getSingle(
+    "recurso do local privado",
+    teacherClient
+      .from("teacher_location_resource_records")
+      .select("id, location_id, name, kind, is_active, display_order, location_name, location_is_active, can_manage")
+      .eq("id", courtId),
+  );
+  check(
+    courtRecord.location_id === privateLocationId &&
+      courtRecord.can_manage === true &&
+      courtRecord.location_is_active === true,
+    "Recurso herda o local e a autorizacao de quem o administra",
+  );
+  check(
+    forbiddenColumns(courtRecord, [
+      "created_by",
+      "creation_idempotency_key",
+      "organization_id",
+      "teacher_id",
+      "notes",
+      "internal_reference",
+      "capacity",
+      "starts_at",
+      "ends_at",
+    ]).length === 0,
+    "Projecao de recursos nao expoe autoria, organizacao nem horarios",
+  );
+
+  // Edicao: normaliza, prova a idempotencia e prova que uma alteracao real
+  // devolve `true` — nesta ordem, para a seccao poder correr as vezes que forem
+  // precisas sem depender do estado deixado pela execucao anterior.
+  await teacherClient.rpc("update_location_resource", {
+    p_resource_id: courtId,
+    p_name: courtName,
+    p_kind: "court",
+    p_display_order: 1,
+  });
+  const { data: updateRepeat } = await teacherClient.rpc("update_location_resource", {
+    p_resource_id: courtId,
+    p_name: courtName,
+    p_kind: "court",
+    p_display_order: 1,
+  });
+  const { data: updateChanged } = await teacherClient.rpc("update_location_resource", {
+    p_resource_id: courtId,
+    p_name: courtName,
+    p_kind: "room",
+    p_display_order: 2,
+  });
+  const { data: updateRestored } = await teacherClient.rpc("update_location_resource", {
+    p_resource_id: courtId,
+    p_name: courtName,
+    p_kind: "court",
+    p_display_order: 1,
+  });
+  check(
+    updateRepeat === false && updateChanged === true && updateRestored === true,
+    "Editar recurso aplica alteracoes reais e ignora submissoes iguais",
+  );
+
+  const { data: spareId, error: spareError } = await teacherClient.rpc(
+    "create_location_resource",
+    {
+      p_location_id: privateLocationId,
+      p_name: spareName,
+      p_kind: "area",
+      p_display_order: 2,
+      p_idempotency_key: spareKey,
+    },
+  );
+  if (spareError) throw new Error(`Criar segundo recurso: ${summarizeError(spareError)}`);
+
+  await teacherClient.rpc("set_location_resource_active", {
+    p_resource_id: spareId,
+    p_is_active: true,
+  });
+  const { data: deactivated } = await teacherClient.rpc("set_location_resource_active", {
+    p_resource_id: spareId,
+    p_is_active: false,
+  });
+  const { data: deactivatedAgain } = await teacherClient.rpc("set_location_resource_active", {
+    p_resource_id: spareId,
+    p_is_active: false,
+  });
+  const spareRecord = await getSingle(
+    "recurso desativado",
+    teacherClient
+      .from("teacher_location_resource_records")
+      .select("id, is_active")
+      .eq("id", spareId),
+  );
+  check(
+    deactivated === true && deactivatedAgain === false && spareRecord.is_active === false,
+    "Desativar preserva a linha e repetir e idempotente",
+  );
+  await teacherClient.rpc("set_location_resource_active", {
+    p_resource_id: spareId,
+    p_is_active: true,
+  });
+
+  // Escrita direta e sempre recusada: autoria e chave vivem na tabela.
+  await mustReject("Professor nao insere diretamente recursos", async () =>
+    teacherClient
+      .from("location_resources")
+      .insert({ location_id: privateLocationId, name: "Insercao direta" }),
+  );
+  await mustReject("Professor nao altera diretamente recursos", async () =>
+    teacherClient.from("location_resources").update({ name: "Escrita direta" }).eq("id", courtId),
+  );
+
+  await mustReturnNoRows("Professor B nao ve os recursos do local privado do Professor A", () =>
+    teacherBClient.from("teacher_location_resource_records").select("id").eq("id", courtId),
+  );
+  await mustReject("Professor B nao cria recursos no local alheio", async () =>
+    teacherBClient.rpc("create_location_resource", {
+      p_location_id: privateLocationId,
+      p_name: "Intruso",
+      p_idempotency_key: deterministicUuid(`resource-intruder:${runId}`),
+    }),
+  );
+  await mustReject("Professor B nao edita recursos alheios", async () =>
+    teacherBClient.rpc("update_location_resource", {
+      p_resource_id: courtId,
+      p_name: "Apropriacao indevida",
+    }),
+  );
+  await mustReject("Professor B nao desativa recursos alheios", async () =>
+    teacherBClient.rpc("set_location_resource_active", {
+      p_resource_id: courtId,
+      p_is_active: false,
+    }),
+  );
+
+  // Local do clube: o Professor A e proprietario e administra os recursos.
+  const clubResourceKey = deterministicUuid(`resource-club:${runId}`);
+  const { data: clubResourceId, error: clubResourceError } = await teacherClient.rpc(
+    "create_location_resource",
+    {
+      p_location_id: clubLocationId,
+      p_name: `Court Central E2E ${runId}`,
+      p_kind: "court",
+      p_display_order: 1,
+      p_idempotency_key: clubResourceKey,
+    },
+  );
+  if (clubResourceError) {
+    throw new Error(`Criar recurso do clube: ${summarizeError(clubResourceError)}`);
+  }
+  await mustReturnNoRows("Professor de fora do clube nao ve os recursos do clube", () =>
+    teacherBClient.from("teacher_location_resource_records").select("id").eq("id", clubResourceId),
+  );
+
+  // Locais publicos nao suportam recursos nesta etapa, e a limitacao e do
+  // servidor — nao apenas da interface.
+  await mustReject("Local publico nao aceita recursos", async () =>
+    teacherClient.rpc("create_location_resource", {
+      p_location_id: suggestionId,
+      p_name: "Campo do parque",
+      p_idempotency_key: deterministicUuid(`resource-public:${runId}`),
+    }),
+  );
+
+  // Local inativo nao aceita recursos novos; os existentes permanecem.
+  await teacherClient.rpc("set_location_active", {
+    p_location_id: privateLocationId,
+    p_is_active: false,
+  });
+  await mustReject("Local inativo nao aceita recursos novos", async () =>
+    teacherClient.rpc("create_location_resource", {
+      p_location_id: privateLocationId,
+      p_name: `Campo 9 E2E ${runId}`,
+      p_idempotency_key: deterministicUuid(`resource-inactive:${runId}`),
+    }),
+  );
+  const survivingResource = await getSingle(
+    "recurso de local desativado",
+    teacherClient
+      .from("teacher_location_resource_records")
+      .select("id, location_is_active")
+      .eq("id", courtId),
+  );
+  check(
+    survivingResource.location_is_active === false,
+    "Desativar o local preserva os recursos que ja existiam",
+  );
+  await teacherClient.rpc("set_location_active", {
+    p_location_id: privateLocationId,
+    p_is_active: true,
+  });
+
+  // O aluno le locais porque precisa de saber onde e a aula; recursos, nao.
+  await mustReturnNoRows("Aluno nao consulta recursos de locais", () =>
+    studentClient.from("teacher_location_resource_records").select("id").limit(1),
+  );
+  await mustReject("Aluno nao cria recursos", async () =>
+    studentClient.rpc("create_location_resource", {
+      p_location_id: privateLocationId,
+      p_name: "Do aluno",
+      p_idempotency_key: deterministicUuid(`resource-student:${runId}`),
+    }),
+  );
+
   section("Conta bloqueada e anonimo");
   await signIn(blockedClient, credentials.blocked.email, credentials.blocked.password, "Conta bloqueada");
   await mustReturnNoRows("Conta bloqueada nao le views de pacotes", () =>
@@ -1915,6 +2161,20 @@ try {
     }),
   );
 
+  await mustReturnNoRows("Conta bloqueada nao le recursos de locais", () =>
+    blockedClient.from("teacher_location_resource_records").select("id").limit(1),
+  );
+  await mustReject("Conta bloqueada nao cria recursos", async () =>
+    blockedClient.rpc("create_location_resource", {
+      p_location_id: privateLocationId,
+      p_name: "Bloqueado",
+      p_idempotency_key: deterministicUuid(`resource-blocked:${runId}`),
+    }),
+  );
+
+  await mustReject("Anonimo nao le recursos de locais", async () =>
+    anonClient.from("teacher_location_resource_records").select("id").limit(1),
+  );
   await mustReject("Anonimo nao le view de pacotes", async () =>
     anonClient.from("student_package_records").select("id").limit(1),
   );

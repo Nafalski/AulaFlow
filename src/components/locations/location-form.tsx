@@ -116,7 +116,10 @@ export function LocationForm({
           <TextField name="city" label="Localidade" defaultValue={values.city ?? ""} maxLength={120} autoComplete="address-level2" error={state.fieldErrors?.city} />
           <TextField name="postalCode" label="Código postal" defaultValue={values.postalCode ?? ""} maxLength={20} autoComplete="postal-code" error={state.fieldErrors?.postalCode} />
           <TextField name="country" label="País" defaultValue={values.country ?? ""} maxLength={80} autoComplete="country-name" error={state.fieldErrors?.country} />
-          <TextField name="internalReference" label="Campo, quadra ou referência interna" defaultValue={values.internalReference ?? ""} maxLength={80} placeholder="Ex.: Campo B · entrada norte" autoComplete="off" error={state.fieldErrors?.internalReference} />
+          {/* Deixou de mencionar campos e quadras: isso passou a ter estrutura
+              própria em «Campos, salas e áreas». Aqui ficam apenas as notas de
+              acesso ao espaço. */}
+          <TextField name="internalReference" label="Referência interna" defaultValue={values.internalReference ?? ""} maxLength={80} placeholder="Ex.: entrada norte · código do portão" hint="Nota curta sobre como chegar ou entrar. Os campos e salas definem-se à parte." autoComplete="off" error={state.fieldErrors?.internalReference} />
           <TextareaField name="notes" label="Observações administrativas" defaultValue={values.notes ?? ""} maxLength={2_000} rows={5} hint="Privadas: não fazem parte da projeção disponibilizada aos alunos." error={state.fieldErrors?.notes} />
 
           {state.fieldErrors?.form && <p role="alert" className="text-sm font-medium text-state-danger">{state.fieldErrors.form}</p>}

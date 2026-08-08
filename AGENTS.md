@@ -156,7 +156,8 @@ update public.profiles set role = 'admin' where email = 'voce@exemplo.pt';
 │   ├── ..._phase5_club_calendar_outside_hours.sql Etapa 5B.2B: dia sem janela positiva é fora do horário
 │   ├── ..._phase5_location_domain.sql Etapa 5B.3A: visibilidade, moderação e morada manual
 │   ├── ..._phase5_location_security.sql Etapa 5B.3A: RLS, grants e projeções de locais
-│   └── ..._phase5_location_functions.sql Etapa 5B.3A: RPCs atómicas de locais
+│   ├── ..._phase5_location_functions.sql Etapa 5B.3A: RPCs atómicas de locais
+│   └── ..._phase5_location_resources.sql Etapa 5B.3B: campos, salas e áreas de um local
 │
 └── src/
     ├── proxy.ts             Renova a sessão e protege rotas (era middleware.ts)
@@ -177,6 +178,7 @@ update public.profiles set role = 'admin' where email = 'voce@exemplo.pt';
     │   ├── settings/        Formulários de conta, perfil público, avisos e segurança
     │   ├── availability/    Horários, exceções e bloqueios do professor
     │   ├── workspaces/      Criação de clube, membros, convites e seletor de contexto
+    │   ├── locations/      Locais, moradas manuais, moderação e recursos do local
     │   ├── admin/           Diretório, filtros, detalhe, estado de contas e clubes
     │   └── brand/           Logótipo
     │
@@ -322,7 +324,35 @@ Views: `teacher_location_records` (os seus, os do clube, os públicos aprovados)
 
 **Retrocompatibilidade:** locais anteriores ficam `private`/`not_required`/`manual`. `teacher_id` **não** é exigido pelo trigger — a Fase 3 só atribuiu responsável em organizações com um professor, e editar os restantes não pode passar a ser impossível.
 
-**Não implementado:** campos, quadras, salas, recursos (5B.3B), aulas (5C), conflitos e créditos (5D).
+**Não implementado:** aulas (5C), conflitos e créditos (5D). Campos, salas e áreas passaram a existir na 5B.3B, abaixo.
+
+### Campos, salas e áreas de um local (Etapa 5B.3B)
+
+Um local pode conter **recursos**: campos, quadras, salas, áreas. É a futura unidade de **conflito físico** — dois professores às 18:00 no Campo 1 do mesmo local serão um conflito; no Campo 1 e no Campo 2, não.
+
+**Aqui não existe nenhuma lógica de conflito, horário, reserva ou disponibilidade.** Isso exige aulas (5C) e conflitos (5D). Um recurso não tem estado de ocupação — não escrever "livre", "ocupado", "reservado", "vaga" ou "conflito" em nada que descreva um recurso.
+
+**Tipos genéricos.** `location_resource_kind` = `court`/`room`/`area`/`other`. O AulaFlow serve ténis, padel, beach tennis, ginásio e aulas de sala; não acrescentar valores de uma modalidade só. O nome ("Campo 1", "Court Central", "Sala Funcional") é texto livre do utilizador.
+
+**Sem capacidade.** Capacidade do espaço, máximo de alunos de uma aula e limite de uma turma são três regras diferentes; uma coluna `capacity` aqui seria lida como as três. Não a acrescentar sem necessidade concreta.
+
+**Sem recursos em locais públicos.** Um trigger recusa-os. Um local público é visível a todos os professores, e deixar o proponente definir os campos que todos veriam dar-lhe-ia poder sobre trabalho alheio. A limitação é do servidor, não da interface.
+
+**Herda o contexto do local.** `can_manage_location_resources()` é `can_manage_location()` mais a recusa de locais públicos — não repetir regras de clube nem de membership. Quem administra o local administra os seus recursos; um membro com papel `teacher` consulta.
+
+**O aluno não lê recursos.** `can_read_location_resources()` exige professor ou admin. Um aluno lê `locations` porque precisa de saber onde é a aula; um recurso é hoje matéria de gestão. Quando a 5C ligar um recurso a uma aula, o aluno lê-o pela projeção dessa aula — não por acesso direto ao inventário do local.
+
+**Escrita só por RPC.** `create_location_resource`, `update_location_resource`, `set_location_resource_active`. Sem GRANT de INSERT/UPDATE/DELETE: com autoria e chave de idempotência na tabela, a escrita direta permitiria forjar o autor.
+
+**SELECT por lista de colunas.** `created_by` e `creation_idempotency_key` ficam fora do GRANT partilhado.
+
+**Unicidade por local, só entre ativos.** `(location_id, lower(btrim(name))) where is_active`. Dois recursos ativos com o mesmo nome seriam indistinguíveis ao escolher um; um desativado não ocupa o nome; "Campo 1" existe legitimamente em milhares de locais. A foreign key é `on delete restrict`.
+
+View: `teacher_location_resource_records` — é o contrato que a Etapa 5C vai consumir para oferecer recursos ao criar uma aula.
+
+`locations.internal_reference` deixou de ser rotulado "Campo, quadra ou referência interna": passou a "Referência interna", para notas de acesso ao espaço. Não voltar a usá-lo como substituto de um recurso.
+
+**Não implementado:** aulas, participantes, disponibilidade/horário/reserva de recurso, conflitos, créditos, notificações.
 
 ### Ao criar uma tabela nova
 
@@ -354,7 +384,7 @@ npm run typecheck
 
 ### `npm run db:verify`
 
-Executa **todas** as migrações, a partir de uma base vazia, contra PostgreSQL compilado para WebAssembly (PGlite), e volta a aplicá-las para confirmar idempotência. Depois exerce 537 garantias: RLS com papéis `authenticated`/`anon`, isolamento entre organizações e professores, privilégios das RPCs, perfis/claim/bloqueio, convites sem segredo, alunos, turmas, locais, modelos, atribuição, consulta e ajustes administrativos de pacotes, disponibilidade do professor, calendário seguro, clubes, memberships, convites de workspace, papéis internos, contexto ativo, suspensão, consentimento de partilha por clube, projeção do calendário partilhado, grants estritos das views, políticas, reserva, consumo, libertação, reagendamento, exceções, correções, imutabilidade do livro-razão e constraints herdadas das aulas.
+Executa **todas** as migrações, a partir de uma base vazia, contra PostgreSQL compilado para WebAssembly (PGlite), e volta a aplicá-las para confirmar idempotência. Depois exerce 582 garantias: RLS com papéis `authenticated`/`anon`, isolamento entre organizações e professores, privilégios das RPCs, perfis/claim/bloqueio, convites sem segredo, alunos, turmas, locais, modelos, atribuição, consulta e ajustes administrativos de pacotes, disponibilidade do professor, calendário seguro, clubes, memberships, convites de workspace, papéis internos, contexto ativo, suspensão, consentimento de partilha por clube, projeção do calendário partilhado, grants estritos das views, políticas, reserva, consumo, libertação, reagendamento, exceções, correções, imutabilidade do livro-razão, locais, campos/salas/áreas e constraints herdadas das aulas.
 
 Corre em segundos, sem Docker e sem projeto na nuvem — serve para o CI.
 
@@ -644,7 +674,7 @@ Interface em `/professor/clubes/[id]/calendario`, com filtro por professor no UR
 
 **Não implementado:** aulas, participantes, locais, campos, recursos, conflitos, reservas e créditos. Os únicos estados são disponível e indisponível — não escrever "ocupado", "reservado", "lotado", "vagas" ou "conflito", porque nada disso existe ainda para ser verdade.
 
-Ordem: 5B.3B campos e recursos → 5C criação/edição de aulas → 5D recorrência, conflitos e reservas de créditos → 5E revisão integrada.
+Ordem: 5C criação/edição de aulas → 5D recorrência, conflitos e reservas de créditos → 5E revisão integrada.
 
 ### `src/types/database.ts`
 
@@ -656,7 +686,7 @@ As linhas são declaradas com `type`, **nunca com `interface`**. Um `interface` 
 
 Vitest, ambiente Node, `TZ=Europe/Lisbon` fixo para que um teste que passa localmente passe também no CI (que corre em UTC).
 
-Cobertura atual: **373 testes** em vinte e dois ficheiros — testes de domínio, regressões de respostas/autenticação do proxy, formulários da Fase 2, validação/normalização da gestão da Fase 3, modelos, atribuição, apresentação, navegação, ajustes administrativos de pacotes, disponibilidade do professor, calendário, permissões de clube, validação de workspaces, regras do calendário partilhado e domínio de locais.
+Cobertura atual: **418 testes** em vinte e quatro ficheiros — testes de domínio, regressões de respostas/autenticação do proxy, formulários da Fase 2, validação/normalização da gestão da Fase 3, modelos, atribuição, apresentação, navegação, ajustes administrativos de pacotes, disponibilidade do professor, calendário, permissões de clube, validação de workspaces, regras do calendário partilhado, domínio de locais e recursos de locais.
 
 Os testes de domínio exercem funções puras, sem base de dados nem mocks. Os testes de validação garantem normalização, limites, identificadores, estados, valores monetários em cêntimos, datas civis e rejeição de campos extra/protegidos. A integração SQL fica separada em `db:verify`.
 
@@ -679,7 +709,7 @@ Não existe um comando de formatação separado. Use `npm run lint:fix` apenas p
 | 2 | Perfis, definições e gestão administrativa básica de contas | **Concluído** |
 | 3 | Alunos, turmas, locais, política de cancelamento | **Concluído** |
 | 4 | Interfaces de modelos, atribuição, ajustes e saldos | **Concluído** — Etapas 1A, 1B, 1C, 1D e 1E validadas com Auth/PostgREST reais e browser desktop/mobile |
-| 5 | Calendário e criação de aulas com reserva | **Parcialmente concluído** — Etapas 5A, 5B, 5B.1, 5B.2A, 5B.2B e 5B.3A: disponibilidade, projeção segura, refinamento visual, clubes/membros, calendário partilhado e domínio de locais com moradas manuais |
+| 5 | Calendário e criação de aulas com reserva | **Parcialmente concluído** — Etapas 5A, 5B, 5B.1, 5B.2A, 5B.2B, 5B.3A e 5B.3B: disponibilidade, projeção segura, refinamento visual, clubes/membros, calendário partilhado, domínio de locais com moradas manuais e campos/salas/áreas de cada local |
 | 6 | Cancelamento, reagendamento, presenças e histórico | **Planeado** |
 | 7 | Área do aluno: aulas, créditos e confirmação | **Planeado** |
 | 8 | Notificações, lembretes e expiração agendada | **Planeado** |

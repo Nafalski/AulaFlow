@@ -132,8 +132,9 @@ export default async function TeacherClubsPage() {
 
       <Alert tone="info" title="O que ainda usa apenas o workspace pessoal">
         Mudar de contexto altera o clube que está a gerir, não os dados destes módulos:{" "}
-        {PERSONAL_ONLY_MODULES.join(", ")}. O calendário partilhado do clube chega na etapa
-        seguinte. Nenhum professor vê alunos, pacotes, saldos ou agenda de outro.
+        {PERSONAL_ONLY_MODULES.join(", ")}. Os locais do clube — e os campos e salas de cada um —
+        já são partilhados com os membros. Nenhum professor vê alunos, pacotes ou saldos de outro,
+        e a disponibilidade só é partilhada por quem a autoriza.
       </Alert>
 
       <p className="flex items-center gap-2 text-sm text-muted">

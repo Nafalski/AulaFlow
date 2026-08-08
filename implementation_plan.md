@@ -6,7 +6,7 @@
 
 **Documento vivo.** Atualizado no fim de cada fase com o que foi realmente construído.
 
-- **Estado atual:** Fases 1, 1.5, 2, 3 e 4 concluídas. A Fase 5 tem as **Etapas 5A, 5B, 5B.1, 5B.2A, 5B.2B e 5B.3A** concluídas — disponibilidade, projeção segura, calendário visual refinado, clubes/workspaces/membros, calendário partilhado com consentimento e domínio de locais com moradas manuais. **Campos e recursos (5B.3B)** e a criação de aulas continuam pendentes.
+- **Estado atual:** Fases 1, 1.5, 2, 3 e 4 concluídas. A Fase 5 tem as **Etapas 5A, 5B, 5B.1, 5B.2A, 5B.2B, 5B.3A e 5B.3B** concluídas — disponibilidade, projeção segura, calendário visual refinado, clubes/workspaces/membros, calendário partilhado com consentimento, domínio de locais com moradas manuais e campos/salas/áreas de cada local. **A criação de aulas (5C)** continua pendente.
 - **Timezone do sistema:** `Europe/Lisbon`
 - **Idioma da interface:** Português (pt-PT)
 
@@ -812,10 +812,10 @@ Ordem da Fase 5:
 2. 5B.2A — Clubes, workspaces e membros. **Concluída.**
 3. 5B.2B — Calendário partilhado do clube. **Concluída.**
 4. 5B.3A — Locais e moradas manuais. **Concluída.**
-5. 5B.3B — Campos e recursos. **Próxima.**
-5. 5C — Criação e edição de aulas.
-6. 5D — Recorrência, conflitos e reservas de créditos.
-7. 5E — Revisão integrada.
+5. 5B.3B — Campos e recursos dos locais. **Concluída.**
+6. 5C — Criação e edição de aulas. **Próxima.**
+7. 5D — Recorrência, conflitos e reservas de créditos.
+8. 5E — Revisão integrada.
 
 ### Concluído na Fase 5 — Etapa 5B.3A: locais e moradas manuais
 
@@ -861,7 +861,47 @@ Locais existentes ficam `private`/`not_required`/`manual`, com `created_by` deri
 
 #### Não implementado
 
-Campos, quadras, salas e recursos (5B.3B); aulas (5C); conflitos e créditos (5D); qualquer integração externa, mapa ou cálculo de distância.
+Aulas (5C); conflitos e créditos (5D); qualquer integração externa, mapa ou cálculo de distância. Campos, quadras e salas passaram a existir na 5B.3B, a seguir.
+
+### Concluído na Fase 5 — Etapa 5B.3B: campos e recursos dos locais
+
+Estado: **concluída**.
+
+Um local passou a poder conter **recursos**: campos, quadras, salas e áreas. É a futura unidade de **conflito físico** — dois professores às 18:00 no Campo 1 do mesmo local serão um conflito; no Campo 1 e no Campo 2, não. Nesta etapa modela-se apenas a estrutura: **não existe aqui nenhuma lógica de conflito, horário, reserva ou disponibilidade de recurso**, porque isso exige aulas (5C) e conflitos (5D).
+
+#### Auditoria prévia
+
+Não existia nenhuma tabela de `courts`, `resources`, `rooms`, `spaces` ou `facilities`. A estrutura mais próxima era `locations.internal_reference`, um campo de texto livre que a interface rotulava "Campo, quadra ou referência interna" — um substituto improvisado. A coluna mantém-se, porque continua útil para "entrada norte" ou o código do portão, mas o rótulo deixou de mencionar campos: passou a "Referência interna", e a duplicação de conceito desapareceu.
+
+#### Três decisões, e porquê
+
+1. **Sem capacidade.** Capacidade física do recurso, capacidade de uma aula e capacidade de uma turma são três coisas diferentes, e uma coluna `capacity` aqui seria lida como as três. Uma quadra que "suporta 4" não limita uma aula individual. Sem necessidade concreta agora, fica de fora em vez de criar uma regra prematura que a 5C/5D teriam de contornar.
+2. **Sem notas administrativas.** Seriam mais uma coluna a mascarar em cada projeção. `locations.notes` já cobre o que há a dizer sobre o espaço.
+3. **Sem recursos em locais públicos.** Um local público aprovado é visível a todos os professores; deixar o proponente administrar os recursos que todos veriam dar-lhe-ia poder sobre trabalho alheio. A limitação é imposta por um trigger — não é um esquecimento da interface — e está documentada como tal.
+
+#### Modelo
+
+`location_resources` guarda `location_id`, `name`, `kind`, `is_active`, `display_order`, autoria e chave de idempotência. `location_resource_kind` é `court`/`room`/`area`/`other` — **genérico de propósito**, porque o AulaFlow serve ténis, padel, beach tennis, ginásio e aulas de sala; o nome ("Campo 1", "Court Central", "Sala Funcional") é texto livre.
+
+A unicidade é `(location_id, lower(btrim(name))) where is_active`: dois recursos ativos com o mesmo nome no mesmo local seriam indistinguíveis no momento de escolher um, mas um recurso desativado não ocupa o nome, e "Campo 1" existe legitimamente em milhares de locais. A foreign key é `on delete restrict` — um recurso órfão não faz sentido nenhum.
+
+#### Segurança
+
+O recurso **herda o contexto do local**: `can_manage_location_resources()` é `can_manage_location()` mais a recusa de locais públicos, e por isso não repete regras de clube nem de membership. A leitura tem função própria, `can_read_location_resources()`, que exclui alunos — um aluno lê `locations` porque precisa de saber onde é a aula, mas um recurso é hoje matéria de gestão; quando a 5C ligar um recurso a uma aula, o aluno lê-o pela projeção dessa aula.
+
+Escrita exclusivamente por RPC (`create_location_resource`, `update_location_resource`, `set_location_resource_active`); `SELECT` por lista de colunas, com `created_by` e `creation_idempotency_key` fora do GRANT. A projeção `teacher_location_resource_records` é o contrato que a 5C vai consumir.
+
+#### Interface
+
+Secção "Campos, salas e áreas" dentro de `/professor/locais/[id]`: lista com estado, formulário de criação, edição em linha e desativar/reativar. Quem só consulta o local vê a lista sem ações. Em locais públicos a secção não aparece de todo.
+
+#### Efeito colateral: `PERSONAL_ONLY_MODULES`
+
+"Locais" saiu da lista. Desde a 5B.3A um local pode mesmo pertencer a um clube — os membros veem-no, `owner`/`manager` administram-no — e agora os seus campos e salas herdam esse contexto. Manter o nome na lista passaria a desinformar na direção oposta à do resto dela.
+
+#### Não implementado
+
+Aulas e participantes (5C); disponibilidade, horário ou reserva de um recurso; conflitos e créditos (5D); notificações; qualquer integração externa. Os recursos não têm estado de ocupação — a interface não diz "livre", "ocupado", "reservado" nem "conflito", porque nada disso existe ainda para ser verdade.
 
 ### Fase 2 — estado por item
 
@@ -990,6 +1030,14 @@ Ver secção 1.4. Preservar o que funciona; a separação por área é a pedida.
 **Alternativa:** token assinado numa URL de convite.
 **Porquê:** a mesma razão de `student_invitations`. Um token é um segredo portador que aparece em logs, históricos de browser e cabeçalhos `Referer`, e obriga a gerir entropia, hashing, expiração e uso único. Exigir que quem aceita esteja autenticado com o email **confirmado** do convite dá a mesma garantia sem criar nada que possa vazar. O custo é não poder convidar alguém que nunca confirme o email — que é precisamente quem não deveria entrar.
 
+### D-22 — Recursos sem capacidade
+**Alternativa:** uma coluna `capacity` em `location_resources`, já que a informação parece óbvia.
+**Porquê:** capacidade física do espaço, número máximo de alunos numa aula e limite de uma turma são três regras diferentes com três donos diferentes. Uma coluna com este nome aqui seria lida como as três, e uma quadra que "suporta 4" não limita uma aula individual. Sem uma necessidade concreta, acrescentá-la agora seria criar uma regra que a 5C e a 5D teriam de contornar. O custo é uma migração futura de uma coluna — barato face a desfazer semântica errada espalhada por três camadas.
+
+### D-23 — Recursos apenas em locais privados e de clube
+**Alternativa:** permitir recursos também em locais públicos, geridos por quem propôs o local.
+**Porquê:** um local público aprovado é visível a todos os professores. Deixar o proponente definir os campos que todos veriam dar-lhe-ia poder sobre o trabalho alheio, sem nenhuma relação de confiança que o justifique — e o AulaFlow não tem ainda moderação de recursos. A limitação é imposta por um trigger, e não pela interface, para que fique explícita no esquema em vez de parecer um esquecimento. O custo é um local público não ter campos identificáveis; quem precisar disso cria o seu próprio local privado ou de clube.
+
 ---
 
 ## 12. Pontos de extensão
@@ -998,7 +1046,7 @@ Preparados, **não implementados**. Assinalados no código com `// EXTENSÃO:`.
 
 | Funcionalidade | O que já está preparado | O que falta |
 |---|---|---|
-| Clubes com vários professores | `organizations` tipada, `organization_members`, convites, papéis internos, contexto ativo e calendário partilhado com consentimento (5B.2A + 5B.2B) | Locais/campos (5B.3); aulas (5C); transferência de propriedade |
+| Clubes com vários professores | `organizations` tipada, `organization_members`, convites, papéis internos, contexto ativo, calendário partilhado com consentimento e locais/recursos do clube (5B.2A + 5B.2B + 5B.3) | Aulas (5C); conflitos por recurso (5D); transferência de propriedade |
 | Outras modalidades | Tabela `sports`; pacotes com `sport_id` opcional | Seed; campos por desporto |
 | Pagamentos | `paid_amount_cents`, `reference_price_cents` | Stripe; tabela `payments` |
 | Expiração automática de créditos | `credit_expired` no enum; `refresh_package_status()` | Tarefa agendada noturna |

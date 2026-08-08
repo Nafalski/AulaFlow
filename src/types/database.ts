@@ -197,6 +197,15 @@ export type LocationModerationStatus = "not_required" | "pending" | "approved" |
  */
 export type LocationAddressSource = "manual";
 
+/**
+ * Tipo de recurso físico dentro de um local.
+ *
+ * Genérico de propósito — o AulaFlow serve ténis, padel, beach tennis, ginásio
+ * e aulas de sala. O nome do recurso ("Campo 1", "Sala Funcional") é texto
+ * livre; o tipo serve apenas para agrupar e apresentar.
+ */
+export type LocationResourceKind = "court" | "room" | "area" | "other";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Linhas
 // ─────────────────────────────────────────────────────────────────────────────
@@ -800,6 +809,35 @@ export type TeacherGroupRecord = Group & {
   participant_count: number;
 };
 
+/**
+ * Recurso físico de um local.
+ *
+ * `created_by` e `creation_idempotency_key` existem na tabela mas estão FORA do
+ * GRANT de `authenticated`, tal como em `Location`. Por isso não fazem parte
+ * desta linha.
+ */
+export type LocationResource = {
+  id: UUID;
+  location_id: UUID;
+  name: string;
+  kind: LocationResourceKind;
+  is_active: boolean;
+  display_order: number;
+  created_at: Timestamp;
+  updated_at: Timestamp;
+};
+
+/** Projeção que a Etapa 5C consumirá para oferecer recursos ao criar uma aula. */
+export type TeacherLocationResourceRecord = Omit<
+  LocationResource,
+  "created_at" | "updated_at"
+> & {
+  location_name: string;
+  location_is_active: boolean;
+  /** Quem administra o local administra os seus recursos. */
+  can_manage: boolean;
+};
+
 export type TeacherLocationRecord = Location & {
   organization_name: string;
   belongs_to_club: boolean;
@@ -1305,6 +1343,14 @@ export type Database = {
         Update: never;
         Relationships: [];
       };
+      location_resources: {
+        Row: LocationResource;
+        // Mesmo motivo: autoria e chave de idempotência tornam a escrita direta
+        // uma forma de forjar o autor de um recurso.
+        Insert: never;
+        Update: never;
+        Relationships: [];
+      };
       groups: {
         Row: Group;
         Insert: {
@@ -1539,6 +1585,10 @@ export type Database = {
       };
       teacher_location_records: {
         Row: TeacherLocationRecord;
+        Relationships: [];
+      };
+      teacher_location_resource_records: {
+        Row: TeacherLocationResourceRecord;
         Relationships: [];
       };
       admin_location_moderation_records: {
@@ -1954,6 +2004,29 @@ export type Database = {
         };
         Returns: boolean;
       };
+      create_location_resource: {
+        Args: {
+          p_location_id: UUID;
+          p_name: string;
+          p_kind?: LocationResourceKind;
+          p_display_order?: number;
+          p_idempotency_key?: UUID | null;
+        };
+        Returns: UUID;
+      };
+      update_location_resource: {
+        Args: {
+          p_resource_id: UUID;
+          p_name: string;
+          p_kind?: LocationResourceKind;
+          p_display_order?: number;
+        };
+        Returns: boolean;
+      };
+      set_location_resource_active: {
+        Args: { p_resource_id: UUID; p_is_active: boolean };
+        Returns: boolean;
+      };
       get_club_availability_calendar: {
         Args: {
           p_organization_id: UUID;
@@ -1995,6 +2068,7 @@ export type Database = {
       location_visibility: LocationVisibility;
       location_moderation_status: LocationModerationStatus;
       location_address_source: LocationAddressSource;
+      location_resource_kind: LocationResourceKind;
     };
     CompositeTypes: Record<never, never>;
   };

@@ -223,6 +223,13 @@ describe("apresentação", () => {
   it("declara explicitamente os módulos que continuam só no contexto pessoal", () => {
     expect(PERSONAL_ONLY_MODULES).toContain("Alunos");
     expect(PERSONAL_ONLY_MODULES).toContain("Pacotes e créditos");
-    expect(PERSONAL_ONLY_MODULES).toContain("Calendário");
+    expect(PERSONAL_ONLY_MODULES).toContain("Disponibilidade");
+  });
+
+  // Um local pode pertencer a um clube desde a 5B.3A, e os seus campos e salas
+  // herdam esse contexto na 5B.3B. Continuar a anunciá-lo como pessoal seria
+  // desinformar na direção oposta à do resto desta lista.
+  it("já não afirma que os locais são apenas pessoais", () => {
+    expect(PERSONAL_ONLY_MODULES).not.toContain("Locais");
   });
 });
