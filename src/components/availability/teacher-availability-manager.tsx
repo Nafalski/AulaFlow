@@ -129,7 +129,7 @@ function PreferencesForm({
             Preferências
           </span>
         }
-        description="Valores usados mais tarde ao criar aulas e calcular conflitos."
+        description="Valores usados ao criar aulas e validar conflitos."
       />
       <CardBody>
         <form action={formAction} onReset={preserveFormValuesOnReset} className="flex flex-col gap-4">
@@ -155,7 +155,7 @@ function PreferencesForm({
               label="Intervalo mínimo"
               defaultValue={String(minimumBreakMinutes)}
               required
-              hint="Guardado agora; será aplicado aos conflitos de aulas na Etapa 5D."
+              hint="Aplicado ao criar ou editar aulas para respeitar o intervalo entre marcações."
               error={state.fieldErrors?.minimumBreakMinutes}
             >
               {MINIMUM_BREAK_OPTIONS.map((minutes) => (

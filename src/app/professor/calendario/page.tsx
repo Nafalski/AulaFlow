@@ -8,7 +8,7 @@ import { Alert } from "@/components/ui/alert";
 import { requireRole } from "@/lib/auth/session";
 import { lisbonDateKey, lisbonDayRange } from "@/lib/datetime";
 import {
-  NO_CONFLICT_CHECK_NOTICE,
+  LESSON_CONFLICT_PROTECTION_NOTICE,
   lessonCalendarSlot,
 } from "@/lib/domain/lesson-scheduling";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
@@ -126,7 +126,7 @@ export default async function TeacherCalendarPage({
       />
 
       <Alert tone="info">
-        {NO_CONFLICT_CHECK_NOTICE}
+        {LESSON_CONFLICT_PROTECTION_NOTICE}
       </Alert>
     </div>
   );

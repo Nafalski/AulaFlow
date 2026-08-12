@@ -2,10 +2,10 @@ import { describe, expect, it } from "vitest";
 
 import {
   EDITABLE_LESSON_STATUSES,
+  LESSON_CONFLICT_PROTECTION_NOTICE,
   LESSON_CONTEXT_KINDS,
   LESSON_CONTEXT_LABELS,
   LESSON_DURATION_LIMITS,
-  NO_CONFLICT_CHECK_NOTICE,
   PARTICIPANT_MODE_LABELS,
   addDurationToTime,
   durationChoices,
@@ -294,17 +294,18 @@ describe("lessonCalendarSlot", () => {
   });
 });
 
-describe("honestidade sobre o que ainda não existe", () => {
-  it("o aviso diz que a sobreposição e os créditos ficam para depois", () => {
-    expect(NO_CONFLICT_CHECK_NOTICE).toContain("sobreposição");
-    expect(NO_CONFLICT_CHECK_NOTICE).toContain("créditos");
+describe("honestidade sobre o que existe e o que ainda não existe", () => {
+  it("o aviso diz que conflitos já são protegidos e créditos ficam para depois", () => {
+    expect(LESSON_CONFLICT_PROTECTION_NOTICE).toContain("sobreposição");
+    expect(LESSON_CONFLICT_PROTECTION_NOTICE).toContain("intervalo mínimo");
+    expect(LESSON_CONFLICT_PROTECTION_NOTICE).toContain("créditos");
   });
 
-  it("nada no módulo promete ausência de conflitos", () => {
+  it("nada no módulo promete disponibilidade absoluta de um campo", () => {
     const text = [
       ...Object.values(LESSON_CONTEXT_LABELS),
       ...Object.values(PARTICIPANT_MODE_LABELS),
-      NO_CONFLICT_CHECK_NOTICE,
+      LESSON_CONFLICT_PROTECTION_NOTICE,
     ]
       .join(" ")
       .toLowerCase();

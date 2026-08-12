@@ -326,7 +326,7 @@ Views: `teacher_location_records` (os seus, os do clube, os públicos aprovados)
 
 **Retrocompatibilidade:** locais anteriores ficam `private`/`not_required`/`manual`. `teacher_id` **não** é exigido pelo trigger — a Fase 3 só atribuiu responsável em organizações com um professor, e editar os restantes não pode passar a ser impossível.
 
-**Não implementado:** aulas (5C), conflitos e créditos (5D). Campos, salas e áreas passaram a existir na 5B.3B, abaixo.
+**Na 5B.3A ainda não existiam aulas.** Hoje as aulas existem na 5C e os conflitos de recurso entram na 5D.1; créditos continuam para a continuação da 5D. Campos, salas e áreas passaram a existir na 5B.3B, abaixo.
 
 ### Campos, salas e áreas de um local (Etapa 5B.3B)
 
@@ -354,13 +354,13 @@ View: `teacher_location_resource_records` — é o contrato que a Etapa 5C vai c
 
 `locations.internal_reference` deixou de ser rotulado "Campo, quadra ou referência interna": passou a "Referência interna", para notas de acesso ao espaço. Não voltar a usá-lo como substituto de um recurso.
 
-**Não implementado:** aulas, participantes, disponibilidade/horário/reserva de recurso, conflitos, créditos, notificações.
+**Não implementado nesta camada de inventário:** disponibilidade/horário/reserva visual de recurso, créditos e notificações. Aulas existem na 5C, e a colisão real de recurso é validada só ao criar/editar aulas na 5D.1.
 
-### Criação e edição de aulas (Etapa 5C)
+### Criação, edição e conflitos de aulas (Etapas 5C e 5D.1)
 
-As aulas existem no esquema desde a Fase 1, mas nunca tinham sido criadas pela aplicação. A 5C dá-lhes um caminho de escrita real. **Não há motor de conflitos nem movimento de créditos** — duas aulas podem ficar sobrepostas no mesmo campo, e nada na interface pode dar a entender o contrário.
+As aulas existem no esquema desde a Fase 1, mas só a 5C lhes deu um caminho de escrita real. A 5D.1 acrescenta a garantia transacional de conflitos de professor e recurso. **Ainda não há movimento de créditos** — `lesson_participants` continua a nascer com cobrança pendente.
 
-**Nunca escrever "sem conflito", "campo livre", "professor disponível às 18:00" ou "vaga garantida".** Sem bloqueio transacional (5D), qualquer verificação seria uma corrida perdida entre dois separadores abertos. `NO_CONFLICT_CHECK_NOTICE` em `lib/domain/lesson-scheduling.ts` é o que se diz ao utilizador, e está sob teste.
+**Nunca escrever "campo livre", "vaga garantida" ou "crédito reservado".** O banco impede sobreposição no momento de gravar, mas a interface não deve apresentar disponibilidade futura como garantia absoluta antes da submissão. `LESSON_CONFLICT_PROTECTION_NOTICE` em `lib/domain/lesson-scheduling.ts` é o texto de limite do produto e está sob teste.
 
 **`lessons.organization_id` é sempre a organização PESSOAL do professor.** Uma aula de clube guarda o clube em `club_organization_id`, com `context_kind = 'club'`. Pôr o clube em `organization_id` mudaria em silêncio o significado de todas as policies que já comparam com `auth_org_id()`. O clube é contexto, não propriedade.
 
@@ -374,6 +374,7 @@ As aulas existem no esquema desde a Fase 1, mas nunca tinham sido criadas pela a
 | Local ativo, recurso do local, recurso ativo | trigger `validate_lesson_scope()` |
 | Autorização de uso do local | `can_schedule_at_location()` |
 | Janela dentro da disponibilidade e fora de bloqueios | `lesson_fits_teacher_availability()` |
+| Sobreposição de professor, intervalo mínimo e recurso físico | trigger `ensure_lesson_has_no_conflict()` |
 | Clube ativo e membership | `create_lesson()` |
 
 `lesson_fits_teacher_availability()` reutiliza `resolve_teacher_availability_windows()` e `resolve_teacher_block_segments()` da 5B.2B — não duplicar a precedência nem a conversão de fuso. Funde períodos contíguos: uma aula das 12:30 às 13:30 cabe em `09:00–12:00` + `12:00–15:00`. Um intervalo real (o espaço entre `09:00–13:00` e `15:00–20:00`) continua a recusar. É **interna**: expô-la deixaria um professor sondar a agenda de outro por tentativa e erro.
@@ -382,7 +383,9 @@ As aulas existem no esquema desde a Fase 1, mas nunca tinham sido criadas pela a
 
 **Turma: participantes materializados na criação.** `lesson_participants` recebe os membros ativos no momento. Alterar a turma amanhã não altera quem estava previsto para a aula de hoje — é isso que torna o histórico verdadeiro.
 
-**Pacotes: nada se move.** `lesson_participants` nasce `billing_status='pending'`, com zero reservado e `student_package_id` a `NULL`. Guardar um pacote "planeado" sem reserva criaria um ponteiro que a 5D leria como decidido, e que pode estar esgotado ou expirado quando ela chegar. A sugestão de pacote é leitura (`select_package_for_student()`), no momento da reserva.
+**Conflitos: só estados ativos bloqueiam.** `ensure_lesson_has_no_conflict()` usa advisory locks transacionais por professor e recurso, verifica `scheduled`/`confirmed`, aplica `teacher_profiles.minimum_break_minutes` e ignora estados históricos (`completed`, canceladas, reagendadas e faltas). Recurso `NULL` não bloqueia o local inteiro: a unidade física é `location_resource_id`.
+
+**Pacotes: nada se move.** `lesson_participants` nasce `billing_status='pending'`, com zero reservado e `student_package_id` a `NULL`. Guardar um pacote "planeado" sem reserva criaria um ponteiro que a continuação da 5D leria como decidido, e que pode estar esgotado ou expirado quando ela chegar. A sugestão de pacote é leitura (`select_package_for_student()`), no momento da reserva.
 
 **Projeções, e o que cada uma não tem:**
 
@@ -399,9 +402,9 @@ As aulas existem no esquema desde a Fase 1, mas nunca tinham sido criadas pela a
 
 **Edição:** só horário, local, recurso, título e observações, e só em `scheduled`/`confirmed`. Participante, modalidade e contexto não se editam — trocar o aluno é criar outra aula. O histórico é escrito pelo trigger `log_lesson_change()` da Fase 1, que também trata o caso "nada mudou": um `update_lesson()` sem alterações devolve `false` e não gera entrada.
 
-**Onde a 5D entra**, sem reescrever a 5C: dentro de `create_lesson()`, entre a validação de disponibilidade e o `insert` — bloquear professor e recurso, verificar colisão, selecionar pacote e chamar `reserve_participation_credits()` para cada participante materializado.
+**Onde a 5D continua**, sem reescrever a 5C/5D.1: depois da criação materializar participantes, selecionar pacote e chamar `reserve_participation_credits()` para cada participante. Não reabrir escrita direta em `lessons` nem em `lesson_participants`.
 
-**Não implementado:** conflitos, exclusion constraints, locks, recorrência, intervalo mínimo transacional, presença, conclusão, cancelamento e reagendamento operacionais, confirmação pelo aluno, lista de espera, notificações.
+**Não implementado:** reserva de créditos na criação da aula, recorrência, presença, conclusão, cancelamento e reagendamento operacionais, confirmação pelo aluno, lista de espera, notificações.
 
 ### Ao criar uma tabela nova
 
@@ -621,7 +624,7 @@ Precedência, também implementada em `resolve_teacher_availability_for_date()`:
 3. rotina semanal;
 4. indisponível por padrão.
 
-Intervalos simples são representados pelo espaço entre períodos do mesmo dia, por exemplo `09:00–13:00` e `15:00–20:00`. O intervalo mínimo entre marcações fica guardado, mas só será aplicado ao cálculo de conflitos quando existirem aulas.
+Intervalos simples são representados pelo espaço entre períodos do mesmo dia, por exemplo `09:00–13:00` e `15:00–20:00`. O intervalo mínimo entre marcações é aplicado na criação/edição de aulas pela 5D.1.
 
 A interface vive em `/professor/definicoes/disponibilidade`. Server Actions chamam RPCs (`save_teacher_availability_preferences`, `upsert_teacher_availability_rule`, `upsert_teacher_availability_exception`, `upsert_teacher_schedule_block` e cancelamentos/desativações correspondentes). O browser nunca envia organização, professor, autor ou timestamps.
 
@@ -758,7 +761,7 @@ Não existe um comando de formatação separado. Use `npm run lint:fix` apenas p
 | 2 | Perfis, definições e gestão administrativa básica de contas | **Concluído** |
 | 3 | Alunos, turmas, locais, política de cancelamento | **Concluído** |
 | 4 | Interfaces de modelos, atribuição, ajustes e saldos | **Concluído** — Etapas 1A, 1B, 1C, 1D e 1E validadas com Auth/PostgREST reais e browser desktop/mobile |
-| 5 | Calendário e criação de aulas com reserva | **Parcialmente concluído** — Etapas 5A a 5C: disponibilidade, projeção segura, refinamento visual, clubes/membros, calendário partilhado, locais com moradas manuais, campos/salas/áreas e criação/edição de aulas. Falta 5D: conflitos e créditos |
+| 5 | Calendário e criação de aulas com reserva | **Parcialmente concluído** — Etapas 5A a 5D.1: disponibilidade, projeção segura, refinamento visual, clubes/membros, calendário partilhado, locais com moradas manuais, campos/salas/áreas, criação/edição de aulas e conflitos atómicos de professor/recurso. Falta a continuação da 5D: créditos e recorrência |
 | 6 | Cancelamento, reagendamento, presenças e histórico | **Planeado** |
 | 7 | Área do aluno: aulas, créditos e confirmação | **Planeado** |
 | 8 | Notificações, lembretes e expiração agendada | **Planeado** |

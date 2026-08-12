@@ -5,8 +5,8 @@ Professores marcam aulas, escolhem os alunos e registam presenças; os alunos ve
 
 A começar pelo **beach tennis**, com arquitetura preparada para outras modalidades.
 
-> **Estado:** Fases 1, 1.5, 2, 3 e 4 concluídas. A Fase 5 tem as Etapas 5A a 5C: disponibilidade, projeção segura, calendário visual refinado, clubes/workspaces/membros, calendário partilhado com consentimento, locais com moradas manuais, campos/salas/áreas e **criação e edição de aulas**.
-> A deteção de sobreposição entre aulas, a reserva de créditos, a recorrência e a transferência/fusão de pacotes continuam nas etapas seguintes.
+> **Estado:** Fases 1, 1.5, 2, 3 e 4 concluídas. A Fase 5 tem as Etapas 5A a 5D.1: disponibilidade, projeção segura, calendário visual refinado, clubes/workspaces/membros, calendário partilhado com consentimento, locais com moradas manuais, campos/salas/áreas, criação/edição de aulas e conflitos atómicos de professor/recurso.
+> A reserva de créditos, a recorrência e a transferência/fusão de pacotes continuam nas etapas seguintes.
 
 ---
 
@@ -39,7 +39,7 @@ Instruções completas — incluindo a configuração do Supabase — em [`AGENT
 - Gestão de turmas, participantes, capacidade, modalidade e observações administrativas privadas
 - Locais privados, de clube e propostas públicas em `/professor/locais`, com morada escrita à mão e assumida como não validada por terceiros; moderação das propostas em `/admin/locais`
 - Campos, salas e áreas de cada local, com tipo genérico, ordem de apresentação e desativação que preserva a linha; herdam a autorização do local
-- Criação e edição de aulas em `/professor/aulas/nova` e `/professor/aulas/[id]`, com aluno ou turma, contexto pessoal ou de clube, local, campo, data, hora e duração — validadas contra a disponibilidade e os bloqueios do professor
+- Criação e edição de aulas em `/professor/aulas/nova` e `/professor/aulas/[id]`, com aluno ou turma, contexto pessoal ou de clube, local, campo, data, hora e duração — validadas contra a disponibilidade, bloqueios, intervalo mínimo, aulas ativas do professor e ocupação do recurso físico
 - Aulas de turma fixam os alunos no momento da criação: alterar a turma depois não altera quem estava previsto
 - Aulas marcadas aparecem no calendário do professor e no do aluno; o aluno vê hora, professor, modalidade, local e campo, e nunca os colegas, a turma ou o custo em créditos
 - Política de cancelamento do professor com fallback da organização
@@ -58,22 +58,22 @@ Instruções completas — incluindo a configuração do Supabase — em [`AGENT
 - RPCs seguras de disponibilidade: professor vê detalhes dos próprios bloqueios; aluno não recebe motivo, categoria, fonte interna, organização nem `teacher_id`
 - Diretório administrativo com pesquisa, filtros, detalhe e bloqueio/reativação auditados
 - Proteção de rotas por tipo de conta e revogação de acesso para contas bloqueadas
-- Esquema atual da base de dados: 29 tabelas, Row Level Security em todas; aulas e participantes escritos apenas por RPC
+- Esquema atual da base de dados: 29 tabelas, Row Level Security em todas; aulas e participantes escritos apenas por RPC, com trigger de conflitos na tabela `lessons`
 - Pacotes, saldos disponíveis/reservados/utilizados e livro-razão append-only
 - RPCs PostgreSQL para atribuir, reservar, consumir, libertar, reagendar, ajustar e corrigir créditos
 - RPCs PostgreSQL para guardar preferências, horários semanais, exceções, bloqueios e resolução segura de disponibilidade
 - Regras e validação com 477 testes de unidade/regressão
-- 650 verificações PostgreSQL sobre migrações, permissões, RLS, gestão, claim, modelos, atribuição, consulta, ajustes administrativos, disponibilidade, calendário seguro, clubes, memberships, convites, contexto ativo, consentimento de partilha, calendário partilhado, locais, recursos de locais, criação/edição de aulas, grants de views e saldos
-- 264 verificações Auth/PostgREST reais no Supabase de desenvolvimento
+- 657 verificações PostgreSQL sobre migrações, permissões, RLS, gestão, claim, modelos, atribuição, consulta, ajustes administrativos, disponibilidade, calendário seguro, clubes, memberships, convites, contexto ativo, consentimento de partilha, calendário partilhado, locais, recursos de locais, criação/edição de aulas, conflitos, grants de views e saldos
+- 270 verificações Auth/PostgREST reais no Supabase de desenvolvimento
 - Estrutura responsiva das áreas de professor, aluno e administração, com manifesto e ícones PWA
 
-`/professor/clubes` gere contextos, clubes e membros; `/professor/clubes/[id]/calendario` mostra a disponibilidade partilhada do clube; `/professor/convites` mostra os convites recebidos. `/professor/pacotes` gere modelos reutilizáveis, atribuição, consulta e ajustes administrativos dos pacotes atribuídos. `/professor/pacotes/historico` mostra a auditoria global. `/professor/definicoes/disponibilidade` guarda a fonte de verdade da agenda do professor. `/professor/calendario` e `/aluno/calendario` mostram disponibilidade calculada em Dia/Semana/Mês; ainda não criam aulas. `/aluno/pacotes` mostra apenas os próprios pacotes e movimentos básicos.
+`/professor/clubes` gere contextos, clubes e membros; `/professor/clubes/[id]/calendario` mostra a disponibilidade partilhada do clube; `/professor/convites` mostra os convites recebidos. `/professor/pacotes` gere modelos reutilizáveis, atribuição, consulta e ajustes administrativos dos pacotes atribuídos. `/professor/pacotes/historico` mostra a auditoria global. `/professor/definicoes/disponibilidade` guarda a fonte de verdade da agenda do professor. `/professor/calendario` e `/aluno/calendario` mostram disponibilidade e aulas em Dia/Semana/Mês. `/aluno/pacotes` mostra apenas os próprios pacotes e movimentos básicos.
 
-O próximo passo planeado da Fase 5 é a **Etapa 5D — recorrência, conflitos e reserva de créditos**. O professor independente continua totalmente suportado, com workspace pessoal privado e agenda própria, e não precisa criar clube nenhum.
+O próximo passo planeado da Fase 5 é continuar a **Etapa 5D** com recorrência e reserva de créditos. O professor independente continua totalmente suportado, com workspace pessoal privado e agenda própria, e não precisa criar clube nenhum.
 
 Entrar num clube **não** partilha a agenda: `calendar_sharing_enabled` nasce desativado e só o próprio membro o altera — proprietários, gestores e a administração da plataforma não têm caminho para forçar a partilha de outra pessoa. Os locais e os seus campos já são partilhados com o clube; alunos, pacotes, turmas e disponibilidade continuam ligados ao workspace pessoal, e a interface diz isso explicitamente em vez de o esconder.
 
-Criar uma aula **não** verifica sobreposição com outras aulas e **não** move créditos. Duas aulas podem ficar no mesmo campo à mesma hora: sem bloqueio transacional, qualquer verificação seria uma corrida perdida entre dois separadores abertos, e uma garantia falsa é pior do que garantia nenhuma. A interface diz isto onde é relevante, em vez de o esconder. Conflitos e reservas chegam na Etapa 5D.
+Criar ou editar uma aula impede sobreposição de aulas ativas do professor, respeita o intervalo mínimo e impede duas aulas no mesmo campo/sala ao mesmo horário. Ainda **não** move créditos: os participantes continuam com cobrança pendente até a etapa de reserva de créditos.
 
 Sem um bucket de Storage configurado, os avatares usam iniciais. Preparar a ligação de um aluno ainda não envia email sem um Supabase remoto; a interface identifica essa limitação. As preferências de email ficam guardadas, mas a entrega automática e os lembretes agendados pertencem à Fase 8.
 

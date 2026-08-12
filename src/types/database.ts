@@ -486,7 +486,7 @@ export type Lesson = {
   teacher_id: UUID;
   sport_id: UUID;
   location_id: UUID | null;
-  /** Campo, sala ou área. Futura unidade de conflito físico (Etapa 5D). */
+  /** Campo, sala ou área. Unidade de conflito físico desde a Etapa 5D.1. */
   location_resource_id: UUID | null;
   group_id: UUID | null;
   context_kind: LessonContextKind;

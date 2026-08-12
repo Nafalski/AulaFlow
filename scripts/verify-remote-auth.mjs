@@ -116,6 +116,28 @@ function forbiddenColumns(row, columns) {
   return columns.filter((column) => Object.hasOwn(row, column));
 }
 
+async function rpcOutcome(run) {
+  const { data, error } = await run();
+  if (error) return { ok: false, error };
+  return { ok: true, data };
+}
+
+function checkOneSuccessOneConflict(label, outcomes, expectedMessage) {
+  const successes = outcomes.filter((outcome) => outcome.ok);
+  const expected = expectedMessage.toLowerCase();
+  const conflicts = outcomes.filter(
+    (outcome) => !outcome.ok && summarizeError(outcome.error).toLowerCase().includes(expected),
+  );
+
+  check(
+    successes.length === 1 && conflicts.length === 1,
+    `${label}: exatamente uma escrita venceu e a outra recebeu conflito`,
+    `${label}: resultado inesperado (${outcomes
+      .map((outcome) => (outcome.ok ? "ok" : summarizeError(outcome.error)))
+      .join(" | ")})`,
+  );
+}
+
 try {
   requireDevelopmentConfirmation();
   loadDotenvLocal(ROOT);
@@ -494,6 +516,18 @@ try {
   );
   const teacherBProfile = await getProfile(teacherBClient, teacherBUser.id, "Professor B");
   check(teacherBProfile.role === "teacher", "Professor B tem papel teacher");
+  const teacherBRecord = await getSingle(
+    "teacher profile B",
+    teacherBClient.from("teacher_profiles").select("id, organization_id").eq("profile_id", teacherBUser.id),
+  );
+  const studentsB = await getSingle(
+    "aluno B",
+    teacherBClient
+      .from("teacher_student_management_records")
+      .select("id, full_name, email, organization_id, created_by_teacher_id, is_active")
+      .ilike("email", credentials.studentB.email),
+  );
+  check(studentsB.created_by_teacher_id === teacherBRecord.id, "Professor B ve o proprio Aluno B");
   await mustReturnNoRows("Professor B nao le pacote do Professor A", () =>
     teacherBClient.from("teacher_package_records").select("id").eq("id", packageId),
   );
@@ -2212,6 +2246,140 @@ try {
     !lessonsAfterFailures.error && (lessonsAfterFailures.data ?? []).length === 1,
     "Nenhuma aula parcial ficou de uma criacao recusada",
   );
+
+  // ── Conflitos atomicos ───────────────────────────────────────────────────
+
+  const conflictDate = isoDatePlusDays(131, fixtureBaseDate);
+  const minimumBreakDate = isoDatePlusDays(132, fixtureBaseDate);
+  const resourceConflictDate = isoDatePlusDays(133, fixtureBaseDate);
+
+  const prepareException = async (supabase, label, dateOnly, keyPrefix) => {
+    const { error } = await supabase.rpc("upsert_teacher_availability_exception", {
+      p_exception_date: dateOnly,
+      p_starts_at: "10:00",
+      p_ends_at: "12:00",
+      p_mode: "replace",
+      p_idempotency_key: deterministicUuid(`${keyPrefix}:${runId}`),
+    });
+    if (error) throw new Error(`${label}: ${summarizeError(error)}`);
+  };
+
+  await prepareException(teacherClient, "Disponibilidade para conflito do Professor A", conflictDate, "lesson-conflict-date-a");
+  await prepareException(teacherClient, "Disponibilidade para intervalo minimo", minimumBreakDate, "lesson-break-date-a");
+  await prepareException(teacherClient, "Disponibilidade para recurso do Professor A", resourceConflictDate, "lesson-resource-date-a");
+  await prepareException(teacherBClient, "Disponibilidade para recurso do Professor B", resourceConflictDate, "lesson-resource-date-b");
+
+  const baseBreakLesson = await createLesson(teacherClient, {
+    p_starts_at: lisbonInstant(minimumBreakDate, "10:00"),
+    p_ends_at: lisbonInstant(minimumBreakDate, "11:00"),
+    p_title: `Aula E2E intervalo ${runId}`,
+    p_location_id: null,
+    p_location_resource_id: null,
+    p_idempotency_key: deterministicUuid(`lesson-break-base:${runId}`),
+  });
+  if (baseBreakLesson.error || !baseBreakLesson.data) {
+    throw new Error(`Criar base de intervalo minimo: ${summarizeError(baseBreakLesson.error)}`);
+  }
+  const breakError = await mustReject("Intervalo minimo entre aulas e recusado", async () =>
+    createLesson(teacherClient, {
+      p_starts_at: lisbonInstant(minimumBreakDate, "11:05"),
+      p_ends_at: lisbonInstant(minimumBreakDate, "11:45"),
+      p_title: `Aula E2E intervalo recusado ${runId}`,
+      p_location_id: null,
+      p_location_resource_id: null,
+      p_idempotency_key: deterministicUuid(`lesson-break-rejected:${runId}`),
+    }),
+  );
+  check(
+    summarizeError(breakError).toLowerCase().includes("intervalo minimo") ||
+      summarizeError(breakError).toLowerCase().includes("intervalo mínimo"),
+    "Erro de intervalo minimo usa mensagem de produto",
+  );
+
+  const teacherRace = await Promise.all([
+    rpcOutcome(() =>
+      createLesson(teacherClient, {
+        p_starts_at: lisbonInstant(conflictDate, "10:00"),
+        p_ends_at: lisbonInstant(conflictDate, "11:00"),
+        p_title: `Aula E2E corrida professor A ${runId}`,
+        p_location_id: null,
+        p_location_resource_id: null,
+        p_idempotency_key: deterministicUuid(`lesson-teacher-race-a:${runId}`),
+      }),
+    ),
+    rpcOutcome(() =>
+      createLesson(teacherClient, {
+        p_starts_at: lisbonInstant(conflictDate, "10:30"),
+        p_ends_at: lisbonInstant(conflictDate, "11:30"),
+        p_title: `Aula E2E corrida professor B ${runId}`,
+        p_location_id: null,
+        p_location_resource_id: null,
+        p_idempotency_key: deterministicUuid(`lesson-teacher-race-b:${runId}`),
+      }),
+    ),
+  ]);
+  checkOneSuccessOneConflict("Corrida simultanea do mesmo professor", teacherRace, "outra aula");
+
+  const activeClubMembership = await maybeSingle(
+    "membership ativa do Professor B no clube",
+    teacherBClient
+      .from("workspace_membership_records")
+      .select("membership_id, organization_id")
+      .eq("organization_id", clubId),
+  );
+  if (!activeClubMembership) {
+    const { data: conflictInviteId, error: conflictInviteError } = await teacherClient.rpc(
+      "invite_workspace_member",
+      {
+        p_organization_id: clubId,
+        p_email: credentials.teacherB.email,
+        p_role: "teacher",
+        p_idempotency_key: deterministicUuid(`lesson-resource-invite:${runId}`),
+      },
+    );
+    if (conflictInviteError || !conflictInviteId) {
+      throw new Error(`Convidar Professor B para conflito de recurso: ${summarizeError(conflictInviteError)}`);
+    }
+    const { error: conflictAcceptError } = await teacherBClient.rpc("accept_workspace_invitation", {
+      p_invitation_id: conflictInviteId,
+    });
+    if (conflictAcceptError) {
+      throw new Error(`Aceitar convite para conflito de recurso: ${summarizeError(conflictAcceptError)}`);
+    }
+    ok("Professor B entrou no clube para validar conflito de recurso");
+  } else {
+    ok("Professor B ja tinha membership ativa no clube para validar recurso");
+  }
+
+  const resourceRace = await Promise.all([
+    rpcOutcome(() =>
+      createLesson(teacherClient, {
+        p_starts_at: lisbonInstant(resourceConflictDate, "10:00"),
+        p_ends_at: lisbonInstant(resourceConflictDate, "11:00"),
+        p_title: `Aula E2E corrida recurso A ${runId}`,
+        p_context_kind: "club",
+        p_club_organization_id: clubId,
+        p_location_id: clubLocationId,
+        p_location_resource_id: clubResourceId,
+        p_student_id: studentsA.id,
+        p_idempotency_key: deterministicUuid(`lesson-resource-race-a:${runId}`),
+      }),
+    ),
+    rpcOutcome(() =>
+      createLesson(teacherBClient, {
+        p_starts_at: lisbonInstant(resourceConflictDate, "10:30"),
+        p_ends_at: lisbonInstant(resourceConflictDate, "11:30"),
+        p_title: `Aula E2E corrida recurso B ${runId}`,
+        p_context_kind: "club",
+        p_club_organization_id: clubId,
+        p_location_id: clubLocationId,
+        p_location_resource_id: clubResourceId,
+        p_student_id: studentsB.id,
+        p_idempotency_key: deterministicUuid(`lesson-resource-race-b:${runId}`),
+      }),
+    ),
+  ]);
+  checkOneSuccessOneConflict("Corrida simultanea pelo mesmo recurso", resourceRace, "ocupado");
 
   // ── Escrita direta ────────────────────────────────────────────────────────
 

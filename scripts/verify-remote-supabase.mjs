@@ -164,6 +164,8 @@ const expectedIndexes = [
   "lessons_creation_idempotency_unique",
   "lessons_club_starts_idx",
   "lessons_resource_starts_idx",
+  "lessons_teacher_conflict_idx",
+  "lessons_resource_conflict_idx",
 ];
 
 const expectedConstraints = [
@@ -278,6 +280,9 @@ const expectedFunctions = [
   "validate_lesson_scope",
   "lesson_fits_teacher_availability",
   "can_schedule_at_location",
+  "lesson_blocks_conflicts",
+  "lock_lesson_conflict_scopes",
+  "ensure_lesson_has_no_conflict",
   "create_lesson",
   "update_lesson",
 ];
@@ -354,6 +359,9 @@ const internalFunctions = [
   "log_location_resource_event",
   "validate_lesson_scope",
   "lesson_fits_teacher_availability",
+  "lesson_blocks_conflicts",
+  "lock_lesson_conflict_scopes",
+  "ensure_lesson_has_no_conflict",
 ];
 
 const sql = `
@@ -945,6 +953,22 @@ checks as (
       join pg_type type_row on type_row.oid = enum_row.enumtypid
       where type_row.typname = 'lesson_context_kind'
     ) = array['personal', 'club'],
+    'ok'
+
+  union all
+  select
+    'estrutura',
+    'trigger de conflitos de aulas esta instalado',
+    (
+      select count(*) = 1
+      from pg_trigger trigger_row
+      join pg_class table_row on table_row.oid = trigger_row.tgrelid
+      join pg_namespace namespace on namespace.oid = table_row.relnamespace
+      where namespace.nspname = 'public'
+        and table_row.relname = 'lessons'
+        and trigger_row.tgname = 'trg_ensure_lesson_conflicts'
+        and not trigger_row.tgisinternal
+    ),
     'ok'
 
   union all

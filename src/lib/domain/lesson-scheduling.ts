@@ -1,16 +1,15 @@
 /**
- * Regras puras da criação e edição de aulas (Etapa 5C).
+ * Regras puras da criação e edição de aulas (Etapas 5C e 5D.1).
  *
  * Sem I/O, sem Supabase, sem React. Decide o que a interface pode oferecer; a
  * autorização real é sempre da RPC e do RLS.
  *
  * O QUE NÃO EXISTE AQUI, E PORQUÊ
  *
- * Não há deteção de conflitos. Duas aulas podem ficar sobrepostas no mesmo
- * campo, e nada neste ficheiro pode sugerir o contrário — sem bloqueio
- * transacional (Etapa 5D), qualquer verificação no cliente seria uma corrida
- * perdida entre dois separadores abertos. Não há também reserva de créditos:
- * criar uma aula não move saldo nenhum.
+ * A deteção de conflitos é uma garantia do banco, não do cliente: a 5D.1
+ * protege professor, intervalo mínimo e recurso físico dentro da transação.
+ * Este ficheiro só decide o que o formulário pode oferecer. Ainda não há
+ * reserva de créditos: criar uma aula não move saldo nenhum.
  */
 
 import { lisbonDateKey, toTimeInput } from "@/lib/datetime";
@@ -218,11 +217,12 @@ export function lessonCalendarSlot(startsAt: string, endsAt: string): {
 }
 
 /**
- * O aviso que acompanha a criação, e que não deve desaparecer antes da 5D.
+ * O aviso que acompanha a criação.
  *
- * Dizer isto é preferível a deixar o professor assumir que o sistema o protege
- * de uma sobreposição — porque não protege.
+ * O conflito de agenda já é protegido no banco. Créditos continuam fora desta
+ * etapa, por isso a interface deve manter esse limite visível.
  */
-export const NO_CONFLICT_CHECK_NOTICE =
-  "O horário é validado contra a sua disponibilidade e bloqueios. A deteção de " +
-  "sobreposição com outras aulas e a reserva de créditos chegam na etapa seguinte.";
+export const LESSON_CONFLICT_PROTECTION_NOTICE =
+  "O horário é validado contra a sua disponibilidade, bloqueios, aulas ativas e " +
+  "intervalo mínimo. Campos e salas também são protegidos contra sobreposição. " +
+  "A reserva de créditos chega numa etapa seguinte.";

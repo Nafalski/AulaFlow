@@ -7636,6 +7636,58 @@ check(
   "repetir a criação com a mesma chave devolve a mesma aula e não duplica participantes",
 );
 
+// ── Conflitos transacionais de professor ────────────────────────────────────
+
+await mustReject(
+  "professor não cria duas aulas ativas sobrepostas",
+  () =>
+    createLessonAs(TEACHER_UID, {
+      studentId: ana.id,
+      start: "2026-08-24 09:30+00",
+      end: "2026-08-24 10:15+00",
+    }),
+  "outra aula",
+);
+
+await mustReject(
+  "intervalo mínimo do professor é aplicado entre aulas",
+  () =>
+    createLessonAs(TEACHER_UID, {
+      studentId: ana.id,
+      start: "2026-08-24 10:05+00",
+      end: "2026-08-24 11:00+00",
+    }),
+  "intervalo mínimo",
+);
+
+const exactBreakLesson = await createLessonAs(TEACHER_UID, {
+  studentId: ana.id,
+  title: "Aula no limite do intervalo mínimo",
+  start: "2026-08-24 10:15+00",
+  end: "2026-08-24 11:15+00",
+});
+check(
+  Boolean(exactBreakLesson.id),
+  "o limite exato do intervalo mínimo é aceite",
+);
+await db.query(`update public.lessons set status='completed', completed_at=now() where id=$1`, [
+  exactBreakLesson.id,
+]);
+
+const overlapsCompletedLesson = await createLessonAs(TEACHER_UID, {
+  studentId: ana.id,
+  title: "Aula sobre histórico concluído",
+  start: "2026-08-24 10:30+00",
+  end: "2026-08-24 11:00+00",
+});
+check(
+  Boolean(overlapsCompletedLesson.id),
+  "aula concluída deixa de bloquear novas marcações",
+);
+await db.query(`update public.lessons set status='completed', completed_at=now() where id=$1`, [
+  overlapsCompletedLesson.id,
+]);
+
 // ── Aula de turma: materialização ───────────────────────────────────────────
 
 const groupMembersBefore = await rows(
@@ -7650,8 +7702,8 @@ const teamLesson = await createLessonAs(TEACHER_UID, {
   groupId: managedGroup.id,
   locationId: managedLocation.id,
   title: "Aula de turma 5C",
-  start: "2026-08-24 16:00+00",
-  end: "2026-08-24 17:00+00",
+  start: "2026-08-24 14:00+00",
+  end: "2026-08-24 15:00+00",
 });
 const groupParticipants = await rows(
   `select student_id from public.lesson_participants where lesson_id=$1 order by student_id`,
@@ -7804,8 +7856,8 @@ const clubLesson = await createLessonAs(TEACHER_UID, {
   locationId: clubLocation.id,
   resourceId: clubCourt1.id,
   title: "Aula no clube",
-  start: "2026-08-24 15:00+00",
-  end: "2026-08-24 16:00+00",
+  start: "2026-08-24 15:30+00",
+  end: "2026-08-24 16:30+00",
 });
 const clubLessonRow = await one(
   `select organization_id, club_organization_id, context_kind::text
@@ -7817,6 +7869,60 @@ check(
     clubLessonRow.club_organization_id === clubA.id &&
     clubLessonRow.context_kind === "club",
   "aula de clube guarda o clube à parte e mantém a organização pessoal do professor",
+);
+
+const clubLessonInvite = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select public.invite_workspace_member($1,'outro.prof@exemplo.pt','teacher',$2) as id`, [
+    clubA.id,
+    randomUUID(),
+  ]),
+);
+await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  one(`select public.accept_workspace_invitation($1) as id`, [clubLessonInvite.id]),
+);
+
+await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  db.query(
+    `select public.upsert_teacher_availability_rule(
+       p_weekday => 1,
+       p_starts_at => '15:00'::time,
+       p_ends_at => '20:00'::time,
+       p_idempotency_key => $1::uuid,
+       p_is_active => true
+     )`,
+    [randomUUID()],
+  ),
+);
+
+await mustReject(
+  "recurso físico não aceita duas aulas ativas no mesmo horário",
+  () =>
+    createLessonAs(OTHER_TEACHER_UID, {
+      studentId: otherStudent.id,
+      contextKind: "club",
+      clubId: clubA.id,
+      locationId: clubLocation.id,
+      resourceId: clubCourt1.id,
+      title: "Colisão de recurso",
+      start: "2026-08-24 15:45+00",
+      end: "2026-08-24 16:15+00",
+    }),
+  "ocupado",
+);
+
+const differentResourceLesson = await createLessonAs(OTHER_TEACHER_UID, {
+  studentId: otherStudent.id,
+  contextKind: "club",
+  clubId: clubA.id,
+  locationId: clubLocation.id,
+  resourceId: managerResource.id,
+  title: "Outro recurso em paralelo",
+  start: "2026-08-24 15:45+00",
+  end: "2026-08-24 16:15+00",
+});
+check(
+  Boolean(differentResourceLesson.id),
+  "professores diferentes podem usar recursos diferentes no mesmo horário",
 );
 
 await mustReject("aula pessoal com clube indicado", () =>
@@ -7846,7 +7952,7 @@ await asDatabaseRole("authenticated", ADMIN_UID, () =>
   db.query(`select public.admin_set_workspace_status($1,'active',null)`, [clubA.id]),
 );
 
-await mustReject("professor sem membership não cria aula no clube", () =>
+await mustReject("professor não usa aluno de outro professor numa aula de clube", () =>
   createLessonAs(OTHER_TEACHER_UID, {
     studentId: ana.id,
     contextKind: "club",
@@ -8191,7 +8297,9 @@ const lessonFunctionAnon = await rows(
      join pg_namespace ns on ns.oid = proc.pronamespace
     where ns.nspname='public'
       and proc.proname in ('create_lesson','update_lesson','can_schedule_at_location',
-                           'lesson_fits_teacher_availability','validate_lesson_scope')
+                           'lesson_fits_teacher_availability','validate_lesson_scope',
+                           'lesson_blocks_conflicts','lock_lesson_conflict_scopes',
+                           'ensure_lesson_has_no_conflict')
       and has_function_privilege('anon', proc.oid, 'EXECUTE')`,
 );
 check(lessonFunctionAnon.length === 0, "anon não executa nenhuma função de aulas");
@@ -8200,7 +8308,9 @@ const lessonInternalFunctions = await rows(
   `select proc.proname from pg_proc proc
      join pg_namespace ns on ns.oid = proc.pronamespace
     where ns.nspname='public'
-      and proc.proname in ('lesson_fits_teacher_availability','validate_lesson_scope')
+      and proc.proname in ('lesson_fits_teacher_availability','validate_lesson_scope',
+                           'lesson_blocks_conflicts','lock_lesson_conflict_scopes',
+                           'ensure_lesson_has_no_conflict')
       and has_function_privilege('authenticated', proc.oid, 'EXECUTE')`,
 );
 check(
@@ -8213,13 +8323,28 @@ const lessonSearchPath = await rows(
      join pg_namespace ns on ns.oid = proc.pronamespace
     where ns.nspname='public'
       and proc.proname in ('create_lesson','update_lesson','can_schedule_at_location',
-                           'lesson_fits_teacher_availability','validate_lesson_scope')
+                           'lesson_fits_teacher_availability','validate_lesson_scope',
+                           'lesson_blocks_conflicts','lock_lesson_conflict_scopes',
+                           'ensure_lesson_has_no_conflict')
       and not exists (
         select 1 from unnest(coalesce(proc.proconfig, array[]::text[])) as config
         where config like 'search_path=%'
       )`,
 );
 check(lessonSearchPath.length === 0, "todas as funções de aulas fixam search_path");
+
+const lessonConflictTrigger = await one(
+  `select count(*)::int as total
+     from pg_trigger trigger_row
+     join pg_class table_row on table_row.oid = trigger_row.tgrelid
+    where table_row.relname='lessons'
+      and trigger_row.tgname='trg_ensure_lesson_conflicts'
+      and not trigger_row.tgisinternal`,
+);
+check(
+  Number(lessonConflictTrigger.total) === 1,
+  "trigger de conflitos de aulas está instalado na tabela lessons",
+);
 
 const lessonViewsAnon = await rows(
   `select table_name from information_schema.table_privileges

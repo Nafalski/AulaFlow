@@ -16,7 +16,7 @@ import { createLessonAction, updateLessonAction } from "@/lib/actions/lessons";
 import {
   LESSON_CONTEXT_DESCRIPTIONS,
   LESSON_CONTEXT_LABELS,
-  NO_CONFLICT_CHECK_NOTICE,
+  LESSON_CONFLICT_PROTECTION_NOTICE,
   PARTICIPANT_MODE_LABELS,
   durationChoices,
   locationsForContext,
@@ -366,7 +366,7 @@ export function LessonForm({
           <Alert tone="info">
             <span className="inline-flex items-start gap-2">
               <Info className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
-              {NO_CONFLICT_CHECK_NOTICE}
+              {LESSON_CONFLICT_PROTECTION_NOTICE}
             </span>
           </Alert>
 

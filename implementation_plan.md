@@ -6,7 +6,7 @@
 
 **Documento vivo.** Atualizado no fim de cada fase com o que foi realmente construído.
 
-- **Estado atual:** Fases 1, 1.5, 2, 3 e 4 concluídas. A Fase 5 tem as **Etapas 5A a 5C** concluídas — disponibilidade, projeção segura, calendário visual refinado, clubes/workspaces/membros, calendário partilhado com consentimento, locais com moradas manuais, campos/salas/áreas e **criação e edição de aulas**. **Conflitos e reserva de créditos (5D)** continuam pendentes.
+- **Estado atual:** Fases 1, 1.5, 2, 3 e 4 concluídas. A Fase 5 tem as **Etapas 5A a 5D.1** concluídas — disponibilidade, projeção segura, calendário visual refinado, clubes/workspaces/membros, calendário partilhado com consentimento, locais com moradas manuais, campos/salas/áreas, **criação e edição de aulas** e conflitos atómicos de professor/recurso. **Reserva de créditos e recorrência** continuam pendentes.
 - **Timezone do sistema:** `Europe/Lisbon`
 - **Idioma da interface:** Português (pt-PT)
 
@@ -528,7 +528,7 @@ Concluído:
 - `scripts/verify-remote-auth.mjs` valida login real, JWT, PostgREST, RPCs de pacotes, idempotência, isolamento, conta bloqueada, anónimo, imutabilidade e privacidade usando URL pública e anon key.
 - `.env.local` local preenchido com `SUPABASE_SERVICE_ROLE_KEY` e credenciais `E2E_*`, mantendo o ficheiro ignorado e sem valores reais no repositório.
 - `npm run db:setup:e2e -- --confirm-development` executado com sucesso, criando ou reutilizando professor, aluno, segundo professor, segundo aluno, administrador e conta bloqueada de desenvolvimento.
-- `npm run db:verify:auth -- --confirm-development` executado com sucesso: a suite atual tem 90 verificações Auth/PostgREST reais, incluindo idempotência, privacidade do aluno, isolamento entre contas, recusas para anónimo/bloqueado, disponibilidade, calendário seguro e imutabilidade.
+- `npm run db:verify:auth -- --confirm-development` executado com sucesso: a suite atual tem 270 verificações Auth/PostgREST reais, incluindo idempotência, privacidade do aluno, isolamento entre contas, recusas para anónimo/bloqueado, disponibilidade, calendário seguro, clubes, locais, recursos, aulas, conflitos concorrentes e imutabilidade.
 - Cenário em navegador real validado: professor em desktop autenticado abriu painel, alunos, pacotes, atribuição, histórico e detalhe de pacote; aluno em viewport mobile abriu `/aluno/pacotes`, viu apenas a projeção permitida e manteve sessão após refresh, sem overflow horizontal nem erros relevantes de console.
 - Verificações finais executadas com sucesso: `db:verify:remote`, `lint`, `typecheck`, `test`, `db:verify`, `build` e `check`.
 
@@ -861,13 +861,13 @@ Locais existentes ficam `private`/`not_required`/`manual`, com `created_by` deri
 
 #### Não implementado
 
-Aulas (5C); conflitos e créditos (5D); qualquer integração externa, mapa ou cálculo de distância. Campos, quadras e salas passaram a existir na 5B.3B, a seguir.
+Aulas (5C); conflitos de recurso ao criar/editar aulas (5D.1); créditos; qualquer integração externa, mapa ou cálculo de distância. Campos, quadras e salas passaram a existir na 5B.3B, a seguir.
 
 ### Concluído na Fase 5 — Etapa 5B.3B: campos e recursos dos locais
 
 Estado: **concluída**.
 
-Um local passou a poder conter **recursos**: campos, quadras, salas e áreas. É a futura unidade de **conflito físico** — dois professores às 18:00 no Campo 1 do mesmo local serão um conflito; no Campo 1 e no Campo 2, não. Nesta etapa modela-se apenas a estrutura: **não existe aqui nenhuma lógica de conflito, horário, reserva ou disponibilidade de recurso**, porque isso exige aulas (5C) e conflitos (5D).
+Um local passou a poder conter **recursos**: campos, quadras, salas e áreas. É a unidade de **conflito físico** desde a 5D.1 — dois professores às 18:00 no Campo 1 do mesmo local são um conflito; no Campo 1 e no Campo 2, não. Nesta etapa modelava-se apenas a estrutura: a ocupação real só é validada ao criar/editar aulas.
 
 #### Auditoria prévia
 
@@ -901,7 +901,7 @@ Secção "Campos, salas e áreas" dentro de `/professor/locais/[id]`: lista com 
 
 #### Não implementado
 
-Disponibilidade, horário ou reserva de um recurso; conflitos e créditos (5D); notificações; qualquer integração externa. Os recursos não têm estado de ocupação — a interface não diz "livre", "ocupado", "reservado" nem "conflito", porque nada disso existe ainda para ser verdade. Aulas passaram a existir na 5C, a seguir.
+Disponibilidade, horário ou reserva visual de um recurso; créditos; notificações; qualquer integração externa. Os recursos não têm estado próprio de ocupação — a interface não diz "livre", "ocupado" ou "reservado" no inventário. A colisão real é validada ao gravar aulas desde a 5D.1.
 
 ### Concluído na Fase 5 — Etapa 5C: criação e edição segura de aulas
 
@@ -927,23 +927,23 @@ Um clube é **contexto**, não propriedade: a aula é do professor que a criou, 
 
 Aula individual ou de turma, nunca as duas — XOR imposto na RPC e no schema Zod. Numa aula de turma os membros ativos são **materializados no momento da criação**: alterar a composição da turma amanhã não altera quem estava previsto para a aula de hoje. É isso que torna o histórico verdadeiro.
 
-#### Disponibilidade, e o limite honesto desta etapa
+#### Disponibilidade e conflitos
 
 `lesson_fits_teacher_availability()` responde a uma pergunta só: *o professor declarou-se disponível nesta janela?* Reutiliza `resolve_teacher_availability_windows()` e `resolve_teacher_block_segments()` da 5B.2B, funde períodos contíguos e recusa uma aula a atravessar a meia-noite.
 
-**Não é um motor de conflitos.** Duas aulas podem ficar sobrepostas no mesmo campo. Sem bloqueio transacional, qualquer verificação seria uma corrida perdida entre dois separadores abertos — e uma garantia falsa é pior do que garantia nenhuma. A interface diz isto por palavras, e o texto está sob teste.
+A Etapa 5D.1 acrescentou o motor de conflitos no PostgreSQL. O trigger `ensure_lesson_has_no_conflict()` usa locks transacionais por professor e por recurso, impede sobreposição de aulas ativas (`scheduled`/`confirmed`), aplica `teacher_profiles.minimum_break_minutes` e bloqueia dois professores no mesmo campo/sala/área ao mesmo horário. Estados históricos (`completed`, canceladas, reagendadas e faltas) não bloqueiam novas marcações.
 
 #### Pacotes: deliberadamente parados
 
 `lesson_participants` nasce `billing_status='pending'`, zero reservado, `student_package_id` a `NULL`. As constraints permitiriam guardar um pacote "planeado" sem reserva — e é exatamente por isso que não se guarda: seria um ponteiro que a 5D leria como decidido, e que pode estar esgotado ou expirado quando ela chegar. A sugestão continua a ser leitura, no momento da reserva.
 
-#### Onde a 5D entra
+#### Onde a 5D continua
 
-Dentro de `create_lesson()`, entre a validação de disponibilidade e o `insert`: bloquear professor e recurso, verificar colisão, selecionar pacote e reservar crédito para cada participante materializado. A transação já existe; falta-lhe o meio.
+A 5D.1 já cobre conflitos de professor/recurso. A continuação da 5D deve escolher pacote e reservar crédito para cada participante materializado, sem reabrir escrita direta em `lessons` ou `lesson_participants`.
 
 #### Não implementado
 
-Conflitos, exclusion constraints, locks de professor ou recurso, recorrência, intervalo mínimo transacional, presença, conclusão, falta, cancelamento e reagendamento operacionais, confirmação pelo aluno, lista de espera, notificações, pagamentos, calendários externos.
+Reserva de créditos na criação da aula, recorrência, presença, conclusão, falta, cancelamento e reagendamento operacionais, confirmação pelo aluno, lista de espera, notificações, pagamentos, calendários externos.
 
 ### Fase 2 — estado por item
 
