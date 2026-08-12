@@ -14,7 +14,6 @@ import {
   packageAssignmentFormSchema,
   readPackageAssignmentFormData,
   unexpectedPackageAssignmentFormFields,
-  type PackageAssignmentFormInput,
 } from "@/lib/validation/package-assignments";
 
 export type PackageAssignmentActionState = TeacherManagementActionState & {
@@ -201,5 +200,3 @@ export async function assignStudentPackageAction(
     return persistenceState("Erro inesperado ao atribuir pacote ao aluno.", error);
   }
 }
-
-export type { PackageAssignmentFormInput };

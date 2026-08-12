@@ -100,6 +100,7 @@ export function PackageAssignmentForm({
     assignStudentPackageAction,
     FORM_ACTION_IDLE_STATE,
   );
+  const [initialKey] = useState(idempotencyKey);
   const [studentSearch, setStudentSearch] = useState("");
   const [mode, setMode] = useState<"template" | "custom">(
     initialTemplate ? "template" : "custom",
@@ -137,6 +138,7 @@ export function PackageAssignmentForm({
   const selectedStudent = students.find((student) => student.id === selectedStudentId) ?? null;
   const selectedTemplate = templates.find((template) => template.id === selectedTemplateId) ?? null;
   const selectedSport = sports.find((sport) => sport.id === sportId) ?? null;
+  const key = state.status === "success" && state.resourceId ? state.resourceId : initialKey;
 
   function applyTemplate(template: PackageAssignmentTemplateOption | null) {
     if (!template) return;
@@ -173,10 +175,11 @@ export function PackageAssignmentForm({
         setSelectedStudentId(initialStudentId ?? "");
         setSelectedTemplateId(initialTemplate?.id ?? "");
       }}
+      key={key}
       className="grid gap-6 xl:grid-cols-[minmax(0,1.35fr)_minmax(20rem,0.65fr)]"
     >
       <input type="hidden" name="assignmentMode" value={mode} />
-      <input type="hidden" name="idempotencyKey" value={idempotencyKey} />
+      <input type="hidden" name="idempotencyKey" value={key} />
 
       <Card>
         <CardHeader
