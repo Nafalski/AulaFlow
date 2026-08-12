@@ -61,6 +61,15 @@ export type LessonStatus =
 
 export type ParticipantStatus = "invited" | "confirmed" | "declined" | "removed";
 
+/**
+ * Contexto operacional de uma aula (Etapa 5C).
+ *
+ * `personal` = agenda própria do professor; `club` = dada no contexto de um
+ * clube. Não é propriedade: `lessons.organization_id` continua a ser sempre a
+ * organização PESSOAL do professor, e o clube vive em `club_organization_id`.
+ */
+export type LessonContextKind = "personal" | "club";
+
 export type AttendanceStatus = "present" | "absent" | "late" | "excused";
 
 export type NotificationType =
@@ -472,11 +481,18 @@ export type StudentInvitation = {
 
 export type Lesson = {
   id: UUID;
+  /** Organização PESSOAL do professor. NUNCA um clube. */
   organization_id: UUID;
   teacher_id: UUID;
   sport_id: UUID;
   location_id: UUID | null;
+  /** Campo, sala ou área. Futura unidade de conflito físico (Etapa 5D). */
+  location_resource_id: UUID | null;
   group_id: UUID | null;
+  context_kind: LessonContextKind;
+  /** Clube em cujo contexto a aula acontece. `null` numa aula pessoal. */
+  club_organization_id: UUID | null;
+  creation_idempotency_key: UUID | null;
 
   title: string;
   /** Instante absoluto (UTC). Formatar sempre em Europe/Lisbon — ver lib/datetime.ts. */
@@ -760,14 +776,19 @@ export type OrgDirectoryEntry = {
   organization_id: UUID;
 }
 
-/** Participantes de uma aula, visíveis a quem pertence a essa aula. */
+/**
+ * Participantes de uma aula, visíveis ao PROFESSOR dessa aula.
+ *
+ * Um aluno nunca recebe os nomes dos colegas de uma aula de grupo, e
+ * `profile_id` saiu da projeção na Etapa 5C — identificar a conta de outro
+ * aluno nunca foi necessário para mostrar uma aula.
+ */
 export type LessonParticipantDirectoryEntry = {
   lesson_id: UUID;
   student_id: UUID;
   status: ParticipantStatus;
   confirmed_at: Timestamp | null;
   full_name: string;
-  profile_id: UUID | null;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1069,8 +1090,86 @@ export type StudentAvailabilityCalendarRecord = {
   status: AvailabilityPublicStatus;
 };
 
-/** Aula completa do professor, incluindo as suas observações privadas. */
-export type TeacherLessonRecord = Lesson;
+/**
+ * Aula do professor, com nomes resolvidos e observações privadas.
+ *
+ * Substitui `teacher_lesson_records` da Fase 2, que dava as observações
+ * privadas de qualquer professor a um administrador da plataforma.
+ */
+export type TeacherLessonScheduleRecord = {
+  id: UUID;
+  organization_id: UUID;
+  teacher_id: UUID;
+  context_kind: LessonContextKind;
+  club_organization_id: UUID | null;
+  club_name: string | null;
+  sport_id: UUID;
+  sport_name: string;
+  location_id: UUID | null;
+  location_name: string | null;
+  location_resource_id: UUID | null;
+  location_resource_name: string | null;
+  group_id: UUID | null;
+  group_name: string | null;
+  title: string;
+  starts_at: Timestamp;
+  ends_at: Timestamp;
+  duration_minutes: number;
+  max_participants: number;
+  status: LessonStatus;
+  requires_confirmation: boolean;
+  credit_cost: number;
+  notes_for_students: string | null;
+  private_notes: string | null;
+  cancellation_reason: string | null;
+  cancelled_at: Timestamp | null;
+  completed_at: Timestamp | null;
+  created_at: Timestamp;
+  updated_at: Timestamp;
+  participant_count: number;
+};
+
+/**
+ * Aula vista pelo aluno participante.
+ *
+ * O que ele precisa para aparecer no sítio certo à hora certa, e mais nada. Sem
+ * organização, professor interno, turma, custo em créditos, observações
+ * privadas nem — sobretudo — os colegas: numa aula de dois, uma contagem de
+ * participantes seria o mesmo que dizer quem é o outro.
+ */
+export type StudentLessonRecord = {
+  id: UUID;
+  participation_id: UUID;
+  title: string;
+  starts_at: Timestamp;
+  ends_at: Timestamp;
+  duration_minutes: number;
+  status: LessonStatus;
+  participation_status: ParticipantStatus;
+  sport_name: string;
+  teacher_name: string;
+  location_name: string | null;
+  location_address: string | null;
+  location_city: string | null;
+  location_resource_name: string | null;
+  notes_for_students: string | null;
+  is_group_lesson: boolean;
+  cancellation_reason: string | null;
+};
+
+/**
+ * Recursos que o professor pode ESCOLHER ao criar uma aula.
+ *
+ * Distinto de `TeacherLocationResourceRecord`, que responde "quem administra
+ * este local?": dar uma aula num campo não é administrá-lo.
+ */
+export type SchedulableLocationResourceRecord = {
+  id: UUID;
+  location_id: UUID;
+  name: string;
+  kind: LocationResourceKind;
+  display_order: number;
+};
 
 /** Contextos autorizados do próprio utilizador: workspace pessoal e clubes. */
 export type WorkspaceMembershipRecord = {
@@ -1385,52 +1484,17 @@ export type Database = {
         Relationships: [];
       };
       lessons: {
-        // `duration_minutes` é gerada pela base de dados: fora de Insert e Update.
         Row: Lesson;
-        Insert: Insertable<
-          Omit<Lesson, "duration_minutes">,
-          | Audited
-          | "location_id"
-          | "group_id"
-          | "max_participants"
-          | "status"
-          | "requires_confirmation"
-          | "is_recurring"
-          | "recurrence_group_id"
-          | "recurrence_rule"
-          | "credit_cost"
-          | "notes_for_students"
-          | "private_notes"
-          | "cancellation_reason"
-          | "cancelled_at"
-          | "cancelled_by"
-          | "reschedule_reason"
-          | "rescheduled_from_id"
-          | "rescheduled_to_id"
-          | "completed_at"
-          | "created_by"
-        >;
-        Update: Partial<Omit<Lesson, "duration_minutes">>;
+        // Escrita exclusivamente por RPC desde a Etapa 5C: com escrita direta o
+        // browser contornaria disponibilidade, local, recurso e participantes.
+        Insert: never;
+        Update: never;
         Relationships: [];
       };
       lesson_participants: {
         Row: LessonParticipant;
-        Insert: Insertable<
-          LessonParticipant,
-          | Audited
-          | "status"
-          | "confirmed_at"
-          | "declined_at"
-          | "decline_reason"
-          | "added_by"
-          | "student_package_id"
-          | "credits_reserved"
-          | "credits_consumed"
-          | "billing_status"
-          | "is_exception"
-          | "exception_reason"
-          | "exception_authorized_by"
-        >;
+        // Materializados por `create_lesson()`. Sem INSERT direto desde a 5C.
+        Insert: never;
         Update: Partial<LessonParticipant>;
         Relationships: [];
       };
@@ -1635,8 +1699,16 @@ export type Database = {
         Row: TeacherAvailabilityPublicRecord;
         Relationships: [];
       };
-      teacher_lesson_records: {
-        Row: TeacherLessonRecord;
+      teacher_lesson_schedule_records: {
+        Row: TeacherLessonScheduleRecord;
+        Relationships: [];
+      };
+      student_lesson_records: {
+        Row: StudentLessonRecord;
+        Relationships: [];
+      };
+      schedulable_location_resource_records: {
+        Row: SchedulableLocationResourceRecord;
         Relationships: [];
       };
       admin_user_directory: {
@@ -2027,6 +2099,37 @@ export type Database = {
         Args: { p_resource_id: UUID; p_is_active: boolean };
         Returns: boolean;
       };
+      create_lesson: {
+        Args: {
+          p_sport_id: UUID;
+          p_starts_at: Timestamp;
+          p_ends_at: Timestamp;
+          p_title: string;
+          p_context_kind?: LessonContextKind;
+          p_club_organization_id?: UUID | null;
+          p_location_id?: UUID | null;
+          p_location_resource_id?: UUID | null;
+          p_student_id?: UUID | null;
+          p_group_id?: UUID | null;
+          p_notes_for_students?: string | null;
+          p_private_notes?: string | null;
+          p_idempotency_key?: UUID | null;
+        };
+        Returns: UUID;
+      };
+      update_lesson: {
+        Args: {
+          p_lesson_id: UUID;
+          p_starts_at: Timestamp;
+          p_ends_at: Timestamp;
+          p_title: string;
+          p_location_id?: UUID | null;
+          p_location_resource_id?: UUID | null;
+          p_notes_for_students?: string | null;
+          p_private_notes?: string | null;
+        };
+        Returns: boolean;
+      };
       get_club_availability_calendar: {
         Args: {
           p_organization_id: UUID;
@@ -2048,6 +2151,7 @@ export type Database = {
       notification_channel: NotificationChannel;
       delivery_status: DeliveryStatus;
       lesson_change_type: LessonChangeType;
+      lesson_context_kind: LessonContextKind;
       recurrence_frequency: RecurrenceFrequency;
       package_status: PackageStatus;
       credit_transaction_type: CreditTransactionType;

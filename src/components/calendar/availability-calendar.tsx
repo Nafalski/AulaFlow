@@ -6,6 +6,8 @@ import {
   ChevronLeft,
   ChevronRight,
   Clock,
+  GraduationCap,
+  Plus,
   Settings2,
 } from "lucide-react";
 import Link from "next/link";
@@ -41,6 +43,20 @@ import type {
   ScheduleBlockCategory,
 } from "@/types/database";
 
+/**
+ * Uma aula real sobreposta ao calendário de disponibilidade (Etapa 5C).
+ *
+ * A disponibilidade continua a ser calculada como sempre; a aula é uma camada
+ * por cima. `subtitle` é o que se pode dizer a esta audiência sobre quem vem —
+ * ao professor, o aluno ou a turma; ao aluno, a modalidade. Nunca os colegas.
+ */
+export type LessonCalendarBadge = {
+  id: string;
+  title: string;
+  subtitle: string | null;
+  href: string | null;
+};
+
 export type AvailabilityCalendarItem = {
   date: string;
   startsAt: string | null;
@@ -51,6 +67,7 @@ export type AvailabilityCalendarItem = {
   reason?: string | null;
   category?: ScheduleBlockCategory | null;
   allDay?: boolean;
+  lesson?: LessonCalendarBadge | null;
 };
 
 /**
@@ -73,6 +90,8 @@ type AvailabilityCalendarProps = {
   subtitle?: string;
   teacherName?: string | null;
   settingsHref?: string;
+  /** Entrada para criar uma aula, a partir do dia selecionado. */
+  newLessonHref?: string;
   defaultLessonDurationMinutes?: number;
   minimumBreakMinutes?: number;
   invalidDate?: boolean;
@@ -176,12 +195,17 @@ function availablePeriods(items: AvailabilityCalendarItem[]): TimeSlot[] {
 }
 
 function displayKind(item: AvailabilityCalendarItem): CalendarDisplayKind {
+  if (item.lesson) return "lesson";
   if (item.source === "schedule_block") return "block";
   if (item.status === "available") return item.source === "date_exception" ? "exception" : "availability";
   return "unavailable";
 }
 
 function itemTitle(item: AvailabilityCalendarItem, audience: CalendarAudience): string {
+  // Antes da verificação de audiência: uma aula própria é segura para o aluno,
+  // e é a informação que ele veio ali procurar.
+  if (item.lesson) return item.lesson.title;
+
   if (audience !== "teacher") {
     return item.status === "available" ? "Disponível" : "Indisponível";
   }
@@ -194,6 +218,7 @@ function itemTitle(item: AvailabilityCalendarItem, audience: CalendarAudience): 
 }
 
 function itemMeta(item: AvailabilityCalendarItem, audience: CalendarAudience): string | null {
+  if (item.lesson) return item.lesson.subtitle;
   if (audience !== "teacher") return null;
   if (item.source === "schedule_block" && item.category) return categoryLabel(item.category);
   if (item.source) return SOURCE_LABELS[item.source];
@@ -206,6 +231,11 @@ function itemDescription(item: AvailabilityCalendarItem, audience: CalendarAudie
     ? "dia inteiro"
     : `das ${item.startsAt?.slice(0, 5)} às ${item.endsAt?.slice(0, 5)}`;
 
+  if (item.lesson) {
+    const detail = item.lesson.subtitle ? `, ${item.lesson.subtitle}` : "";
+    return `Aula: ${item.lesson.title}${detail}, ${day}, ${timeLabel}.`;
+  }
+
   if (audience !== "teacher") {
     return `${item.status === "available" ? "Disponível" : "Indisponível"}, ${day}, ${timeLabel}.`;
   }
@@ -214,7 +244,16 @@ function itemDescription(item: AvailabilityCalendarItem, audience: CalendarAudie
 }
 
 function itemClasses(item: AvailabilityCalendarItem, audience: CalendarAudience) {
-  const kind = audience !== "teacher" && item.status === "available" ? "availability" : displayKind(item);
+  const kind =
+    item.lesson || !(audience !== "teacher" && item.status === "available")
+      ? displayKind(item)
+      : "availability";
+
+  // Preenchimento sólido: uma aula é um compromisso, e tem de se distinguir à
+  // primeira vista dos tons suaves que descrevem apenas disponibilidade.
+  if (kind === "lesson") {
+    return "border-brand-deep/50 bg-brand text-white";
+  }
 
   if (kind === "availability") {
     return "border-state-success/30 bg-state-success-soft text-state-success";
@@ -232,7 +271,14 @@ function itemClasses(item: AvailabilityCalendarItem, audience: CalendarAudience)
 }
 
 function ItemIcon({ item, audience }: { item: AvailabilityCalendarItem; audience: CalendarAudience }) {
-  const kind = audience !== "teacher" && item.status === "available" ? "availability" : displayKind(item);
+  const kind =
+    item.lesson || !(audience !== "teacher" && item.status === "available")
+      ? displayKind(item)
+      : "availability";
+
+  if (kind === "lesson") {
+    return <GraduationCap className="size-4 shrink-0" aria-hidden="true" />;
+  }
 
   if (kind === "block" || kind === "unavailable") {
     return <Ban className="size-4 shrink-0" aria-hidden="true" />;
@@ -316,7 +362,7 @@ function TimelineBlock({
 
   return (
     <Link
-      href={calendarHref({ basePath, date: item.date, view: "day" })}
+      href={item.lesson?.href ?? calendarHref({ basePath, date: item.date, view: "day" })}
       aria-label={itemDescription(item, audience)}
       className={cn(
         "absolute right-1 left-1 overflow-hidden rounded-[var(--radius-field)] border px-2 py-1.5 text-left shadow-card transition-colors hover:brightness-[0.98] focus-visible:z-50",
@@ -332,7 +378,7 @@ function TimelineBlock({
         top: `${position.topPercent}%`,
         height: `${position.heightPercent}%`,
         minHeight: compact ? "2.25rem" : "2.75rem",
-        zIndex: calendarItemLayer(item),
+        zIndex: calendarItemLayer({ ...item, isLesson: Boolean(item.lesson) }),
       }}
     >
       <span className="flex min-w-0 items-center gap-1.5 text-xs font-extrabold">
@@ -827,6 +873,7 @@ function MonthSummary({
   audience: CalendarAudience;
 }) {
   const dayItems = itemsForDate(items, date);
+  const lessons = dayItems.filter((item) => item.lesson);
   const available = dayItems.filter((item) => item.status === "available" && item.startsAt && item.endsAt);
   const hasBlock = audience === "teacher" && dayItems.some((item) => item.source === "schedule_block");
   const hasException = audience === "teacher" && dayItems.some((item) => item.source === "date_exception");
@@ -845,6 +892,11 @@ function MonthSummary({
 
   return (
     <div className="mt-1 flex min-w-0 flex-col gap-1">
+      {lessons.length > 0 && (
+        <span className="truncate rounded bg-brand px-1.5 py-0.5 text-[0.68rem] font-bold text-white">
+          {lessons.length === 1 ? "1 aula" : `${lessons.length} aulas`}
+        </span>
+      )}
       {hasBlock && (
         <span className="truncate rounded bg-state-warning-soft px-1.5 py-0.5 text-[0.68rem] font-bold text-state-warning">
           Bloqueio
@@ -995,11 +1047,13 @@ function CalendarToolbar({
   window,
   today,
   settingsHref,
+  newLessonHref,
 }: {
   basePath: string;
   window: CalendarWindow;
   today: string;
   settingsHref?: string;
+  newLessonHref?: string;
 }) {
   const previousDate = shiftCalendarWindow(window, -1);
   const nextDate = shiftCalendarWindow(window, 1);
@@ -1039,6 +1093,15 @@ function CalendarToolbar({
 
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
         <ViewSwitcher basePath={basePath} window={window} />
+        {newLessonHref && (
+          <Link
+            href={`${newLessonHref}?data=${window.selectedDate}`}
+            className={buttonClasses({ variant: "accent", size: "sm", className: "shrink-0" })}
+          >
+            <Plus className="size-4" aria-hidden="true" />
+            Nova aula
+          </Link>
+        )}
         {settingsHref && (
           <Link
             href={settingsHref}
@@ -1137,6 +1200,7 @@ export function AvailabilityCalendar({
   subtitle,
   teacherName,
   settingsHref,
+  newLessonHref,
   defaultLessonDurationMinutes = 60,
   minimumBreakMinutes = 0,
   invalidDate = false,
@@ -1184,6 +1248,7 @@ export function AvailabilityCalendar({
           window={window}
           today={today}
           settingsHref={settingsHref}
+          newLessonHref={newLessonHref}
         />
       </header>
 

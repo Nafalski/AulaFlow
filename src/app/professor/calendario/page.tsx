@@ -6,7 +6,11 @@ import {
 } from "@/components/calendar/availability-calendar";
 import { Alert } from "@/components/ui/alert";
 import { requireRole } from "@/lib/auth/session";
-import { lisbonDateKey } from "@/lib/datetime";
+import { lisbonDateKey, lisbonDayRange } from "@/lib/datetime";
+import {
+  NO_CONFLICT_CHECK_NOTICE,
+  lessonCalendarSlot,
+} from "@/lib/domain/lesson-scheduling";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import {
   readCalendarSearchParamsResult,
@@ -52,7 +56,13 @@ export default async function TeacherCalendarPage({
   const { window } = calendarParams;
   const supabase = await createSupabaseServerClient();
 
-  const [profileResult, calendarResult] = await Promise.all([
+  // A janela do calendário é em dias civis; as aulas são instantes. Os limites
+  // do primeiro e do último dia de Lisboa dão o intervalo a consultar, e
+  // permitem usar o índice `(teacher_id, starts_at)`.
+  const windowStart = lisbonDayRange(`${window.startDate}T12:00:00Z`).start;
+  const windowEnd = lisbonDayRange(`${window.endDate}T12:00:00Z`).end;
+
+  const [profileResult, calendarResult, lessonsResult] = await Promise.all([
     supabase
       .from("teacher_profiles")
       .select("id, default_lesson_duration_minutes, minimum_break_minutes")
@@ -62,13 +72,40 @@ export default async function TeacherCalendarPage({
       p_start_date: window.startDate,
       p_end_date: window.endDate,
     }),
+    supabase
+      .from("teacher_lesson_schedule_records")
+      .select("id, title, starts_at, ends_at, status, group_name, sport_name, participant_count")
+      .gte("starts_at", windowStart.toISOString())
+      .lt("starts_at", windowEnd.toISOString())
+      .order("starts_at"),
   ]);
 
   if (profileResult.error) throwCalendarReadError("as preferências", profileResult.error);
   if (!profileResult.data) throwCalendarReadError("as preferências", "perfil inexistente");
   if (calendarResult.error) throwCalendarReadError("a disponibilidade", calendarResult.error);
+  if (lessonsResult.error) throwCalendarReadError("as aulas", lessonsResult.error);
 
-  const items = (calendarResult.data ?? []).map(teacherCalendarItem);
+  const lessonItems: AvailabilityCalendarItem[] = (lessonsResult.data ?? []).map((lesson) => {
+    const slot = lessonCalendarSlot(lesson.starts_at, lesson.ends_at);
+    return {
+      date: slot.date,
+      startsAt: slot.startTime,
+      endsAt: slot.endTime,
+      // Uma aula é um compromisso assumido: ocupa uma janela que estava
+      // disponível, e por isso continua a ler-se como disponibilidade usada.
+      status: "available",
+      lesson: {
+        id: lesson.id,
+        title: lesson.title,
+        subtitle:
+          lesson.group_name ??
+          (lesson.participant_count === 1 ? "Aula individual" : `${lesson.participant_count} alunos`),
+        href: `/professor/aulas/${lesson.id}`,
+      },
+    };
+  });
+
+  const items = [...(calendarResult.data ?? []).map(teacherCalendarItem), ...lessonItems];
 
   return (
     <div className="flex flex-col gap-5">
@@ -79,8 +116,9 @@ export default async function TeacherCalendarPage({
         today={today}
         items={items}
         title="Calendário"
-        subtitle="Disponibilidade calculada pela rotina semanal, exceções e bloqueios ativos."
+        subtitle="Aulas marcadas sobre a disponibilidade calculada pela rotina, exceções e bloqueios."
         settingsHref="/professor/definicoes/disponibilidade"
+        newLessonHref="/professor/aulas/nova"
         defaultLessonDurationMinutes={profileResult.data.default_lesson_duration_minutes}
         minimumBreakMinutes={profileResult.data.minimum_break_minutes}
         invalidDate={calendarParams.invalidDate}
@@ -88,7 +126,7 @@ export default async function TeacherCalendarPage({
       />
 
       <Alert tone="info">
-        Nesta etapa, o calendário mostra disponibilidade. Aulas, participantes e créditos continuam sem alteração.
+        {NO_CONFLICT_CHECK_NOTICE}
       </Alert>
     </div>
   );

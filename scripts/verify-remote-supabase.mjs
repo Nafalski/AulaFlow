@@ -73,6 +73,9 @@ const expectedTables = [
   "organization_invitations",
   "locations",
   "location_resources",
+  "lessons",
+  "lesson_participants",
+  "lesson_change_history",
 ];
 
 const expectedViews = [
@@ -94,6 +97,10 @@ const expectedViews = [
   "admin_location_moderation_records",
   "teacher_location_records",
   "teacher_location_resource_records",
+  "teacher_lesson_schedule_records",
+  "student_lesson_records",
+  "schedulable_location_resource_records",
+  "lesson_participant_directory",
 ];
 
 const expectedEnums = [
@@ -115,6 +122,7 @@ const expectedEnums = [
   "location_moderation_status",
   "location_address_source",
   "location_resource_kind",
+  "lesson_context_kind",
 ];
 
 const expectedIndexes = [
@@ -153,6 +161,9 @@ const expectedIndexes = [
   "location_resources_location_idx",
   "location_resources_active_name_unique",
   "location_resources_idempotency_unique",
+  "lessons_creation_idempotency_unique",
+  "lessons_club_starts_idx",
+  "lessons_resource_starts_idx",
 ];
 
 const expectedConstraints = [
@@ -188,6 +199,9 @@ const expectedConstraints = [
   "locations_rejection_needs_reason",
   "location_resources_name_length",
   "location_resources_display_order_range",
+  "lessons_context_matches_club",
+  "lessons_ends_after_starts",
+  "lessons_duration_sane",
 ];
 
 const expectedFunctions = [
@@ -261,6 +275,11 @@ const expectedFunctions = [
   "create_location_resource",
   "update_location_resource",
   "set_location_resource_active",
+  "validate_lesson_scope",
+  "lesson_fits_teacher_availability",
+  "can_schedule_at_location",
+  "create_lesson",
+  "update_lesson",
 ];
 
 const authenticatedRpc = [
@@ -310,6 +329,9 @@ const authenticatedRpc = [
   "create_location_resource",
   "update_location_resource",
   "set_location_resource_active",
+  "can_schedule_at_location",
+  "create_lesson",
+  "update_lesson",
 ];
 
 const internalFunctions = [
@@ -330,6 +352,8 @@ const internalFunctions = [
   "log_location_event",
   "validate_location_resource_scope",
   "log_location_resource_event",
+  "validate_lesson_scope",
+  "lesson_fits_teacher_availability",
 ];
 
 const sql = `
@@ -858,6 +882,117 @@ checks as (
     coalesce((
       select relrowsecurity from pg_class where oid = to_regclass('public.location_resources')
     ), false),
+    'ok'
+
+  union all
+  select
+    'seguranca',
+    'cliente autenticado nao cria nem altera aulas diretamente',
+    not exists (
+      select 1
+      from information_schema.table_privileges
+      where table_schema = 'public'
+        and table_name in ('lessons', 'lesson_participants')
+        and grantee in ('authenticated', 'anon')
+        and privilege_type in ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE')
+    ),
+    coalesce((
+      select string_agg(table_name || ':' || privilege_type, ', ')
+      from information_schema.table_privileges
+      where table_schema = 'public'
+        and table_name in ('lessons', 'lesson_participants')
+        and grantee in ('authenticated', 'anon')
+        and privilege_type in ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE')
+    ), 'ok')
+
+  union all
+  select
+    'privacidade',
+    'observacoes privadas da aula ficam fora do SELECT partilhado',
+    not exists (
+      select 1
+      from information_schema.column_privileges
+      where table_schema = 'public'
+        and table_name = 'lessons'
+        and grantee in ('authenticated', 'anon')
+        and column_name in ('private_notes', 'creation_idempotency_key')
+    ),
+    'ok'
+
+  union all
+  select
+    'estrutura',
+    'a aula guarda contexto, clube e recurso em colunas proprias',
+    (
+      select count(*) = 4
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'lessons'
+        and column_name in (
+          'context_kind', 'club_organization_id', 'location_resource_id',
+          'creation_idempotency_key'
+        )
+    ),
+    'ok'
+
+  union all
+  select
+    'estrutura',
+    'o contexto de uma aula e apenas pessoal ou de clube',
+    (
+      select array_agg(enum_row.enumlabel::text order by enum_row.enumsortorder)
+      from pg_enum enum_row
+      join pg_type type_row on type_row.oid = enum_row.enumtypid
+      where type_row.typname = 'lesson_context_kind'
+    ) = array['personal', 'club'],
+    'ok'
+
+  union all
+  select
+    'estrutura',
+    'a projecao legada de aulas, que dava notas privadas ao admin, foi removida',
+    not exists (
+      select 1 from information_schema.views
+      where table_schema = 'public' and table_name = 'teacher_lesson_records'
+    ),
+    'ok'
+
+  union all
+  select
+    'privacidade',
+    'a projecao do aluno nao expoe turma, custo, autoria nem contagem de colegas',
+    not exists (
+      select 1
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'student_lesson_records'
+        and column_name in (
+          'group_id', 'credit_cost', 'created_by', 'organization_id', 'teacher_id',
+          'private_notes', 'club_organization_id', 'participant_count', 'max_participants'
+        )
+    ),
+    coalesce((
+      select string_agg(column_name, ', ')
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'student_lesson_records'
+        and column_name in (
+          'group_id', 'credit_cost', 'created_by', 'organization_id', 'teacher_id',
+          'private_notes', 'club_organization_id', 'participant_count', 'max_participants'
+        )
+    ), 'ok')
+
+  union all
+  select
+    'privacidade',
+    'o diretorio de participantes nao expoe o identificador de conta do aluno',
+    not exists (
+      select 1
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'lesson_participant_directory'
+        and column_name = 'profile_id'
+    ),
     'ok'
 
   union all

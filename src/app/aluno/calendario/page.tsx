@@ -8,7 +8,8 @@ import {
 import { Alert } from "@/components/ui/alert";
 import { Card } from "@/components/ui/card";
 import { requireRole } from "@/lib/auth/session";
-import { lisbonDateKey } from "@/lib/datetime";
+import { lisbonDateKey, lisbonDayRange } from "@/lib/datetime";
+import { lessonCalendarSlot } from "@/lib/domain/lesson-scheduling";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import {
   readCalendarSearchParamsResult,
@@ -86,7 +87,10 @@ export default async function StudentCalendarPage({
     );
   }
 
-  const [teacherResult, calendarResult] = await Promise.all([
+  const windowStart = lisbonDayRange(`${window.startDate}T12:00:00Z`).start;
+  const windowEnd = lisbonDayRange(`${window.endDate}T12:00:00Z`).end;
+
+  const [teacherResult, calendarResult, lessonsResult] = await Promise.all([
     supabase
       .from("teacher_public_profiles")
       .select("public_name")
@@ -96,12 +100,38 @@ export default async function StudentCalendarPage({
       p_start_date: window.startDate,
       p_end_date: window.endDate,
     }),
+    // A projeção do aluno já filtra por `current_student_id()`: nunca traz a
+    // aula de outro, e não tem colegas, turma nem custo em créditos.
+    supabase
+      .from("student_lesson_records")
+      .select("id, title, starts_at, ends_at, status, sport_name, location_name, is_group_lesson")
+      .gte("starts_at", windowStart.toISOString())
+      .lt("starts_at", windowEnd.toISOString())
+      .order("starts_at"),
   ]);
 
   if (teacherResult.error) throwCalendarReadError("o professor responsável", teacherResult.error);
   if (calendarResult.error) throwCalendarReadError("a disponibilidade", calendarResult.error);
+  if (lessonsResult.error) throwCalendarReadError("as aulas", lessonsResult.error);
 
-  const items = (calendarResult.data ?? []).map(studentCalendarItem);
+  const lessonItems: AvailabilityCalendarItem[] = (lessonsResult.data ?? []).map((lesson) => {
+    const slot = lessonCalendarSlot(lesson.starts_at, lesson.ends_at);
+    return {
+      date: slot.date,
+      startsAt: slot.startTime,
+      endsAt: slot.endTime,
+      status: "available",
+      lesson: {
+        id: lesson.id,
+        title: lesson.title,
+        // Modalidade e local — nunca quantos são nem quem são os colegas.
+        subtitle: [lesson.sport_name, lesson.location_name].filter(Boolean).join(" · ") || null,
+        href: null,
+      },
+    };
+  });
+
+  const items = [...(calendarResult.data ?? []).map(studentCalendarItem), ...lessonItems];
 
   return (
     <div className="flex flex-col gap-5">
@@ -112,14 +142,15 @@ export default async function StudentCalendarPage({
         today={today}
         items={items}
         title="Calendário"
-        subtitle="Horários disponíveis do seu professor."
+        subtitle="As suas aulas e os horários disponíveis do seu professor."
         teacherName={teacherResult.data?.public_name ?? null}
         invalidDate={calendarParams.invalidDate}
         invalidView={calendarParams.invalidView}
       />
 
       <Alert tone="info">
-        Marcações e confirmações chegam numa etapa seguinte.
+        As aulas marcadas pelo seu professor aparecem aqui. Pedir marcação e confirmar presença
+        chegam numa etapa seguinte.
       </Alert>
     </div>
   );

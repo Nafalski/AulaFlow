@@ -6,7 +6,7 @@
 
 **Documento vivo.** Atualizado no fim de cada fase com o que foi realmente construído.
 
-- **Estado atual:** Fases 1, 1.5, 2, 3 e 4 concluídas. A Fase 5 tem as **Etapas 5A, 5B, 5B.1, 5B.2A, 5B.2B, 5B.3A e 5B.3B** concluídas — disponibilidade, projeção segura, calendário visual refinado, clubes/workspaces/membros, calendário partilhado com consentimento, domínio de locais com moradas manuais e campos/salas/áreas de cada local. **A criação de aulas (5C)** continua pendente.
+- **Estado atual:** Fases 1, 1.5, 2, 3 e 4 concluídas. A Fase 5 tem as **Etapas 5A a 5C** concluídas — disponibilidade, projeção segura, calendário visual refinado, clubes/workspaces/membros, calendário partilhado com consentimento, locais com moradas manuais, campos/salas/áreas e **criação e edição de aulas**. **Conflitos e reserva de créditos (5D)** continuam pendentes.
 - **Timezone do sistema:** `Europe/Lisbon`
 - **Idioma da interface:** Português (pt-PT)
 
@@ -813,8 +813,8 @@ Ordem da Fase 5:
 3. 5B.2B — Calendário partilhado do clube. **Concluída.**
 4. 5B.3A — Locais e moradas manuais. **Concluída.**
 5. 5B.3B — Campos e recursos dos locais. **Concluída.**
-6. 5C — Criação e edição de aulas. **Próxima.**
-7. 5D — Recorrência, conflitos e reservas de créditos.
+6. 5C — Criação e edição de aulas. **Concluída.**
+7. 5D — Recorrência, conflitos e reservas de créditos. **Próxima.**
 8. 5E — Revisão integrada.
 
 ### Concluído na Fase 5 — Etapa 5B.3A: locais e moradas manuais
@@ -901,7 +901,49 @@ Secção "Campos, salas e áreas" dentro de `/professor/locais/[id]`: lista com 
 
 #### Não implementado
 
-Aulas e participantes (5C); disponibilidade, horário ou reserva de um recurso; conflitos e créditos (5D); notificações; qualquer integração externa. Os recursos não têm estado de ocupação — a interface não diz "livre", "ocupado", "reservado" nem "conflito", porque nada disso existe ainda para ser verdade.
+Disponibilidade, horário ou reserva de um recurso; conflitos e créditos (5D); notificações; qualquer integração externa. Os recursos não têm estado de ocupação — a interface não diz "livre", "ocupado", "reservado" nem "conflito", porque nada disso existe ainda para ser verdade. Aulas passaram a existir na 5C, a seguir.
+
+### Concluído na Fase 5 — Etapa 5C: criação e edição segura de aulas
+
+Estado: **concluída**.
+
+As aulas existiam no esquema desde a Fase 1 — `lessons`, `lesson_participants`, `attendance`, `lesson_change_history`, enums, triggers — mas nenhuma linha da aplicação as criava. A 5C dá-lhes um caminho de escrita real.
+
+#### O que a auditoria encontrou, e mudou
+
+1. **A Fase 1 dava escrita direta ao cliente.** `grant select, insert on lessons`, `grant update` numa lista larga de colunas, e as policies correspondentes. Era coerente numa fase sem RPCs; deixou de ser. Com escrita direta, o browser contornaria toda a validação desta etapa com um `PATCH`. Revogado.
+2. **`lesson_participant_directory` era uma fuga à espera de acontecer.** A vista deixava **qualquer participante** ler o nome e o `profile_id` de todos os outros. Sem aulas de grupo isso nunca ocorreu; a partir desta etapa ocorreria. Passou a ser do professor da aula, e `profile_id` saiu.
+3. **O aluno e o administrador liam `lessons` diretamente.** O aluno passa a ler `student_lesson_records`; o administrador deixa de ter leitura operacional — moderar a plataforma não é motivo para ler o conteúdo das aulas.
+4. **`teacher_lesson_records` da Fase 2 dava `private_notes` de qualquer professor a um administrador.** Removida. O contrato da 5C nasce com nome próprio, `teacher_lesson_schedule_records`, porque `create or replace view` não deixa mudar a lista de colunas sem quebrar a reaplicação da migração antiga.
+5. **`log_lesson_change()` já fazia o trabalho certo** — histórico por trigger, com `previous_values`/`new_values` e um caminho explícito para "nada mudou". Reaproveitado, não duplicado; só alargado aos campos que passam a ser editáveis.
+
+#### Contexto: a decisão que não se podia errar
+
+`lessons.organization_id` continua a ser a organização **pessoal** do professor, sempre. O clube vive em `club_organization_id`, com `context_kind`. Pôr o clube em `organization_id` mudaria em silêncio o significado de todas as policies que já comparam com `auth_org_id()` — a mesma razão pela qual `profiles.organization_id` nunca aponta para um clube.
+
+Um clube é **contexto**, não propriedade: a aula é do professor que a criou, e é ele quem a edita. `create_lesson()` não tem parâmetro de professor.
+
+#### Participantes
+
+Aula individual ou de turma, nunca as duas — XOR imposto na RPC e no schema Zod. Numa aula de turma os membros ativos são **materializados no momento da criação**: alterar a composição da turma amanhã não altera quem estava previsto para a aula de hoje. É isso que torna o histórico verdadeiro.
+
+#### Disponibilidade, e o limite honesto desta etapa
+
+`lesson_fits_teacher_availability()` responde a uma pergunta só: *o professor declarou-se disponível nesta janela?* Reutiliza `resolve_teacher_availability_windows()` e `resolve_teacher_block_segments()` da 5B.2B, funde períodos contíguos e recusa uma aula a atravessar a meia-noite.
+
+**Não é um motor de conflitos.** Duas aulas podem ficar sobrepostas no mesmo campo. Sem bloqueio transacional, qualquer verificação seria uma corrida perdida entre dois separadores abertos — e uma garantia falsa é pior do que garantia nenhuma. A interface diz isto por palavras, e o texto está sob teste.
+
+#### Pacotes: deliberadamente parados
+
+`lesson_participants` nasce `billing_status='pending'`, zero reservado, `student_package_id` a `NULL`. As constraints permitiriam guardar um pacote "planeado" sem reserva — e é exatamente por isso que não se guarda: seria um ponteiro que a 5D leria como decidido, e que pode estar esgotado ou expirado quando ela chegar. A sugestão continua a ser leitura, no momento da reserva.
+
+#### Onde a 5D entra
+
+Dentro de `create_lesson()`, entre a validação de disponibilidade e o `insert`: bloquear professor e recurso, verificar colisão, selecionar pacote e reservar crédito para cada participante materializado. A transação já existe; falta-lhe o meio.
+
+#### Não implementado
+
+Conflitos, exclusion constraints, locks de professor ou recurso, recorrência, intervalo mínimo transacional, presença, conclusão, falta, cancelamento e reagendamento operacionais, confirmação pelo aluno, lista de espera, notificações, pagamentos, calendários externos.
 
 ### Fase 2 — estado por item
 
@@ -1033,6 +1075,14 @@ Ver secção 1.4. Preservar o que funciona; a separação por área é a pedida.
 ### D-22 — Recursos sem capacidade
 **Alternativa:** uma coluna `capacity` em `location_resources`, já que a informação parece óbvia.
 **Porquê:** capacidade física do espaço, número máximo de alunos numa aula e limite de uma turma são três regras diferentes com três donos diferentes. Uma coluna com este nome aqui seria lida como as três, e uma quadra que "suporta 4" não limita uma aula individual. Sem uma necessidade concreta, acrescentá-la agora seria criar uma regra que a 5C e a 5D teriam de contornar. O custo é uma migração futura de uma coluna — barato face a desfazer semântica errada espalhada por três camadas.
+
+### D-24 — O clube de uma aula numa coluna própria
+**Alternativa:** `lessons.organization_id` passar a ser o clube nas aulas de clube.
+**Porquê:** `organization_id` é o eixo de tenancy que `auth_org_id()` lê. Mudá-lo nalgumas linhas alteraria em silêncio o significado de todas as policies que já comparam com ele — e a falha apareceria longe da causa. `club_organization_id` mantém o eixo intacto e torna o contexto explícito. O custo é uma coluna e uma constraint de coerência; o benefício é não ter de reauditar dez policies.
+
+### D-25 — Criar uma aula não reserva créditos
+**Alternativa:** guardar já o pacote sugerido em `lesson_participants.student_package_id`, sem mover saldo.
+**Porquê:** as constraints permitem-no, mas o ponteiro seria lido pela 5D como uma decisão tomada — quando na verdade é uma sugestão que pode estar esgotada ou expirada quando a reserva acontecer. Um `NULL` é honesto: ninguém decidiu nada ainda. O custo é a 5D voltar a chamar `select_package_for_student()`, que é uma leitura barata.
 
 ### D-23 — Recursos apenas em locais privados e de clube
 **Alternativa:** permitir recursos também em locais públicos, geridos por quem propôs o local.

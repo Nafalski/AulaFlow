@@ -28,7 +28,13 @@ export type CalendarTimelinePosition = {
   heightPercent: number;
 };
 
-export type CalendarDisplayKind = "availability" | "exception" | "block" | "unavailable";
+/** `lesson` chegou na Etapa 5C: uma aula real, e não um estado de agenda. */
+export type CalendarDisplayKind =
+  | "availability"
+  | "exception"
+  | "block"
+  | "unavailable"
+  | "lesson";
 
 export type CalendarDisplayItemContract = {
   id: string;
@@ -306,10 +312,15 @@ export function positionCalendarBlock(
 export function calendarItemLayer({
   status,
   source,
+  isLesson = false,
 }: {
   status: string;
   source?: string | null;
+  isLesson?: boolean;
 }): number {
+  // Uma aula fica sempre por cima: é o compromisso concreto, e a disponibilidade
+  // por baixo é apenas o pano de fundo que o tornou possível.
+  if (isLesson) return 40;
   if (source === "schedule_block") return 30;
   if (status === "available") return source === "date_exception" ? 24 : 20;
   return 10;

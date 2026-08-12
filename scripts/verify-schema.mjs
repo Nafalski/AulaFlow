@@ -7517,6 +7517,737 @@ check(
   "a projeção de recursos não expõe autoria, organização nem dados administrativos",
 );
 
+// ── Criação e edição de aulas (Etapa 5C) ─────────────────────────────────────
+
+section("Criação e edição de aulas");
+
+// Fusos: Lisboa está em WEST (UTC+1) em agosto, por isso 10:00 locais são
+// 09:00 UTC. 2026-08-24 é uma segunda-feira, e a rotina semanal do professor
+// tem 09:00–13:00 e 15:00–20:00 — com um intervalo real entre as duas.
+const MONDAY_10H = "2026-08-24 09:00+00";
+const MONDAY_11H = "2026-08-24 10:00+00";
+
+const createLessonAs = (uid, args) =>
+  asDatabaseRole("authenticated", uid, () =>
+    one(
+      `select public.create_lesson(
+         p_sport_id => $1::uuid,
+         p_starts_at => $2::timestamptz,
+         p_ends_at => $3::timestamptz,
+         p_title => $4::text,
+         p_context_kind => $5::public.lesson_context_kind,
+         p_club_organization_id => $6::uuid,
+         p_location_id => $7::uuid,
+         p_location_resource_id => $8::uuid,
+         p_student_id => $9::uuid,
+         p_group_id => $10::uuid,
+         p_notes_for_students => $11::text,
+         p_private_notes => $12::text,
+         p_idempotency_key => $13::uuid
+       ) as id`,
+      [
+        args.sportId ?? sport,
+        args.start ?? MONDAY_10H,
+        args.end ?? MONDAY_11H,
+        args.title ?? "Aula 5C",
+        args.contextKind ?? "personal",
+        args.clubId ?? null,
+        args.locationId ?? null,
+        args.resourceId ?? null,
+        args.studentId ?? null,
+        args.groupId ?? null,
+        args.notes ?? null,
+        args.privateNotes ?? null,
+        args.idempotencyKey ?? randomUUID(),
+      ],
+    ),
+  );
+
+const lessonCount = async () =>
+  Number((await one(`select count(*)::int as total from public.lessons`)).total);
+
+// ── Aula individual ─────────────────────────────────────────────────────────
+
+const individualKey = randomUUID();
+const individualLesson = await createLessonAs(TEACHER_UID, {
+  studentId: ana.id,
+  locationId: managedLocation.id,
+  resourceId: court1.id,
+  title: "Aula individual 5C",
+  privateNotes: "Nota reservada ao professor",
+  idempotencyKey: individualKey,
+});
+
+const individualRow = await one(
+  `select teacher_id, organization_id, context_kind::text, club_organization_id,
+          location_id, location_resource_id, group_id, status::text, created_by,
+          max_participants
+     from public.lessons where id=$1`,
+  [individualLesson.id],
+);
+check(
+  individualRow.teacher_id === teacher.id &&
+    individualRow.organization_id === org &&
+    individualRow.context_kind === "personal" &&
+    individualRow.club_organization_id === null &&
+    individualRow.location_resource_id === court1.id &&
+    individualRow.group_id === null &&
+    individualRow.status === "scheduled" &&
+    individualRow.created_by === TEACHER_UID,
+  "aula individual nasce agendada, pessoal e com professor derivado da sessão",
+);
+
+const individualParticipants = await rows(
+  `select student_id, status::text, billing_status::text, credits_reserved, student_package_id
+     from public.lesson_participants where lesson_id=$1`,
+  [individualLesson.id],
+);
+check(
+  individualParticipants.length === 1 &&
+    individualParticipants[0].student_id === ana.id &&
+    individualParticipants[0].billing_status === "pending" &&
+    individualParticipants[0].credits_reserved === 0 &&
+    individualParticipants[0].student_package_id === null,
+  "participante é materializado sem reservar nem apontar créditos",
+);
+
+check(
+  (await one(
+    `select count(*)::int as total from public.lesson_change_history
+      where lesson_id=$1 and change_type='created'`,
+    [individualLesson.id],
+  )).total === 1,
+  "criação regista uma entrada de histórico",
+);
+
+const individualRepeat = await createLessonAs(TEACHER_UID, {
+  studentId: ana.id,
+  locationId: managedLocation.id,
+  resourceId: court1.id,
+  title: "Aula individual 5C",
+  idempotencyKey: individualKey,
+});
+const participantsAfterRepeat = await one(
+  `select count(*)::int as total from public.lesson_participants where lesson_id=$1`,
+  [individualLesson.id],
+);
+check(
+  individualRepeat.id === individualLesson.id && Number(participantsAfterRepeat.total) === 1,
+  "repetir a criação com a mesma chave devolve a mesma aula e não duplica participantes",
+);
+
+// ── Aula de turma: materialização ───────────────────────────────────────────
+
+const groupMembersBefore = await rows(
+  `select member.student_id
+     from public.group_members member
+     join public.student_profiles student on student.id = member.student_id
+    where member.group_id=$1 and member.is_active and student.is_active`,
+  [managedGroup.id],
+);
+
+const teamLesson = await createLessonAs(TEACHER_UID, {
+  groupId: managedGroup.id,
+  locationId: managedLocation.id,
+  title: "Aula de turma 5C",
+  start: "2026-08-24 16:00+00",
+  end: "2026-08-24 17:00+00",
+});
+const groupParticipants = await rows(
+  `select student_id from public.lesson_participants where lesson_id=$1 order by student_id`,
+  [teamLesson.id],
+);
+check(
+  groupParticipants.length === groupMembersBefore.length &&
+    groupParticipants.length > 0 &&
+    groupParticipants.every((participant) =>
+      groupMembersBefore.some((member) => member.student_id === participant.student_id),
+    ),
+  "aula de turma materializa os membros ativos no momento da criação",
+);
+
+// A composição da turma muda DEPOIS: quem estava previsto continua previsto.
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(`select public.remove_group_member($1,$2)`, [managedGroup.id, bruno.id]),
+);
+const participantsAfterGroupChange = await rows(
+  `select student_id from public.lesson_participants where lesson_id=$1`,
+  [teamLesson.id],
+);
+check(
+  participantsAfterGroupChange.length === groupParticipants.length,
+  "alterar a turma depois não altera quem estava previsto para a aula",
+);
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(`select public.add_group_member($1,$2)`, [managedGroup.id, bruno.id]),
+);
+
+// ── Aluno XOR turma ─────────────────────────────────────────────────────────
+
+await mustReject("aula com aluno e turma ao mesmo tempo", () =>
+  createLessonAs(TEACHER_UID, { studentId: ana.id, groupId: managedGroup.id }),
+);
+await mustReject("aula sem aluno nem turma", () => createLessonAs(TEACHER_UID, {}));
+
+// ── Disponibilidade ─────────────────────────────────────────────────────────
+
+await mustReject("horário fora da rotina semanal", () =>
+  createLessonAs(TEACHER_UID, {
+    studentId: ana.id,
+    start: "2026-08-24 20:00+00",
+    end: "2026-08-24 21:00+00",
+  }),
+);
+await mustReject("horário no intervalo entre dois períodos do mesmo dia", () =>
+  createLessonAs(TEACHER_UID, {
+    studentId: ana.id,
+    start: "2026-08-24 11:30+00",
+    end: "2026-08-24 12:30+00",
+  }),
+);
+await mustReject("dia sem rotina nem exceção", () =>
+  createLessonAs(TEACHER_UID, {
+    studentId: ana.id,
+    start: "2026-08-23 09:00+00",
+    end: "2026-08-23 10:00+00",
+  }),
+);
+await mustReject("dia coberto por bloqueio de dia inteiro", () =>
+  createLessonAs(TEACHER_UID, {
+    studentId: ana.id,
+    start: "2026-08-20 09:00+00",
+    end: "2026-08-20 10:00+00",
+  }),
+);
+await mustReject("aula que atravessa a meia-noite", () =>
+  createLessonAs(TEACHER_UID, {
+    studentId: ana.id,
+    start: "2026-08-24 18:00+00",
+    end: "2026-08-25 06:00+00",
+  }),
+);
+await mustReject("aula que termina antes de começar", () =>
+  createLessonAs(TEACHER_UID, {
+    studentId: ana.id,
+    start: "2026-08-24 10:00+00",
+    end: "2026-08-24 09:00+00",
+  }),
+);
+
+// Períodos contíguos contam como uma janela só: recusar uma aula por estar "a
+// cavalo" de 12:00 seria um falso negativo, porque não há ali interrupção.
+const tuesdayFirst = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.upsert_teacher_availability_rule(
+       2, '09:00'::time, '12:00'::time, $1, null, null, true) as id`,
+    [randomUUID()],
+  ),
+);
+const tuesdaySecond = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.upsert_teacher_availability_rule(
+       2, '12:00'::time, '15:00'::time, $1, null, null, true) as id`,
+    [randomUUID()],
+  ),
+);
+const contiguousLesson = await createLessonAs(TEACHER_UID, {
+  studentId: ana.id,
+  title: "Aula sobre dois períodos contíguos",
+  start: "2026-08-25 10:30+00",
+  end: "2026-08-25 11:30+00",
+});
+check(
+  Boolean(tuesdayFirst.id && tuesdaySecond.id && contiguousLesson.id),
+  "dois períodos contíguos formam uma janela única e aceitam uma aula a meio",
+);
+
+// ── Local e recurso ─────────────────────────────────────────────────────────
+
+await mustReject("recurso que pertence a outro local", () =>
+  createLessonAs(TEACHER_UID, {
+    studentId: ana.id,
+    locationId: managedLocation.id,
+    resourceId: clubCourt1.id,
+  }),
+);
+await mustReject("recurso sem local", () =>
+  createLessonAs(TEACHER_UID, { studentId: ana.id, resourceId: court1.id }),
+);
+await mustReject("recurso desativado", () =>
+  createLessonAs(TEACHER_UID, {
+    studentId: ana.id,
+    locationId: managedLocation.id,
+    resourceId: court2.id,
+  }),
+);
+
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(`select public.set_location_active($1, false)`, [managedLocation.id]),
+);
+await mustReject("local desativado", () =>
+  createLessonAs(TEACHER_UID, { studentId: ana.id, locationId: managedLocation.id }),
+);
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(`select public.set_location_active($1, true)`, [managedLocation.id]),
+);
+
+await mustReject("local privado de outro professor", () =>
+  createLessonAs(OTHER_TEACHER_UID, { studentId: ana.id, locationId: managedLocation.id }),
+);
+
+// ── Contexto de clube ───────────────────────────────────────────────────────
+
+const clubLesson = await createLessonAs(TEACHER_UID, {
+  studentId: ana.id,
+  contextKind: "club",
+  clubId: clubA.id,
+  locationId: clubLocation.id,
+  resourceId: clubCourt1.id,
+  title: "Aula no clube",
+  start: "2026-08-24 15:00+00",
+  end: "2026-08-24 16:00+00",
+});
+const clubLessonRow = await one(
+  `select organization_id, club_organization_id, context_kind::text
+     from public.lessons where id=$1`,
+  [clubLesson.id],
+);
+check(
+  clubLessonRow.organization_id === org &&
+    clubLessonRow.club_organization_id === clubA.id &&
+    clubLessonRow.context_kind === "club",
+  "aula de clube guarda o clube à parte e mantém a organização pessoal do professor",
+);
+
+await mustReject("aula pessoal com clube indicado", () =>
+  createLessonAs(TEACHER_UID, { studentId: ana.id, contextKind: "personal", clubId: clubA.id }),
+);
+await mustReject("aula de clube sem clube indicado", () =>
+  createLessonAs(TEACHER_UID, { studentId: ana.id, contextKind: "club" }),
+);
+await mustReject("local do clube numa aula pessoal", () =>
+  createLessonAs(TEACHER_UID, { studentId: ana.id, locationId: clubLocation.id }),
+);
+
+await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  db.query(`select public.admin_set_workspace_status($1,'suspended','Teste de aulas')`, [clubA.id]),
+);
+await mustReject("clube suspenso não aceita aulas", () =>
+  createLessonAs(TEACHER_UID, {
+    studentId: ana.id,
+    contextKind: "club",
+    clubId: clubA.id,
+    locationId: clubLocation.id,
+    start: "2026-08-24 15:00+00",
+    end: "2026-08-24 16:00+00",
+  }),
+);
+await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  db.query(`select public.admin_set_workspace_status($1,'active',null)`, [clubA.id]),
+);
+
+await mustReject("professor sem membership não cria aula no clube", () =>
+  createLessonAs(OTHER_TEACHER_UID, {
+    studentId: ana.id,
+    contextKind: "club",
+    clubId: clubA.id,
+  }),
+);
+
+// ── Aluno, turma e modalidade ───────────────────────────────────────────────
+
+await mustReject("aluno de outra organização", () =>
+  createLessonAs(TEACHER_UID, { studentId: otherStudent.id }),
+);
+const otherGroup = await one(
+  `insert into public.groups (organization_id, teacher_id, sport_id, name)
+   values ($1,$2,$3,'Turma de outra organização') returning id`,
+  [otherTeacher.organization_id, otherTeacher.id, sport],
+);
+await mustReject("turma de outro professor", () =>
+  createLessonAs(TEACHER_UID, { groupId: otherGroup.id }),
+);
+await mustReject("modalidade diferente da turma", () =>
+  createLessonAs(TEACHER_UID, { groupId: managedGroup.id, sportId: padel }),
+);
+
+// ── Atomicidade ─────────────────────────────────────────────────────────────
+
+const totalBeforeFailure = await lessonCount();
+await mustReject("criação inválida não deixa aula pela metade", () =>
+  createLessonAs(TEACHER_UID, {
+    studentId: ana.id,
+    locationId: managedLocation.id,
+    resourceId: clubCourt1.id,
+  }),
+);
+check(
+  (await lessonCount()) === totalBeforeFailure,
+  "nenhuma aula permanece depois de uma criação recusada",
+);
+
+const orphanParticipants = await one(
+  `select count(*)::int as total
+     from public.lesson_participants participant
+     left join public.lessons lesson on lesson.id = participant.lesson_id
+    where lesson.id is null`,
+);
+check(Number(orphanParticipants.total) === 0, "não existem participantes sem aula");
+
+// ── Quem não pode criar ─────────────────────────────────────────────────────
+
+await mustReject("aluno não cria aulas", () =>
+  createLessonAs(ANA_UID, { studentId: ana.id }),
+);
+await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  db.query(`select public.admin_set_account_status($1,'blocked','Teste de aulas')`, [TEACHER_UID]),
+);
+await mustReject("conta bloqueada não cria aulas", () =>
+  createLessonAs(TEACHER_UID, { studentId: ana.id }),
+);
+await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  db.query(`select public.admin_set_account_status($1,'active',null)`, [TEACHER_UID]),
+);
+await mustReject("anónimo não cria aulas", () =>
+  asDatabaseRole("anon", null, () =>
+    db.query(
+      `select public.create_lesson(
+         p_sport_id => $1, p_starts_at => $2::timestamptz, p_ends_at => $3::timestamptz,
+         p_title => 'Anónima', p_student_id => $4)`,
+      [sport, MONDAY_10H, MONDAY_11H, ana.id],
+    ),
+  ),
+);
+
+// ── Escrita direta ──────────────────────────────────────────────────────────
+
+const lessonWriteGrants = await rows(
+  `select table_name, privilege_type
+     from information_schema.table_privileges
+    where table_schema='public'
+      and table_name in ('lessons','lesson_participants')
+      and grantee in ('authenticated','anon')
+      and privilege_type in ('INSERT','UPDATE','DELETE','TRUNCATE')`,
+);
+check(
+  lessonWriteGrants.length === 0,
+  "cliente autenticado não insere nem altera aulas diretamente",
+);
+await mustReject("professor não insere aulas diretamente", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(
+      `insert into public.lessons (organization_id,teacher_id,sport_id,title,starts_at,ends_at)
+       values ($1,$2,$3,'Direta',$4::timestamptz,$5::timestamptz)`,
+      [org, teacher.id, sport, MONDAY_10H, MONDAY_11H],
+    ),
+  ),
+);
+await mustReject("professor não altera aulas diretamente", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`update public.lessons set title='Direta' where id=$1`, [individualLesson.id]),
+  ),
+);
+await mustReject("professor não acrescenta participantes diretamente", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`insert into public.lesson_participants (lesson_id, student_id) values ($1,$2)`, [
+      individualLesson.id,
+      bruno.id,
+    ]),
+  ),
+);
+await mustReject("cliente não altera o histórico da aula", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`update public.lesson_change_history set reason='forjado' where lesson_id=$1`, [
+      individualLesson.id,
+    ]),
+  ),
+);
+
+// ── Edição ──────────────────────────────────────────────────────────────────
+
+const historyBeforeEdit = await one(
+  `select count(*)::int as total from public.lesson_change_history where lesson_id=$1`,
+  [individualLesson.id],
+);
+
+const editLesson = (uid, args = {}) =>
+  asDatabaseRole("authenticated", uid, () =>
+    one(
+      `select public.update_lesson(
+         $1::uuid, $2::timestamptz, $3::timestamptz, $4::text,
+         $5::uuid, $6::uuid, $7::text, $8::text) as done`,
+      [
+        args.lessonId ?? individualLesson.id,
+        args.start ?? "2026-08-24 10:00+00",
+        args.end ?? "2026-08-24 11:00+00",
+        args.title ?? "Aula individual 5C",
+        args.locationId ?? managedLocation.id,
+        args.resourceId ?? court1.id,
+        args.notes ?? null,
+        args.privateNotes ?? "Nota reservada ao professor",
+      ],
+    ),
+  );
+
+const edited = await editLesson(TEACHER_UID);
+const editedAgain = await editLesson(TEACHER_UID);
+const historyAfterEdit = await one(
+  `select count(*)::int as total from public.lesson_change_history where lesson_id=$1`,
+  [individualLesson.id],
+);
+check(
+  edited.done === true &&
+    editedAgain.done === false &&
+    Number(historyAfterEdit.total) === Number(historyBeforeEdit.total) + 1,
+  "editar altera, repetir é no-op e o histórico não ganha entrada duplicada",
+);
+
+const timeChange = await one(
+  `select change_type::text, previous_values, new_values
+     from public.lesson_change_history
+    where lesson_id=$1 and change_type='time_changed'
+    order by created_at desc limit 1`,
+  [individualLesson.id],
+);
+check(
+  timeChange?.change_type === "time_changed" &&
+    timeChange.previous_values?.starts_at !== undefined &&
+    timeChange.new_values?.starts_at !== undefined,
+  "histórico guarda o antes e o depois de uma alteração de horário",
+);
+
+await mustReject("editar para fora da disponibilidade", () =>
+  editLesson(TEACHER_UID, { start: "2026-08-24 20:00+00", end: "2026-08-24 21:00+00" }),
+);
+await mustReject("outro professor não edita a aula", () =>
+  editLesson(OTHER_TEACHER_UID, { title: "Apropriação" }),
+);
+await mustReject("editar com recurso de outro local", () =>
+  editLesson(TEACHER_UID, { resourceId: clubCourt1.id }),
+);
+
+await db.query(
+  `update public.lessons set status='completed', completed_at=now() where id=$1`,
+  [contiguousLesson.id],
+);
+await mustReject("editar uma aula em estado terminal", () =>
+  editLesson(TEACHER_UID, { lessonId: contiguousLesson.id, title: "Já concluída" }),
+);
+
+// ── Projeções e privacidade ─────────────────────────────────────────────────
+
+const teacherLessonRow = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select id, sport_name, location_name, location_resource_name, private_notes,
+            participant_count, context_kind::text
+       from public.teacher_lesson_schedule_records where id=$1`,
+    [individualLesson.id],
+  ),
+);
+check(
+  teacherLessonRow?.location_resource_name === "Campo Coberto" &&
+    teacherLessonRow.private_notes === "Nota reservada ao professor" &&
+    Number(teacherLessonRow.participant_count) === 1,
+  "professor vê nomes resolvidos, observações privadas e contagem de participantes",
+);
+
+const otherTeacherLessons = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+  rows(`select id from public.teacher_lesson_schedule_records where id=$1`, [individualLesson.id]),
+);
+check(otherTeacherLessons.length === 0, "professor não vê aulas de outro professor");
+
+const anaLesson = await asDatabaseRole("authenticated", ANA_UID, () =>
+  one(
+    `select id, teacher_name, sport_name, location_name, location_resource_name,
+            status::text, participation_status::text, is_group_lesson
+       from public.student_lesson_records where id=$1`,
+    [individualLesson.id],
+  ),
+);
+// O nome atual, e não o do fixture: uma prova da Fase 2 renomeia este perfil.
+const teacherDisplayName = (
+  await one(`select full_name from public.profiles where id=$1`, [TEACHER_UID])
+).full_name;
+check(
+  anaLesson?.id === individualLesson.id &&
+    anaLesson.teacher_name === teacherDisplayName &&
+    anaLesson.sport_name === "Beach Tennis" &&
+    anaLesson.location_resource_name === "Campo Coberto" &&
+    anaLesson.status === "scheduled",
+  "aluno vê a própria aula com professor, modalidade e local",
+);
+check(
+  forbiddenColumns(anaLesson ?? {}, [
+    "organization_id",
+    "teacher_id",
+    "club_organization_id",
+    "private_notes",
+    "credit_cost",
+    "group_id",
+    "created_by",
+    "max_participants",
+    "participant_count",
+    "recurrence_rule",
+  ]).length === 0,
+  "projeção do aluno não expõe organização, autoria, turma, custo nem contagem",
+);
+
+const anaSeesGroupLesson = await asDatabaseRole("authenticated", ANA_UID, () =>
+  rows(`select id, is_group_lesson from public.student_lesson_records where id=$1`, [
+    teamLesson.id,
+  ]),
+);
+check(
+  anaSeesGroupLesson.length === 1 && anaSeesGroupLesson[0].is_group_lesson === true,
+  "aluno de uma aula de turma vê que é uma aula de grupo",
+);
+
+const anaSeesColleagues = await asDatabaseRole("authenticated", ANA_UID, () =>
+  rows(`select student_id from public.lesson_participant_directory where lesson_id=$1`, [
+    teamLesson.id,
+  ]),
+);
+check(
+  anaSeesColleagues.length === 0,
+  "aluno de uma aula de grupo não recebe a lista de colegas",
+);
+
+const teacherSeesParticipants = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  rows(`select student_id, full_name from public.lesson_participant_directory where lesson_id=$1`, [
+    teamLesson.id,
+  ]),
+);
+check(
+  teacherSeesParticipants.length === groupParticipants.length,
+  "professor da aula vê os participantes da sua aula de grupo",
+);
+check(
+  forbiddenColumns(teacherSeesParticipants[0] ?? {}, ["profile_id"]).length === 0,
+  "diretório de participantes não expõe o identificador de conta do aluno",
+);
+
+const brunoLesson = await createLessonAs(TEACHER_UID, {
+  studentId: bruno.id,
+  title: "Aula individual do Bruno",
+  start: "2026-08-24 17:00+00",
+  end: "2026-08-24 18:00+00",
+});
+const anaSeesBrunoLesson = await asDatabaseRole("authenticated", ANA_UID, () =>
+  rows(`select id from public.student_lesson_records where id=$1`, [brunoLesson.id]),
+);
+check(anaSeesBrunoLesson.length === 0, "aluno não vê a aula individual de outro aluno");
+
+const anaReadsLessonsTable = await asDatabaseRole("authenticated", ANA_UID, () =>
+  rows(`select id from public.lessons where id=$1`, [individualLesson.id]),
+);
+check(
+  anaReadsLessonsTable.length === 0,
+  "aluno não lê a tabela de aulas diretamente, apenas a sua projeção",
+);
+
+const anaReadsHistory = await asDatabaseRole("authenticated", ANA_UID, () =>
+  rows(`select id from public.lesson_change_history where lesson_id=$1`, [individualLesson.id]),
+);
+check(anaReadsHistory.length === 0, "aluno não lê o histórico administrativo da aula");
+
+const adminLessons = await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  rows(`select id from public.lessons limit 1`),
+);
+check(
+  adminLessons.length === 0,
+  "administrador da plataforma não recebe leitura operacional das aulas",
+);
+
+await mustReject("anónimo não lê aulas", () =>
+  asDatabaseRole("anon", null, () => db.query(`select id from public.lessons limit 1`)),
+);
+await mustReject("anónimo não lê a projeção do aluno", () =>
+  asDatabaseRole("anon", null, () =>
+    db.query(`select id from public.student_lesson_records limit 1`),
+  ),
+);
+
+// ── Recursos disponíveis para agendar ───────────────────────────────────────
+
+const schedulable = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  rows(
+    `select id, name from public.schedulable_location_resource_records where location_id=$1`,
+    [managedLocation.id],
+  ),
+);
+check(
+  schedulable.length > 0 && schedulable.every((resource) => resource.id !== court2.id),
+  "recursos oferecidos para agendar excluem os desativados",
+);
+const schedulableForStudent = await asDatabaseRole("authenticated", ANA_UID, () =>
+  rows(`select id from public.schedulable_location_resource_records`),
+);
+check(schedulableForStudent.length === 0, "aluno não consulta recursos para agendar");
+
+// ── Grants e assinaturas ────────────────────────────────────────────────────
+
+const lessonFunctionAnon = await rows(
+  `select proc.proname from pg_proc proc
+     join pg_namespace ns on ns.oid = proc.pronamespace
+    where ns.nspname='public'
+      and proc.proname in ('create_lesson','update_lesson','can_schedule_at_location',
+                           'lesson_fits_teacher_availability','validate_lesson_scope')
+      and has_function_privilege('anon', proc.oid, 'EXECUTE')`,
+);
+check(lessonFunctionAnon.length === 0, "anon não executa nenhuma função de aulas");
+
+const lessonInternalFunctions = await rows(
+  `select proc.proname from pg_proc proc
+     join pg_namespace ns on ns.oid = proc.pronamespace
+    where ns.nspname='public'
+      and proc.proname in ('lesson_fits_teacher_availability','validate_lesson_scope')
+      and has_function_privilege('authenticated', proc.oid, 'EXECUTE')`,
+);
+check(
+  lessonInternalFunctions.length === 0,
+  "sondar a disponibilidade de outro professor não é executável pelo cliente",
+);
+
+const lessonSearchPath = await rows(
+  `select proc.proname from pg_proc proc
+     join pg_namespace ns on ns.oid = proc.pronamespace
+    where ns.nspname='public'
+      and proc.proname in ('create_lesson','update_lesson','can_schedule_at_location',
+                           'lesson_fits_teacher_availability','validate_lesson_scope')
+      and not exists (
+        select 1 from unnest(coalesce(proc.proconfig, array[]::text[])) as config
+        where config like 'search_path=%'
+      )`,
+);
+check(lessonSearchPath.length === 0, "todas as funções de aulas fixam search_path");
+
+const lessonViewsAnon = await rows(
+  `select table_name from information_schema.table_privileges
+    where table_schema='public'
+      and table_name in ('teacher_lesson_schedule_records','student_lesson_records',
+                         'schedulable_location_resource_records','lesson_participant_directory')
+      and grantee in ('anon','PUBLIC')`,
+);
+check(lessonViewsAnon.length === 0, "anon não tem privilégios nas projeções de aulas");
+
+const legacyLessonView = await rows(
+  `select table_name from information_schema.views
+    where table_schema='public' and table_name='teacher_lesson_records'`,
+);
+check(
+  legacyLessonView.length === 0,
+  "a projeção legada de aulas, que dava observações privadas ao admin, foi removida",
+);
+
+const lessonContextEnum = await rows(
+  `select enumlabel from pg_enum e join pg_type t on t.oid = e.enumtypid
+    where t.typname='lesson_context_kind' order by e.enumsortorder`,
+);
+check(
+  lessonContextEnum.map((row) => row.enumlabel).join(",") === "personal,club",
+  "o contexto de uma aula é pessoal ou de clube, e nada mais",
+);
+
 section("Aulas (Fase 1)");
 
 const [generated] = await rows(

@@ -157,7 +157,8 @@ update public.profiles set role = 'admin' where email = 'voce@exemplo.pt';
 │   ├── ..._phase5_location_domain.sql Etapa 5B.3A: visibilidade, moderação e morada manual
 │   ├── ..._phase5_location_security.sql Etapa 5B.3A: RLS, grants e projeções de locais
 │   ├── ..._phase5_location_functions.sql Etapa 5B.3A: RPCs atómicas de locais
-│   └── ..._phase5_location_resources.sql Etapa 5B.3B: campos, salas e áreas de um local
+│   ├── ..._phase5_location_resources.sql Etapa 5B.3B: campos, salas e áreas de um local
+│   └── ..._phase5c_lesson_scheduling.sql Etapa 5C: contexto, recurso e RPCs de aulas
 │
 └── src/
     ├── proxy.ts             Renova a sessão e protege rotas (era middleware.ts)
@@ -179,6 +180,7 @@ update public.profiles set role = 'admin' where email = 'voce@exemplo.pt';
     │   ├── availability/    Horários, exceções e bloqueios do professor
     │   ├── workspaces/      Criação de clube, membros, convites e seletor de contexto
     │   ├── locations/      Locais, moradas manuais, moderação e recursos do local
+    │   ├── lessons/        Formulário de criação e edição de aulas
     │   ├── admin/           Diretório, filtros, detalhe, estado de contas e clubes
     │   └── brand/           Logótipo
     │
@@ -269,7 +271,7 @@ Alvo: WCAG 2.1 AA. Os componentes de `components/ui/` já resolvem o essencial �
 3. **RLS em todas as tabelas novas.** Com RLS ativo e sem policy, a tabela fica `default deny`; acrescente apenas as policies explícitas exigidas pelo cliente.
 4. **Papéis nunca vêm do cliente.** O trigger `handle_new_user()` aceita `teacher` ou `student` e trata tudo o resto como `student`.
 5. **Aulas nunca são apagadas.** Sem GRANT de DELETE, sem policy de DELETE, e um trigger que recusa estados terminais.
-6. **`private_notes` nunca chega ao aluno.** `authenticated` não tem GRANT dessa coluna; leituras comuns usam listas explícitas e a vista `teacher_lesson_records` é reservada ao professor/admin.
+6. **`private_notes` nunca chega ao aluno.** `authenticated` não tem GRANT dessa coluna; leituras comuns usam listas explícitas e a vista `teacher_lesson_schedule_records` é do professor da sessão. A vista `teacher_lesson_records` da Fase 2, que a dava a qualquer administrador, foi removida na 5C.
 7. **Autenticação sempre com `getUser()`.** `getSession()` apenas descodifica o cookie e acredita nele; serve para mostrar um nome, nunca para decidir um acesso.
 8. **Contas bloqueadas perdem identidades funcionais.** `auth_org_id()`, `current_teacher_id()` e `current_student_id()` só devolvem valores para perfis ativos; o layout encaminha a conta para `/conta-bloqueada`.
 9. **Estado de conta só pela RPC administrativa.** `admin_set_account_status()` exige admin ativo, recusa auto-bloqueio e deixa o estado anterior/novo e o motivo em `audit_log`.
@@ -354,6 +356,53 @@ View: `teacher_location_resource_records` — é o contrato que a Etapa 5C vai c
 
 **Não implementado:** aulas, participantes, disponibilidade/horário/reserva de recurso, conflitos, créditos, notificações.
 
+### Criação e edição de aulas (Etapa 5C)
+
+As aulas existem no esquema desde a Fase 1, mas nunca tinham sido criadas pela aplicação. A 5C dá-lhes um caminho de escrita real. **Não há motor de conflitos nem movimento de créditos** — duas aulas podem ficar sobrepostas no mesmo campo, e nada na interface pode dar a entender o contrário.
+
+**Nunca escrever "sem conflito", "campo livre", "professor disponível às 18:00" ou "vaga garantida".** Sem bloqueio transacional (5D), qualquer verificação seria uma corrida perdida entre dois separadores abertos. `NO_CONFLICT_CHECK_NOTICE` em `lib/domain/lesson-scheduling.ts` é o que se diz ao utilizador, e está sob teste.
+
+**`lessons.organization_id` é sempre a organização PESSOAL do professor.** Uma aula de clube guarda o clube em `club_organization_id`, com `context_kind = 'club'`. Pôr o clube em `organization_id` mudaria em silêncio o significado de todas as policies que já comparam com `auth_org_id()`. O clube é contexto, não propriedade.
+
+**Cada professor cria e edita as suas aulas, inclusive dentro do clube.** `create_lesson()` **não tem parâmetro de professor**: deriva-o de `current_teacher_id()`. Ver o calendário de um colega — com o consentimento da 5B.2B — não é autorização para lhe escrever na agenda. Não acrescentar esse parâmetro sem uma necessidade de produto explícita.
+
+**Escrita só por RPC.** `create_lesson()` e `update_lesson()`. A Fase 1 tinha dado ao cliente `insert` em `lessons`/`lesson_participants` e `update` numa lista larga de colunas; a 5C revoga tudo isso. Com escrita direta, um PATCH contornaria disponibilidade, local, recurso e participantes.
+
+| Validação | Onde |
+|---|---|
+| Aluno XOR turma | `create_lesson()` e o schema Zod |
+| Local ativo, recurso do local, recurso ativo | trigger `validate_lesson_scope()` |
+| Autorização de uso do local | `can_schedule_at_location()` |
+| Janela dentro da disponibilidade e fora de bloqueios | `lesson_fits_teacher_availability()` |
+| Clube ativo e membership | `create_lesson()` |
+
+`lesson_fits_teacher_availability()` reutiliza `resolve_teacher_availability_windows()` e `resolve_teacher_block_segments()` da 5B.2B — não duplicar a precedência nem a conversão de fuso. Funde períodos contíguos: uma aula das 12:30 às 13:30 cabe em `09:00–12:00` + `12:00–15:00`. Um intervalo real (o espaço entre `09:00–13:00` e `15:00–20:00`) continua a recusar. É **interna**: expô-la deixaria um professor sondar a agenda de outro por tentativa e erro.
+
+**Uma aula não atravessa a meia-noite.** A rotina semanal é por dia da semana, e uma aula a cavalo de dois dias não é representável nela. Recusada com mensagem, em vez de aceite por engano.
+
+**Turma: participantes materializados na criação.** `lesson_participants` recebe os membros ativos no momento. Alterar a turma amanhã não altera quem estava previsto para a aula de hoje — é isso que torna o histórico verdadeiro.
+
+**Pacotes: nada se move.** `lesson_participants` nasce `billing_status='pending'`, com zero reservado e `student_package_id` a `NULL`. Guardar um pacote "planeado" sem reserva criaria um ponteiro que a 5D leria como decidido, e que pode estar esgotado ou expirado quando ela chegar. A sugestão de pacote é leitura (`select_package_for_student()`), no momento da reserva.
+
+**Projeções, e o que cada uma não tem:**
+
+| View | Público | Nunca inclui |
+|---|---|---|
+| `teacher_lesson_schedule_records` | Professor da sessão | — (é o dono; inclui `private_notes`) |
+| `student_lesson_records` | Aluno participante | colegas, contagem de participantes, turma, custo em créditos, `private_notes`, organização, `teacher_id`, autoria, recorrência |
+| `lesson_participant_directory` | **Professor da aula** | `profile_id`; e o aluno já não a lê de todo |
+| `schedulable_location_resource_records` | Professor | locais públicos (não têm recursos) |
+
+**Correção de privacidade feita nesta etapa:** `lesson_participant_directory` deixava qualquer participante ler o nome e o `profile_id` dos colegas. Sem aulas de grupo isso nunca aconteceu; a partir da 5C aconteceria. Passou a ser do professor da aula.
+
+**O aluno não lê `lessons` nem `lesson_change_history` diretamente** — só a sua projeção. O administrador da plataforma também não: moderar não é motivo para ler o conteúdo das aulas de ninguém.
+
+**Edição:** só horário, local, recurso, título e observações, e só em `scheduled`/`confirmed`. Participante, modalidade e contexto não se editam — trocar o aluno é criar outra aula. O histórico é escrito pelo trigger `log_lesson_change()` da Fase 1, que também trata o caso "nada mudou": um `update_lesson()` sem alterações devolve `false` e não gera entrada.
+
+**Onde a 5D entra**, sem reescrever a 5C: dentro de `create_lesson()`, entre a validação de disponibilidade e o `insert` — bloquear professor e recurso, verificar colisão, selecionar pacote e chamar `reserve_participation_credits()` para cada participante materializado.
+
+**Não implementado:** conflitos, exclusion constraints, locks, recorrência, intervalo mínimo transacional, presença, conclusão, cancelamento e reagendamento operacionais, confirmação pelo aluno, lista de espera, notificações.
+
 ### Ao criar uma tabela nova
 
 ```sql
@@ -384,7 +433,7 @@ npm run typecheck
 
 ### `npm run db:verify`
 
-Executa **todas** as migrações, a partir de uma base vazia, contra PostgreSQL compilado para WebAssembly (PGlite), e volta a aplicá-las para confirmar idempotência. Depois exerce 582 garantias: RLS com papéis `authenticated`/`anon`, isolamento entre organizações e professores, privilégios das RPCs, perfis/claim/bloqueio, convites sem segredo, alunos, turmas, locais, modelos, atribuição, consulta e ajustes administrativos de pacotes, disponibilidade do professor, calendário seguro, clubes, memberships, convites de workspace, papéis internos, contexto ativo, suspensão, consentimento de partilha por clube, projeção do calendário partilhado, grants estritos das views, políticas, reserva, consumo, libertação, reagendamento, exceções, correções, imutabilidade do livro-razão, locais, campos/salas/áreas e constraints herdadas das aulas.
+Executa **todas** as migrações, a partir de uma base vazia, contra PostgreSQL compilado para WebAssembly (PGlite), e volta a aplicá-las para confirmar idempotência. Depois exerce 650 garantias: RLS com papéis `authenticated`/`anon`, isolamento entre organizações e professores, privilégios das RPCs, perfis/claim/bloqueio, convites sem segredo, alunos, turmas, locais, modelos, atribuição, consulta e ajustes administrativos de pacotes, disponibilidade do professor, calendário seguro, clubes, memberships, convites de workspace, papéis internos, contexto ativo, suspensão, consentimento de partilha por clube, projeção do calendário partilhado, grants estritos das views, políticas, reserva, consumo, libertação, reagendamento, exceções, correções, imutabilidade do livro-razão, locais, campos/salas/áreas, criação/edição de aulas, materialização de turmas e privacidade das projeções de aula.
 
 Corre em segundos, sem Docker e sem projeto na nuvem — serve para o CI.
 
@@ -674,7 +723,7 @@ Interface em `/professor/clubes/[id]/calendario`, com filtro por professor no UR
 
 **Não implementado:** aulas, participantes, locais, campos, recursos, conflitos, reservas e créditos. Os únicos estados são disponível e indisponível — não escrever "ocupado", "reservado", "lotado", "vagas" ou "conflito", porque nada disso existe ainda para ser verdade.
 
-Ordem: 5C criação/edição de aulas → 5D recorrência, conflitos e reservas de créditos → 5E revisão integrada.
+Ordem: 5D recorrência, conflitos e reservas de créditos → 5E revisão integrada.
 
 ### `src/types/database.ts`
 
@@ -686,7 +735,7 @@ As linhas são declaradas com `type`, **nunca com `interface`**. Um `interface` 
 
 Vitest, ambiente Node, `TZ=Europe/Lisbon` fixo para que um teste que passa localmente passe também no CI (que corre em UTC).
 
-Cobertura atual: **418 testes** em vinte e quatro ficheiros — testes de domínio, regressões de respostas/autenticação do proxy, formulários da Fase 2, validação/normalização da gestão da Fase 3, modelos, atribuição, apresentação, navegação, ajustes administrativos de pacotes, disponibilidade do professor, calendário, permissões de clube, validação de workspaces, regras do calendário partilhado, domínio de locais e recursos de locais.
+Cobertura atual: **477 testes** em vinte e seis ficheiros — testes de domínio, regressões de respostas/autenticação do proxy, formulários da Fase 2, validação/normalização da gestão da Fase 3, modelos, atribuição, apresentação, navegação, ajustes administrativos de pacotes, disponibilidade do professor, calendário, permissões de clube, validação de workspaces, regras do calendário partilhado, domínio de locais, recursos de locais e agendamento de aulas.
 
 Os testes de domínio exercem funções puras, sem base de dados nem mocks. Os testes de validação garantem normalização, limites, identificadores, estados, valores monetários em cêntimos, datas civis e rejeição de campos extra/protegidos. A integração SQL fica separada em `db:verify`.
 
@@ -709,7 +758,7 @@ Não existe um comando de formatação separado. Use `npm run lint:fix` apenas p
 | 2 | Perfis, definições e gestão administrativa básica de contas | **Concluído** |
 | 3 | Alunos, turmas, locais, política de cancelamento | **Concluído** |
 | 4 | Interfaces de modelos, atribuição, ajustes e saldos | **Concluído** — Etapas 1A, 1B, 1C, 1D e 1E validadas com Auth/PostgREST reais e browser desktop/mobile |
-| 5 | Calendário e criação de aulas com reserva | **Parcialmente concluído** — Etapas 5A, 5B, 5B.1, 5B.2A, 5B.2B, 5B.3A e 5B.3B: disponibilidade, projeção segura, refinamento visual, clubes/membros, calendário partilhado, domínio de locais com moradas manuais e campos/salas/áreas de cada local |
+| 5 | Calendário e criação de aulas com reserva | **Parcialmente concluído** — Etapas 5A a 5C: disponibilidade, projeção segura, refinamento visual, clubes/membros, calendário partilhado, locais com moradas manuais, campos/salas/áreas e criação/edição de aulas. Falta 5D: conflitos e créditos |
 | 6 | Cancelamento, reagendamento, presenças e histórico | **Planeado** |
 | 7 | Área do aluno: aulas, créditos e confirmação | **Planeado** |
 | 8 | Notificações, lembretes e expiração agendada | **Planeado** |

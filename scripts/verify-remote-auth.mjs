@@ -2087,6 +2087,273 @@ try {
     }),
   );
 
+  section("Aulas");
+
+  // A excecao `replace` desta data da uma janela de 10:00 as 12:00 em hora
+  // civil, seja qual for o dia da semana — e nao ha bloqueio nenhum nela.
+  const lessonDate = availabilityReplaceDate;
+
+  /**
+   * Hora civil de Lisboa -> instante UTC.
+   *
+   * O `create_lesson` recebe instantes, e a disponibilidade e comparada em hora
+   * local. Escrever "10:00Z" a mao daria a hora errada metade do ano.
+   */
+  const lisbonOffsetMinutes = (date) => {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: "Europe/Lisbon",
+      timeZoneName: "longOffset",
+    }).formatToParts(date);
+    const label = parts.find((part) => part.type === "timeZoneName")?.value ?? "GMT+00:00";
+    const match = /GMT([+-])(\d{2}):(\d{2})/.exec(label);
+    if (!match) return 0;
+    return (match[1] === "-" ? -1 : 1) * (Number(match[2]) * 60 + Number(match[3]));
+  };
+  const lisbonInstant = (dateOnly, time) => {
+    const [year, month, day] = dateOnly.split("-").map(Number);
+    const [hour, minute] = time.split(":").map(Number);
+    const naive = Date.UTC(year, month - 1, day, hour, minute);
+    return new Date(naive - lisbonOffsetMinutes(new Date(naive)) * 60_000).toISOString();
+  };
+
+  const sportRow = await getSingle(
+    "modalidade",
+    teacherClient.from("sports").select("id, name").eq("slug", "beach-tennis"),
+  );
+
+  const createLesson = (client, overrides = {}) =>
+    client.rpc("create_lesson", {
+      p_sport_id: sportRow.id,
+      p_starts_at: lisbonInstant(lessonDate, "10:00"),
+      p_ends_at: lisbonInstant(lessonDate, "11:00"),
+      p_title: `Aula E2E ${runId}`,
+      p_context_kind: "personal",
+      p_club_organization_id: null,
+      p_location_id: privateLocationId,
+      p_location_resource_id: courtId,
+      p_student_id: studentsA.id,
+      p_group_id: null,
+      p_notes_for_students: "e2e_nota_publica",
+      p_private_notes: "e2e_nota_privada",
+      p_idempotency_key: deterministicUuid(`lesson-individual:${runId}`),
+      ...overrides,
+    });
+
+  const { data: lessonId, error: lessonError } = await createLesson(teacherClient);
+  if (lessonError) throw new Error(`Criar aula: ${summarizeError(lessonError)}`);
+  ok(`Professor A criou ou reutilizou a aula E2E (${maskId(lessonId)})`);
+
+  const { data: lessonRepeat } = await createLesson(teacherClient);
+  check(lessonRepeat === lessonId, "Criar aula com a mesma chave e idempotente");
+
+  const lessonRecord = await getSingle(
+    "aula do professor",
+    teacherClient
+      .from("teacher_lesson_schedule_records")
+      .select("id, title, status, context_kind, club_organization_id, sport_name, location_name, location_resource_name, private_notes, participant_count, duration_minutes")
+      .eq("id", lessonId),
+  );
+  check(
+    lessonRecord.status === "scheduled" &&
+      lessonRecord.context_kind === "personal" &&
+      lessonRecord.club_organization_id === null &&
+      lessonRecord.location_resource_name !== null &&
+      lessonRecord.private_notes === "e2e_nota_privada" &&
+      lessonRecord.participant_count === 1 &&
+      lessonRecord.duration_minutes === 60,
+    "Aula nasce agendada, pessoal, com recurso e um participante",
+  );
+
+  // ── Recusas atomicas ──────────────────────────────────────────────────────
+
+  await mustReject("Aula com aluno e turma ao mesmo tempo e recusada", async () =>
+    createLesson(teacherClient, {
+      p_group_id: deterministicUuid(`lesson-fake-group:${runId}`),
+      p_idempotency_key: deterministicUuid(`lesson-both:${runId}`),
+    }),
+  );
+  await mustReject("Aula sem aluno nem turma e recusada", async () =>
+    createLesson(teacherClient, {
+      p_student_id: null,
+      p_idempotency_key: deterministicUuid(`lesson-neither:${runId}`),
+    }),
+  );
+  await mustReject("Horario fora da disponibilidade e recusado", async () =>
+    createLesson(teacherClient, {
+      p_starts_at: lisbonInstant(lessonDate, "20:00"),
+      p_ends_at: lisbonInstant(lessonDate, "21:00"),
+      p_idempotency_key: deterministicUuid(`lesson-outside:${runId}`),
+    }),
+  );
+  await mustReject("Aula que termina antes de comecar e recusada", async () =>
+    createLesson(teacherClient, {
+      p_ends_at: lisbonInstant(lessonDate, "09:00"),
+      p_idempotency_key: deterministicUuid(`lesson-inverted:${runId}`),
+    }),
+  );
+  await mustReject("Aluno de outro professor e recusado", async () =>
+    createLesson(teacherClient, {
+      p_student_id: deterministicUuid(`lesson-fake-student:${runId}`),
+      p_idempotency_key: deterministicUuid(`lesson-foreign-student:${runId}`),
+    }),
+  );
+  await mustReject("Aula pessoal com clube indicado e recusada", async () =>
+    createLesson(teacherClient, {
+      p_club_organization_id: clubId,
+      p_idempotency_key: deterministicUuid(`lesson-personal-club:${runId}`),
+    }),
+  );
+
+  const lessonsAfterFailures = await teacherClient
+    .from("teacher_lesson_schedule_records")
+    .select("id")
+    .eq("title", `Aula E2E ${runId}`);
+  check(
+    !lessonsAfterFailures.error && (lessonsAfterFailures.data ?? []).length === 1,
+    "Nenhuma aula parcial ficou de uma criacao recusada",
+  );
+
+  // ── Escrita direta ────────────────────────────────────────────────────────
+
+  await mustReject("Professor nao insere aulas diretamente", async () =>
+    teacherClient.from("lessons").insert({
+      organization_id: teacherRecord.organization_id,
+      teacher_id: teacherRecord.id,
+      sport_id: sportRow.id,
+      title: "Insercao direta",
+      starts_at: lisbonInstant(lessonDate, "10:00"),
+      ends_at: lisbonInstant(lessonDate, "11:00"),
+    }),
+  );
+  await mustReject("Professor nao altera aulas diretamente", async () =>
+    teacherClient.from("lessons").update({ title: "Escrita direta" }).eq("id", lessonId),
+  );
+  await mustReject("Professor nao acrescenta participantes diretamente", async () =>
+    teacherClient
+      .from("lesson_participants")
+      .insert({ lesson_id: lessonId, student_id: studentsA.id }),
+  );
+
+  // ── Edicao ────────────────────────────────────────────────────────────────
+
+  const editLesson = (client, overrides = {}) =>
+    client.rpc("update_lesson", {
+      p_lesson_id: lessonId,
+      p_starts_at: lisbonInstant(lessonDate, "10:00"),
+      p_ends_at: lisbonInstant(lessonDate, "11:00"),
+      p_title: `Aula E2E ${runId}`,
+      p_location_id: privateLocationId,
+      p_location_resource_id: courtId,
+      p_notes_for_students: "e2e_nota_publica",
+      p_private_notes: "e2e_nota_privada",
+      ...overrides,
+    });
+
+  // Normaliza, prova a idempotencia, prova uma alteracao real e volta atras —
+  // nesta ordem, para a seccao correr as vezes que forem precisas.
+  await editLesson(teacherClient);
+  const { data: editRepeat } = await editLesson(teacherClient);
+  const { data: editChanged } = await editLesson(teacherClient, {
+    p_starts_at: lisbonInstant(lessonDate, "11:00"),
+    p_ends_at: lisbonInstant(lessonDate, "12:00"),
+  });
+  const { data: editRestored } = await editLesson(teacherClient);
+  check(
+    editRepeat === false && editChanged === true && editRestored === true,
+    "Editar aplica alteracoes reais e ignora submissoes iguais",
+  );
+
+  const historyRows = await teacherClient
+    .from("lesson_change_history")
+    .select("change_type")
+    .eq("lesson_id", lessonId);
+  check(
+    !historyRows.error &&
+      (historyRows.data ?? []).some((row) => row.change_type === "created") &&
+      (historyRows.data ?? []).some((row) => row.change_type === "time_changed"),
+    "Historico regista a criacao e a alteracao de horario",
+  );
+
+  await mustReject("Editar para fora da disponibilidade e recusado", async () =>
+    editLesson(teacherClient, {
+      p_starts_at: lisbonInstant(lessonDate, "20:00"),
+      p_ends_at: lisbonInstant(lessonDate, "21:00"),
+    }),
+  );
+
+  // ── Isolamento entre professores ──────────────────────────────────────────
+
+  await mustReturnNoRows("Professor B nao ve a aula do Professor A", () =>
+    teacherBClient.from("teacher_lesson_schedule_records").select("id").eq("id", lessonId),
+  );
+  await mustReject("Professor B nao edita a aula do Professor A", async () =>
+    editLesson(teacherBClient, { p_title: "Apropriacao indevida" }),
+  );
+  await mustReturnNoRows("Professor B nao le o historico da aula alheia", () =>
+    teacherBClient.from("lesson_change_history").select("id").eq("lesson_id", lessonId),
+  );
+  await mustReturnNoRows("Professor B nao ve os participantes da aula alheia", () =>
+    teacherBClient.from("lesson_participant_directory").select("student_id").eq("lesson_id", lessonId),
+  );
+
+  // ── Projecao do aluno ─────────────────────────────────────────────────────
+
+  const studentLesson = await getSingle(
+    "aula do aluno",
+    studentClient
+      .from("student_lesson_records")
+      .select("id, title, teacher_name, sport_name, location_name, location_resource_name, status, participation_status, is_group_lesson, notes_for_students")
+      .eq("id", lessonId),
+  );
+  check(
+    studentLesson.id === lessonId &&
+      studentLesson.teacher_name !== null &&
+      studentLesson.notes_for_students === "e2e_nota_publica" &&
+      studentLesson.is_group_lesson === false,
+    "Aluno ve a propria aula com professor, modalidade, local e observacoes publicas",
+  );
+  check(
+    forbiddenColumns(studentLesson, [
+      "private_notes",
+      "organization_id",
+      "teacher_id",
+      "club_organization_id",
+      "group_id",
+      "credit_cost",
+      "created_by",
+      "participant_count",
+      "max_participants",
+    ]).length === 0,
+    "Projecao do aluno nao expoe notas privadas, turma, custo nem contagem",
+  );
+
+  await mustReturnNoRows("Aluno B nao ve a aula do Aluno A", () =>
+    studentBClient.from("student_lesson_records").select("id").eq("id", lessonId),
+  );
+  await mustReturnNoRows("Aluno nao le a tabela de aulas diretamente", () =>
+    studentClient.from("lessons").select("id").eq("id", lessonId),
+  );
+  await mustReturnNoRows("Aluno nao le o historico da aula", () =>
+    studentClient.from("lesson_change_history").select("id").eq("lesson_id", lessonId),
+  );
+  await mustReturnNoRows("Aluno nao ve a lista de participantes", () =>
+    studentClient.from("lesson_participant_directory").select("student_id").eq("lesson_id", lessonId),
+  );
+  await mustReject("Aluno nao cria aulas", async () =>
+    createLesson(studentClient, {
+      p_idempotency_key: deterministicUuid(`lesson-student:${runId}`),
+    }),
+  );
+
+  // ── Administrador ─────────────────────────────────────────────────────────
+
+  await mustReturnNoRows("Admin nao recebe leitura operacional das aulas", () =>
+    adminClient.from("lessons").select("id").limit(1),
+  );
+  await mustReturnNoRows("Admin nao le a projecao de aulas do professor", () =>
+    adminClient.from("teacher_lesson_schedule_records").select("id").limit(1),
+  );
+
   section("Conta bloqueada e anonimo");
   await signIn(blockedClient, credentials.blocked.email, credentials.blocked.password, "Conta bloqueada");
   await mustReturnNoRows("Conta bloqueada nao le views de pacotes", () =>
@@ -2174,6 +2441,33 @@ try {
 
   await mustReject("Anonimo nao le recursos de locais", async () =>
     anonClient.from("teacher_location_resource_records").select("id").limit(1),
+  );
+  await mustReturnNoRows("Conta bloqueada nao le aulas", () =>
+    blockedClient.from("student_lesson_records").select("id").limit(1),
+  );
+  await mustReject("Conta bloqueada nao cria aulas", async () =>
+    blockedClient.rpc("create_lesson", {
+      p_sport_id: sportRow.id,
+      p_starts_at: lisbonInstant(lessonDate, "10:00"),
+      p_ends_at: lisbonInstant(lessonDate, "11:00"),
+      p_title: "Aula bloqueada",
+      p_student_id: studentsA.id,
+      p_idempotency_key: deterministicUuid(`lesson-blocked:${runId}`),
+    }),
+  );
+
+  await mustReject("Anonimo nao le aulas", async () =>
+    anonClient.from("student_lesson_records").select("id").limit(1),
+  );
+  await mustReject("Anonimo nao cria aulas", async () =>
+    anonClient.rpc("create_lesson", {
+      p_sport_id: sportRow.id,
+      p_starts_at: lisbonInstant(lessonDate, "10:00"),
+      p_ends_at: lisbonInstant(lessonDate, "11:00"),
+      p_title: "Aula anonima",
+      p_student_id: studentsA.id,
+      p_idempotency_key: deterministicUuid(`lesson-anon:${runId}`),
+    }),
   );
   await mustReject("Anonimo nao le view de pacotes", async () =>
     anonClient.from("student_package_records").select("id").limit(1),
