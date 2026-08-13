@@ -37,7 +37,7 @@ function lessonMessage(message: string | undefined, fallback: string): string {
     return fallback;
   }
 
-  return /disponibilidade|bloqueio|aluno|turma|clube|local|campo|sala|modalidade|permissão|autoriza|ativa|horário|aula/i.test(
+  return /disponibilidade|bloqueio|aluno|turma|clube|local|campo|sala|modalidade|permissão|autoriza|ativa|horário|aula|crédito|créditos|pacote|saldo|reserva/i.test(
     raw,
   )
     ? raw

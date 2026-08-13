@@ -80,8 +80,7 @@ export const USABLE_PACKAGE_STATUSES: readonly PackageStatus[] = ["active", "not
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** O mínimo para decidir se um pacote serve. */
-export interface PackageSnapshot {
-  id: string;
+export interface PackageSelectionSnapshot {
   name: string;
   status: PackageStatus;
   creditsTotal: number;
@@ -96,6 +95,10 @@ export interface PackageSnapshot {
   sportId: string | null;
   /** ISO 8601 — desempate quando duas validades coincidem. */
   createdAt: string;
+}
+
+export interface PackageSnapshot extends PackageSelectionSnapshot {
+  id: string;
 }
 
 export type PackageUnusableReason =
@@ -118,7 +121,7 @@ export type PackageUsability =
  * ainda é válido nessa data; por omissão, avalia-se o próprio dia de hoje.
  */
 export function checkPackageUsable(
-  pkg: PackageSnapshot,
+  pkg: PackageSelectionSnapshot,
   options: {
     credits: number;
     sportId?: string | null;
@@ -198,15 +201,15 @@ export function checkPackageUsable(
  * o pacote que vai ser usado antes de o professor confirmar — que é
  * literalmente um dos requisitos.
  */
-export function selectPackageForLesson(
-  packages: readonly PackageSnapshot[],
+export function selectPackageForLesson<T extends PackageSelectionSnapshot>(
+  packages: readonly T[],
   options: {
     credits: number;
     sportId?: string | null;
     today: string;
     lessonDate?: string;
   },
-): PackageSnapshot | null {
+): T | null {
   const usable = packages.filter((pkg) => checkPackageUsable(pkg, options).usable);
 
   if (usable.length === 0) return null;
@@ -217,7 +220,13 @@ export function selectPackageForLesson(
       if (b.expiresOn === null) return -1;
       return a.expiresOn < b.expiresOn ? -1 : 1;
     }
-    return a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0;
+    if (a.createdAt !== b.createdAt) {
+      return a.createdAt < b.createdAt ? -1 : 1;
+    }
+    if ("id" in a && "id" in b && typeof a.id === "string" && typeof b.id === "string") {
+      return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+    }
+    return 0;
   });
 
   return sorted[0] ?? null;

@@ -7566,9 +7566,42 @@ const createLessonAs = (uid, args) =>
 const lessonCount = async () =>
   Number((await one(`select count(*)::int as total from public.lessons`)).total);
 
+const assignPackageAs = (uid, args) =>
+  asDatabaseRole("authenticated", uid, () => assignPackage(args));
+
+const schedulingAnaPack = await assignPackageAs(TEACHER_UID, {
+  student: ana.id,
+  name: "Pacote 5D.2 Ana",
+  credits: 80,
+  sportId: sport,
+  starts: "2026-08-01",
+  expires: "2026-08-31",
+});
+const schedulingBrunoPack = await assignPackageAs(TEACHER_UID, {
+  student: bruno.id,
+  name: "Pacote 5D.2 Bruno",
+  credits: 80,
+  sportId: sport,
+  starts: "2026-08-01",
+  expires: "2026-08-31",
+});
+const schedulingOtherPack = await assignPackageAs(OTHER_TEACHER_UID, {
+  student: otherStudent.id,
+  name: "Pacote 5D.2 externo",
+  credits: 20,
+  sportId: sport,
+  starts: "2026-08-01",
+  expires: "2026-08-31",
+});
+check(
+  Boolean(schedulingAnaPack.id && schedulingBrunoPack.id && schedulingOtherPack.id),
+  "fixtures de pacotes da 5D.2 foram criadas para os professores envolvidos",
+);
+
 // ── Aula individual ─────────────────────────────────────────────────────────
 
 const individualKey = randomUUID();
+const individualPackageBefore = await pkg(schedulingAnaPack.id);
 const individualLesson = await createLessonAs(TEACHER_UID, {
   studentId: ana.id,
   locationId: managedLocation.id,
@@ -7605,10 +7638,28 @@ const individualParticipants = await rows(
 check(
   individualParticipants.length === 1 &&
     individualParticipants[0].student_id === ana.id &&
-    individualParticipants[0].billing_status === "pending" &&
-    individualParticipants[0].credits_reserved === 0 &&
-    individualParticipants[0].student_package_id === null,
-  "participante é materializado sem reservar nem apontar créditos",
+    individualParticipants[0].billing_status === "reserved" &&
+    individualParticipants[0].credits_reserved === 1 &&
+    individualParticipants[0].student_package_id === schedulingAnaPack.id,
+  "participante é materializado com pacote real e 1 crédito reservado",
+);
+
+const individualPackageAfter = await pkg(schedulingAnaPack.id);
+check(
+  individualPackageAfter.credits_available === individualPackageBefore.credits_available - 1 &&
+    individualPackageAfter.credits_reserved === individualPackageBefore.credits_reserved + 1,
+  "criar aula individual move 1 crédito de disponível para reservado",
+);
+
+const individualReservationLedger = await one(
+  `select count(*)::int as total
+     from public.package_credit_transactions
+    where student_package_id=$1 and lesson_id=$2 and type='credit_reserved'`,
+  [schedulingAnaPack.id, individualLesson.id],
+);
+check(
+  Number(individualReservationLedger.total) === 1,
+  "reserva da criação fica registada uma vez no livro-razão",
 );
 
 check(
@@ -7631,13 +7682,25 @@ const participantsAfterRepeat = await one(
   `select count(*)::int as total from public.lesson_participants where lesson_id=$1`,
   [individualLesson.id],
 );
+const individualLedgerAfterRepeat = await one(
+  `select count(*)::int as total
+     from public.package_credit_transactions
+    where student_package_id=$1 and lesson_id=$2 and type='credit_reserved'`,
+  [schedulingAnaPack.id, individualLesson.id],
+);
+const individualPackageAfterRepeat = await pkg(schedulingAnaPack.id);
 check(
-  individualRepeat.id === individualLesson.id && Number(participantsAfterRepeat.total) === 1,
-  "repetir a criação com a mesma chave devolve a mesma aula e não duplica participantes",
+  individualRepeat.id === individualLesson.id &&
+    Number(participantsAfterRepeat.total) === 1 &&
+    Number(individualLedgerAfterRepeat.total) === 1 &&
+    individualPackageAfterRepeat.credits_available === individualPackageAfter.credits_available &&
+    individualPackageAfterRepeat.credits_reserved === individualPackageAfter.credits_reserved,
+  "repetir a criação com a mesma chave não duplica participantes nem reservas",
 );
 
 // ── Conflitos transacionais de professor ────────────────────────────────────
 
+const conflictCreditBefore = await pkg(schedulingAnaPack.id);
 await mustReject(
   "professor não cria duas aulas ativas sobrepostas",
   () =>
@@ -7647,6 +7710,12 @@ await mustReject(
       end: "2026-08-24 10:15+00",
     }),
   "outra aula",
+);
+const conflictCreditAfter = await pkg(schedulingAnaPack.id);
+check(
+  conflictCreditAfter.credits_available === conflictCreditBefore.credits_available &&
+    conflictCreditAfter.credits_reserved === conflictCreditBefore.credits_reserved,
+  "conflito de horário não reserva créditos",
 );
 
 await mustReject(
@@ -7706,7 +7775,8 @@ const teamLesson = await createLessonAs(TEACHER_UID, {
   end: "2026-08-24 15:00+00",
 });
 const groupParticipants = await rows(
-  `select student_id from public.lesson_participants where lesson_id=$1 order by student_id`,
+  `select student_id, billing_status::text, credits_reserved, student_package_id
+     from public.lesson_participants where lesson_id=$1 order by student_id`,
   [teamLesson.id],
 );
 check(
@@ -7716,6 +7786,26 @@ check(
       groupMembersBefore.some((member) => member.student_id === participant.student_id),
     ),
   "aula de turma materializa os membros ativos no momento da criação",
+);
+check(
+  groupParticipants.every(
+    (participant) =>
+      participant.billing_status === "reserved" &&
+      participant.credits_reserved === 1 &&
+      participant.student_package_id !== null,
+  ),
+  "aula de turma reserva um pacote individual por participante",
+);
+
+const groupReservationLedger = await one(
+  `select count(*)::int as total
+     from public.package_credit_transactions
+    where lesson_id=$1 and type='credit_reserved'`,
+  [teamLesson.id],
+);
+check(
+  Number(groupReservationLedger.total) === groupParticipants.length,
+  "turma cria um movimento de reserva por participante",
 );
 
 // A composição da turma muda DEPOIS: quem estava previsto continua previsto.
@@ -7732,6 +7822,234 @@ check(
 );
 await asDatabaseRole("authenticated", TEACHER_UID, () =>
   db.query(`select public.add_group_member($1,$2)`, [managedGroup.id, bruno.id]),
+);
+
+const noCreditStudent = await one(
+  `insert into public.student_profiles (organization_id, created_by_teacher_id, full_name, email)
+   values ($1,$2,'Zoe Sem Crédito','zoe.sem.credito@exemplo.pt') returning id`,
+  [org, teacher.id],
+);
+const rollbackGroup = await one(
+  `insert into public.groups (organization_id, teacher_id, sport_id, name)
+   values ($1,$2,$3,'Turma rollback 5D.2') returning id`,
+  [org, teacher.id, sport],
+);
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(`select public.add_group_member($1,$2)`, [rollbackGroup.id, ana.id]),
+);
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(`select public.add_group_member($1,$2)`, [rollbackGroup.id, noCreditStudent.id]),
+);
+
+const rollbackLessonsBefore = await lessonCount();
+const rollbackAnaBefore = await pkg(schedulingAnaPack.id);
+const rollbackLedgerBefore = await one(
+  `select count(*)::int as total from public.package_credit_transactions where student_package_id=$1`,
+  [schedulingAnaPack.id],
+);
+await mustReject(
+  "turma com um aluno sem créditos faz rollback integral",
+  () =>
+    createLessonAs(TEACHER_UID, {
+      groupId: rollbackGroup.id,
+      title: "Turma sem crédito",
+      start: "2026-08-24 15:15+00",
+      end: "2026-08-24 16:00+00",
+    }),
+  "créditos",
+);
+const rollbackAnaAfter = await pkg(schedulingAnaPack.id);
+const rollbackLedgerAfter = await one(
+  `select count(*)::int as total from public.package_credit_transactions where student_package_id=$1`,
+  [schedulingAnaPack.id],
+);
+check(
+  (await lessonCount()) === rollbackLessonsBefore &&
+    rollbackAnaAfter.credits_available === rollbackAnaBefore.credits_available &&
+    rollbackAnaAfter.credits_reserved === rollbackAnaBefore.credits_reserved &&
+    Number(rollbackLedgerAfter.total) === Number(rollbackLedgerBefore.total),
+  "rollback de turma não deixa aula, reserva parcial nem ledger parcial",
+);
+
+const noCreditLessonsBefore = await lessonCount();
+await mustReject(
+  "aluno sem pacote não cria aula nem ocupa horário",
+  () =>
+    createLessonAs(TEACHER_UID, {
+      studentId: noCreditStudent.id,
+      title: "Aula sem pacote",
+      start: "2026-08-24 16:15+00",
+      end: "2026-08-24 17:00+00",
+    }),
+  "créditos",
+);
+check(
+  (await lessonCount()) === noCreditLessonsBefore,
+  "crédito insuficiente não deixa aula parcial",
+);
+
+const expiredStudent = await one(
+  `insert into public.student_profiles (organization_id, created_by_teacher_id, full_name, email)
+   values ($1,$2,'Eva Expirada','eva.expirada@exemplo.pt') returning id`,
+  [org, teacher.id],
+);
+const expiredLessonPack = await assignPackageAs(TEACHER_UID, {
+  student: expiredStudent.id,
+  name: "Pacote expirado 5D.2",
+  credits: 3,
+  sportId: sport,
+  starts: "2026-08-01",
+  expires: "2026-08-23",
+});
+const expiredLedgerBefore = await one(
+  `select count(*)::int as total from public.package_credit_transactions where student_package_id=$1`,
+  [expiredLessonPack.id],
+);
+await mustReject(
+  "pacote expirado na data da aula é recusado",
+  () =>
+    createLessonAs(TEACHER_UID, {
+      studentId: expiredStudent.id,
+      title: "Aula com pacote expirado",
+      start: "2026-08-24 17:15+00",
+      end: "2026-08-24 18:00+00",
+    }),
+  "créditos",
+);
+const expiredLedgerAfter = await one(
+  `select count(*)::int as total from public.package_credit_transactions where student_package_id=$1`,
+  [expiredLessonPack.id],
+);
+check(
+  Number(expiredLedgerAfter.total) === Number(expiredLedgerBefore.total),
+  "pacote expirado recusado não ganha movimento de reserva",
+);
+
+const futureStudent = await one(
+  `insert into public.student_profiles (organization_id, created_by_teacher_id, full_name, email)
+   values ($1,$2,'Filipe Futuro','filipe.futuro@exemplo.pt') returning id`,
+  [org, teacher.id],
+);
+const futurePack = await assignPackageAs(TEACHER_UID, {
+  student: futureStudent.id,
+  name: "Pacote futuro 5D.2",
+  credits: 3,
+  sportId: sport,
+  starts: "2026-08-25",
+  expires: "2026-08-31",
+});
+const futureLedgerBefore = await one(
+  `select count(*)::int as total from public.package_credit_transactions where student_package_id=$1`,
+  [futurePack.id],
+);
+await mustReject(
+  "pacote ainda não iniciado na data da aula é recusado",
+  () =>
+    createLessonAs(TEACHER_UID, {
+      studentId: futureStudent.id,
+      title: "Aula com pacote futuro",
+      start: "2026-08-24 18:15+00",
+      end: "2026-08-24 19:00+00",
+    }),
+  "créditos",
+);
+const futureLedgerAfter = await one(
+  `select count(*)::int as total from public.package_credit_transactions where student_package_id=$1`,
+  [futurePack.id],
+);
+check(
+  Number(futureLedgerAfter.total) === Number(futureLedgerBefore.total),
+  "pacote futuro recusado não ganha movimento de reserva",
+);
+
+const exhaustedStudent = await one(
+  `insert into public.student_profiles (organization_id, created_by_teacher_id, full_name, email)
+   values ($1,$2,'Ema Esgotada','ema.esgotada@exemplo.pt') returning id`,
+  [org, teacher.id],
+);
+const exhaustedPack = await assignPackageAs(TEACHER_UID, {
+  student: exhaustedStudent.id,
+  name: "Pacote esgotado 5D.2",
+  credits: 1,
+  sportId: sport,
+  starts: "2026-08-01",
+  expires: "2026-08-31",
+});
+const exhaustedDrainLesson = await createLesson({
+  title: "Dreno 5D.2",
+  start: "2026-08-22 09:00+00",
+});
+await one(`select public.reserve_participation_credits($1,$2,$3) as id`, [
+  exhaustedDrainLesson.id,
+  exhaustedStudent.id,
+  exhaustedPack.id,
+]);
+const exhaustedBefore = await pkg(exhaustedPack.id);
+const exhaustedLedgerBefore = await one(
+  `select count(*)::int as total from public.package_credit_transactions where student_package_id=$1`,
+  [exhaustedPack.id],
+);
+await mustReject(
+  "pacote esgotado é recusado sem reserva negativa",
+  () =>
+    createLessonAs(TEACHER_UID, {
+      studentId: exhaustedStudent.id,
+      title: "Aula com pacote esgotado",
+      start: "2026-08-24 18:15+00",
+      end: "2026-08-24 19:00+00",
+    }),
+  "créditos",
+);
+const exhaustedAfter = await pkg(exhaustedPack.id);
+const exhaustedLedgerAfter = await one(
+  `select count(*)::int as total from public.package_credit_transactions where student_package_id=$1`,
+  [exhaustedPack.id],
+);
+check(
+  exhaustedAfter.credits_available === 0 &&
+    exhaustedAfter.credits_reserved === exhaustedBefore.credits_reserved &&
+    Number(exhaustedLedgerAfter.total) === Number(exhaustedLedgerBefore.total),
+  "pacote esgotado mantém saldo não negativo e sem ledger extra",
+);
+
+const multiPackageStudent = await one(
+  `insert into public.student_profiles (organization_id, created_by_teacher_id, full_name, email)
+   values ($1,$2,'Mila Multi','mila.multi@exemplo.pt') returning id`,
+  [org, teacher.id],
+);
+const multiLater = await assignPackageAs(TEACHER_UID, {
+  student: multiPackageStudent.id,
+  name: "Segundo pacote 5D.2",
+  credits: 3,
+  sportId: sport,
+  starts: "2026-08-01",
+  expires: "2026-08-31",
+});
+const multiSooner = await assignPackageAs(TEACHER_UID, {
+  student: multiPackageStudent.id,
+  name: "Primeiro pacote 5D.2",
+  credits: 3,
+  sportId: sport,
+  starts: "2026-08-01",
+  expires: "2026-08-30",
+});
+const multiLesson = await createLessonAs(TEACHER_UID, {
+  studentId: multiPackageStudent.id,
+  title: "Aula multi pacote",
+  start: "2026-08-24 18:15+00",
+  end: "2026-08-24 19:00+00",
+});
+const multiParticipant = await one(
+  `select student_package_id, billing_status::text, credits_reserved
+     from public.lesson_participants where lesson_id=$1 and student_id=$2`,
+  [multiLesson.id, multiPackageStudent.id],
+);
+check(
+  multiParticipant.student_package_id === multiSooner.id &&
+    multiParticipant.billing_status === "reserved" &&
+    multiParticipant.credits_reserved === 1 &&
+    multiParticipant.student_package_id !== multiLater.id,
+  "criação escolhe deterministicamente o pacote elegível que expira primeiro",
 );
 
 // ── Aluno XOR turma ─────────────────────────────────────────────────────────
@@ -8095,8 +8413,22 @@ const editLesson = (uid, args = {}) =>
     ),
   );
 
+const editPackageBefore = await pkg(schedulingAnaPack.id);
+const editLedgerBefore = await one(
+  `select count(*)::int as total
+     from public.package_credit_transactions
+    where student_package_id=$1 and lesson_id=$2 and type='credit_reserved'`,
+  [schedulingAnaPack.id, individualLesson.id],
+);
 const edited = await editLesson(TEACHER_UID);
 const editedAgain = await editLesson(TEACHER_UID);
+const editPackageAfter = await pkg(schedulingAnaPack.id);
+const editLedgerAfter = await one(
+  `select count(*)::int as total
+     from public.package_credit_transactions
+    where student_package_id=$1 and lesson_id=$2 and type='credit_reserved'`,
+  [schedulingAnaPack.id, individualLesson.id],
+);
 const historyAfterEdit = await one(
   `select count(*)::int as total from public.lesson_change_history where lesson_id=$1`,
   [individualLesson.id],
@@ -8106,6 +8438,12 @@ check(
     editedAgain.done === false &&
     Number(historyAfterEdit.total) === Number(historyBeforeEdit.total) + 1,
   "editar altera, repetir é no-op e o histórico não ganha entrada duplicada",
+);
+check(
+  editPackageAfter.credits_available === editPackageBefore.credits_available &&
+    editPackageAfter.credits_reserved === editPackageBefore.credits_reserved &&
+    Number(editLedgerAfter.total) === Number(editLedgerBefore.total),
+  "editar horário válido conserva a mesma reserva sem ledger duplicado",
 );
 
 const timeChange = await one(
@@ -8124,6 +8462,15 @@ check(
 
 await mustReject("editar para fora da disponibilidade", () =>
   editLesson(TEACHER_UID, { start: "2026-08-24 20:00+00", end: "2026-08-24 21:00+00" }),
+);
+await mustReject(
+  "editar para data fora da validade do pacote reservado",
+  () =>
+    editLesson(TEACHER_UID, {
+      start: "2026-09-01 09:00+00",
+      end: "2026-09-01 10:00+00",
+    }),
+  "créditos reservados",
 );
 await mustReject("outro professor não edita a aula", () =>
   editLesson(OTHER_TEACHER_UID, { title: "Apropriação" }),
@@ -8165,7 +8512,8 @@ check(otherTeacherLessons.length === 0, "professor não vê aulas de outro profe
 const anaLesson = await asDatabaseRole("authenticated", ANA_UID, () =>
   one(
     `select id, teacher_name, sport_name, location_name, location_resource_name,
-            status::text, participation_status::text, is_group_lesson
+            status::text, participation_status::text, billing_status::text,
+            credits_reserved, package_name, is_group_lesson
        from public.student_lesson_records where id=$1`,
     [individualLesson.id],
   ),
@@ -8179,8 +8527,11 @@ check(
     anaLesson.teacher_name === teacherDisplayName &&
     anaLesson.sport_name === "Beach Tennis" &&
     anaLesson.location_resource_name === "Campo Coberto" &&
-    anaLesson.status === "scheduled",
-  "aluno vê a própria aula com professor, modalidade e local",
+    anaLesson.status === "scheduled" &&
+    anaLesson.billing_status === "reserved" &&
+    anaLesson.credits_reserved === 1 &&
+    anaLesson.package_name === "Pacote 5D.2 Ana",
+  "aluno vê a própria aula com professor, local e o próprio crédito reservado",
 );
 check(
   forbiddenColumns(anaLesson ?? {}, [
@@ -8189,6 +8540,9 @@ check(
     "club_organization_id",
     "private_notes",
     "credit_cost",
+    "student_package_id",
+    "credits_available",
+    "credits_used",
     "group_id",
     "created_by",
     "max_participants",
@@ -8219,17 +8573,30 @@ check(
 );
 
 const teacherSeesParticipants = await asDatabaseRole("authenticated", TEACHER_UID, () =>
-  rows(`select student_id, full_name from public.lesson_participant_directory where lesson_id=$1`, [
-    teamLesson.id,
-  ]),
+  rows(
+    `select student_id, full_name, billing_status::text, credits_reserved, package_name
+       from public.teacher_lesson_participant_credit_records where lesson_id=$1`,
+    [teamLesson.id],
+  ),
 );
 check(
-  teacherSeesParticipants.length === groupParticipants.length,
-  "professor da aula vê os participantes da sua aula de grupo",
+  teacherSeesParticipants.length === groupParticipants.length &&
+    teacherSeesParticipants.every(
+      (participant) =>
+        participant.billing_status === "reserved" &&
+        participant.credits_reserved === 1 &&
+        participant.package_name !== null,
+    ),
+  "professor da aula vê participantes e reservas da sua aula de grupo",
 );
 check(
-  forbiddenColumns(teacherSeesParticipants[0] ?? {}, ["profile_id"]).length === 0,
-  "diretório de participantes não expõe o identificador de conta do aluno",
+  forbiddenColumns(teacherSeesParticipants[0] ?? {}, [
+    "profile_id",
+    "student_package_id",
+    "credits_available",
+    "credits_used",
+  ]).length === 0,
+  "diretório de participantes não expõe conta, id de pacote nem saldos",
 );
 
 const brunoLesson = await createLessonAs(TEACHER_UID, {
@@ -8350,7 +8717,8 @@ const lessonViewsAnon = await rows(
   `select table_name from information_schema.table_privileges
     where table_schema='public'
       and table_name in ('teacher_lesson_schedule_records','student_lesson_records',
-                         'schedulable_location_resource_records','lesson_participant_directory')
+                         'schedulable_location_resource_records','lesson_participant_directory',
+                         'teacher_lesson_participant_credit_records')
       and grantee in ('anon','PUBLIC')`,
 );
 check(lessonViewsAnon.length === 0, "anon não tem privilégios nas projeções de aulas");

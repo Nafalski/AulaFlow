@@ -791,6 +791,20 @@ export type LessonParticipantDirectoryEntry = {
   full_name: string;
 }
 
+export type TeacherLessonParticipantCreditRecord = {
+  lesson_id: UUID;
+  student_id: UUID;
+  status: ParticipantStatus;
+  confirmed_at: Timestamp | null;
+  full_name: string;
+  billing_status: ParticipationBillingStatus;
+  credits_reserved: number;
+  credits_consumed: number;
+  is_exception: boolean;
+  package_name: string | null;
+  package_sport_name: string | null;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 /** Projeção pública do professor, sem dados privados da conta. */
 export type TeacherPublicProfile = {
@@ -1146,6 +1160,11 @@ export type StudentLessonRecord = {
   duration_minutes: number;
   status: LessonStatus;
   participation_status: ParticipantStatus;
+  billing_status: ParticipationBillingStatus;
+  credits_reserved: number;
+  credits_consumed: number;
+  package_name: string | null;
+  package_sport_name: string | null;
   sport_name: string;
   teacher_name: string;
   location_name: string | null;
@@ -1621,6 +1640,10 @@ export type Database = {
       };
       lesson_participant_directory: {
         Row: LessonParticipantDirectoryEntry;
+        Relationships: [];
+      };
+      teacher_lesson_participant_credit_records: {
+        Row: TeacherLessonParticipantCreditRecord;
         Relationships: [];
       };
       teacher_public_profiles: {

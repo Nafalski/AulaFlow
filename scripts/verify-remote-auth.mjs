@@ -138,6 +138,23 @@ function checkOneSuccessOneConflict(label, outcomes, expectedMessage) {
   );
 }
 
+function checkOneSuccessOneInsufficientCredit(label, outcomes) {
+  const successes = outcomes.filter((outcome) => outcome.ok);
+  const insufficient = outcomes.filter((outcome) => {
+    if (outcome.ok) return false;
+    const message = summarizeError(outcome.error).toLowerCase();
+    return message.includes("crédito") || message.includes("credito") || message.includes("credit");
+  });
+
+  check(
+    successes.length === 1 && insufficient.length === 1,
+    `${label}: exatamente uma escrita venceu e a outra ficou sem credito`,
+    `${label}: resultado inesperado (${outcomes
+      .map((outcome) => (outcome.ok ? "ok" : summarizeError(outcome.error)))
+      .join(" | ")})`,
+  );
+}
+
 try {
   requireDevelopmentConfirmation();
   loadDotenvLocal(ROOT);
@@ -557,6 +574,12 @@ try {
   );
 
   await signIn(adminClient, credentials.admin.email, credentials.admin.password, "Admin");
+  await mustReturnNoRows("Admin nao le pacote privado do professor", () =>
+    adminClient.from("teacher_package_records").select("id").eq("id", packageId),
+  );
+  await mustReturnNoRows("Admin nao le ledger privado do professor", () =>
+    adminClient.from("teacher_package_history_records").select("id").eq("student_package_id", packageId),
+  );
   await mustReject("Admin nao ajusta credito como professor funcional", async () =>
     adminClient.rpc("admin_adjust_package_credits", {
       p_package_id: packageId,
@@ -2123,10 +2146,6 @@ try {
 
   section("Aulas");
 
-  // A excecao `replace` desta data da uma janela de 10:00 as 12:00 em hora
-  // civil, seja qual for o dia da semana — e nao ha bloqueio nenhum nela.
-  const lessonDate = availabilityReplaceDate;
-
   /**
    * Hora civil de Lisboa -> instante UTC.
    *
@@ -2150,9 +2169,140 @@ try {
     return new Date(naive - lisbonOffsetMinutes(new Date(naive)) * 60_000).toISOString();
   };
 
+  // Fixture própria da 5D.2: não reutiliza a aula E2E antiga, que pode ter sido
+  // criada antes de a criação reservar créditos.
+  const lessonDate = isoDatePlusDays(130, fixtureBaseDate);
+  const lessonTitle = `Aula E2E 5D2 ${runId}`;
+  const lessonKey = deterministicUuid(`lesson-individual-5d2:${runId}`);
+  const { error: lessonDateError } = await teacherClient.rpc("upsert_teacher_availability_exception", {
+    p_exception_date: lessonDate,
+    p_starts_at: "10:00",
+    p_ends_at: "12:00",
+    p_mode: "replace",
+    p_idempotency_key: deterministicUuid(`lesson-5d2-date:${runId}`),
+  });
+  if (lessonDateError) {
+    throw new Error(`Preparar disponibilidade da aula 5D2: ${summarizeError(lessonDateError)}`);
+  }
+
   const sportRow = await getSingle(
     "modalidade",
     teacherClient.from("sports").select("id, name").eq("slug", "beach-tennis"),
+  );
+
+  const lessonPackageStartsOn = isoDatePlusDays(0, fixtureBaseDate);
+  const lessonPackageExpiresOn = isoDatePlusDays(180, fixtureBaseDate);
+
+  async function ensureTeacherStudent(supabase, teacherProfile, email, fullName) {
+    const existing = await maybeSingle(
+      `aluno ${fullName}`,
+      supabase
+        .from("teacher_student_management_records")
+        .select("id, full_name, email, organization_id, created_by_teacher_id, is_active")
+        .ilike("email", email),
+    );
+    if (existing) return existing;
+
+    const { data, error } = await supabase
+      .from("student_profiles")
+      .insert({
+        organization_id: teacherProfile.organization_id,
+        created_by_teacher_id: teacherProfile.id,
+        full_name: fullName,
+        email,
+        is_active: true,
+      })
+      .select("id, full_name, email, organization_id, created_by_teacher_id, is_active")
+      .single();
+    if (error) throw new Error(`Criar aluno ${fullName}: ${summarizeError(error)}`);
+    ok(`Professor criou aluno E2E ${fullName}`);
+    return data;
+  }
+
+  async function assignLessonPackage(supabase, studentId, label, credits, key, sportId = sportRow.id) {
+    const { data: id, error } = await supabase.rpc("assign_student_package", {
+      p_student_id: studentId,
+      p_template_id: null,
+      p_credits: credits,
+      p_name: label,
+      p_sport_id: sportId,
+      p_starts_on: lessonPackageStartsOn,
+      p_expires_on: lessonPackageExpiresOn,
+      p_paid_amount_cents: null,
+      p_notes: "e2e_aulaflow_agendamento",
+      p_origin: "manual",
+      p_assignment_idempotency_key: key,
+    });
+    if (error || !id) throw new Error(`Atribuir ${label}: ${summarizeError(error)}`);
+    return getSingle(
+      label,
+      supabase
+        .from("teacher_package_records")
+        .select("id, credits_available, credits_reserved, credits_used, status")
+        .eq("id", id),
+    );
+  }
+
+  async function ensureGroup(supabase, teacherProfile, name) {
+    const existing = await maybeSingle(
+      `turma ${name}`,
+      supabase.from("teacher_group_records").select("id, name").eq("name", name),
+    );
+    if (existing) return existing;
+
+    const { data, error } = await supabase
+      .from("groups")
+      .insert({
+        organization_id: teacherProfile.organization_id,
+        teacher_id: teacherProfile.id,
+        sport_id: sportRow.id,
+        name,
+        is_active: true,
+      })
+      .select("id, name")
+      .single();
+    if (error) throw new Error(`Criar turma ${name}: ${summarizeError(error)}`);
+    ok(`Professor criou turma E2E ${name}`);
+    return data;
+  }
+
+  async function ensureGroupMember(supabase, groupId, studentId, label) {
+    const existing = await maybeSingle(
+      `membro ${label}`,
+      supabase
+        .from("group_members")
+        .select("student_id")
+        .eq("group_id", groupId)
+        .eq("student_id", studentId)
+        .eq("is_active", true),
+    );
+    if (existing) return;
+
+    const { error } = await supabase.rpc("add_group_member", {
+      p_group_id: groupId,
+      p_student_id: studentId,
+    });
+    if (error) throw new Error(`Adicionar ${label} a turma: ${summarizeError(error)}`);
+    ok(`${label} ficou na turma E2E`);
+  }
+
+  const lessonPackageA = await assignLessonPackage(
+    teacherClient,
+    studentsA.id,
+    `Pacote aulas E2E A ${runId}`,
+    80,
+    deterministicUuid(`lesson-package-a:${runId}`),
+  );
+  const lessonPackageB = await assignLessonPackage(
+    teacherBClient,
+    studentsB.id,
+    `Pacote aulas E2E B ${runId}`,
+    40,
+    deterministicUuid(`lesson-package-b:${runId}`),
+  );
+  check(
+    lessonPackageA.status === "active" && lessonPackageB.status === "active",
+    "Pacotes de agendamento de Professores A e B estao ativos",
   );
 
   const createLesson = (client, overrides = {}) =>
@@ -2160,7 +2310,7 @@ try {
       p_sport_id: sportRow.id,
       p_starts_at: lisbonInstant(lessonDate, "10:00"),
       p_ends_at: lisbonInstant(lessonDate, "11:00"),
-      p_title: `Aula E2E ${runId}`,
+      p_title: lessonTitle,
       p_context_kind: "personal",
       p_club_organization_id: null,
       p_location_id: privateLocationId,
@@ -2169,15 +2319,31 @@ try {
       p_group_id: null,
       p_notes_for_students: "e2e_nota_publica",
       p_private_notes: "e2e_nota_privada",
-      p_idempotency_key: deterministicUuid(`lesson-individual:${runId}`),
+      p_idempotency_key: lessonKey,
       ...overrides,
     });
 
+  const existingLessonBefore = await maybeSingle(
+    "aula individual E2E existente",
+    teacherClient
+      .from("teacher_lesson_schedule_records")
+      .select("id")
+      .eq("title", lessonTitle)
+      .limit(1),
+  );
+  const lessonPackageBefore = await getSingle(
+    "pacote de agendamento antes da aula",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_available, credits_reserved, credits_used")
+      .eq("id", lessonPackageA.id),
+  );
   const { data: lessonId, error: lessonError } = await createLesson(teacherClient);
   if (lessonError) throw new Error(`Criar aula: ${summarizeError(lessonError)}`);
   ok(`Professor A criou ou reutilizou a aula E2E (${maskId(lessonId)})`);
 
-  const { data: lessonRepeat } = await createLesson(teacherClient);
+  const { data: lessonRepeat, error: lessonRepeatError } = await createLesson(teacherClient);
+  if (lessonRepeatError) throw new Error(`Repetir aula: ${summarizeError(lessonRepeatError)}`);
   check(lessonRepeat === lessonId, "Criar aula com a mesma chave e idempotente");
 
   const lessonRecord = await getSingle(
@@ -2196,6 +2362,39 @@ try {
       lessonRecord.participant_count === 1 &&
       lessonRecord.duration_minutes === 60,
     "Aula nasce agendada, pessoal, com recurso e um participante",
+  );
+
+  const lessonParticipant = await getSingle(
+    "participante com reserva",
+    teacherClient
+      .from("teacher_lesson_participant_credit_records")
+      .select("student_id, billing_status, credits_reserved, credits_consumed, package_name")
+      .eq("lesson_id", lessonId)
+      .eq("student_id", studentsA.id),
+  );
+  check(
+    lessonParticipant.billing_status === "reserved" &&
+      lessonParticipant.credits_reserved === 1 &&
+      lessonParticipant.credits_consumed === 0 &&
+      lessonParticipant.package_name !== null,
+    "Participante nasce com credito reservado e pacote visivel ao professor",
+  );
+
+  const lessonPackageAfter = await getSingle(
+    "pacote de agendamento depois da aula",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_available, credits_reserved, credits_used")
+      .eq("id", lessonPackageA.id),
+  );
+  const expectedLessonDelta = existingLessonBefore ? 0 : 1;
+  check(
+    lessonPackageAfter.credits_available ===
+      lessonPackageBefore.credits_available - expectedLessonDelta &&
+      lessonPackageAfter.credits_reserved ===
+        lessonPackageBefore.credits_reserved + expectedLessonDelta &&
+      lessonPackageAfter.credits_used === lessonPackageBefore.credits_used,
+    "Criar/repetir aula move no maximo uma reserva e nao consome credito",
   );
 
   // ── Recusas atomicas ──────────────────────────────────────────────────────
@@ -2241,10 +2440,28 @@ try {
   const lessonsAfterFailures = await teacherClient
     .from("teacher_lesson_schedule_records")
     .select("id")
-    .eq("title", `Aula E2E ${runId}`);
+    .eq("title", lessonTitle);
   check(
     !lessonsAfterFailures.error && (lessonsAfterFailures.data ?? []).length === 1,
     "Nenhuma aula parcial ficou de uma criacao recusada",
+  );
+
+  const noCreditStudent = await ensureTeacherStudent(
+    teacherClient,
+    teacherRecord,
+    `e2e.no.credit.${runId}@aulaflow.example.com`,
+    `Aluno sem credito ${runId}`,
+  );
+  const noCreditTitle = `Aula E2E sem credito ${runId}`;
+  await mustReject("Aluno sem pacote nao cria aula parcial", async () =>
+    createLesson(teacherClient, {
+      p_student_id: noCreditStudent.id,
+      p_title: noCreditTitle,
+      p_idempotency_key: deterministicUuid(`lesson-no-credit:${runId}`),
+    }),
+  );
+  await mustReturnNoRows("Aula recusada por credito nao aparece no calendario", () =>
+    teacherClient.from("teacher_lesson_schedule_records").select("id").eq("title", noCreditTitle),
   );
 
   // ── Conflitos atomicos ───────────────────────────────────────────────────
@@ -2268,6 +2485,126 @@ try {
   await prepareException(teacherClient, "Disponibilidade para intervalo minimo", minimumBreakDate, "lesson-break-date-a");
   await prepareException(teacherClient, "Disponibilidade para recurso do Professor A", resourceConflictDate, "lesson-resource-date-a");
   await prepareException(teacherBClient, "Disponibilidade para recurso do Professor B", resourceConflictDate, "lesson-resource-date-b");
+
+  const lastCreditDateA = isoDatePlusDays(136, fixtureBaseDate);
+  const lastCreditDateB = isoDatePlusDays(137, fixtureBaseDate);
+  await prepareException(teacherClient, "Disponibilidade para ultimo credito A", lastCreditDateA, "lesson-last-credit-date-a");
+  await prepareException(teacherClient, "Disponibilidade para ultimo credito B", lastCreditDateB, "lesson-last-credit-date-b");
+
+  const lastCreditStudent = await ensureTeacherStudent(
+    teacherClient,
+    teacherRecord,
+    `e2e.last.credit.${runId}@aulaflow.example.com`,
+    `Aluno ultimo credito ${runId}`,
+  );
+  const lastCreditPackage = await assignLessonPackage(
+    teacherClient,
+    lastCreditStudent.id,
+    `Pacote ultimo credito ${runId}`,
+    1,
+    deterministicUuid(`lesson-last-credit-package:${runId}`),
+  );
+  const lastCreditClientA = client(url, anonKey);
+  const lastCreditClientB = client(url, anonKey);
+  await signIn(lastCreditClientA, credentials.teacherA.email, credentials.teacherA.password, "Professor A corrida ultimo credito A");
+  await signIn(lastCreditClientB, credentials.teacherA.email, credentials.teacherA.password, "Professor A corrida ultimo credito B");
+
+  const lastCreditRace = await Promise.all([
+    rpcOutcome(() =>
+      createLesson(lastCreditClientA, {
+        p_starts_at: lisbonInstant(lastCreditDateA, "10:00"),
+        p_ends_at: lisbonInstant(lastCreditDateA, "11:00"),
+        p_title: `Aula E2E ultimo credito A ${runId}`,
+        p_location_id: null,
+        p_location_resource_id: null,
+        p_student_id: lastCreditStudent.id,
+        p_idempotency_key: deterministicUuid(`lesson-last-credit-a:${runId}`),
+      }),
+    ),
+    rpcOutcome(() =>
+      createLesson(lastCreditClientB, {
+        p_starts_at: lisbonInstant(lastCreditDateB, "10:00"),
+        p_ends_at: lisbonInstant(lastCreditDateB, "11:00"),
+        p_title: `Aula E2E ultimo credito B ${runId}`,
+        p_location_id: null,
+        p_location_resource_id: null,
+        p_student_id: lastCreditStudent.id,
+        p_idempotency_key: deterministicUuid(`lesson-last-credit-b:${runId}`),
+      }),
+    ),
+  ]);
+  checkOneSuccessOneInsufficientCredit("Corrida simultanea pelo ultimo credito", lastCreditRace);
+  const lastCreditAfter = await getSingle(
+    "pacote depois da corrida de ultimo credito",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_available, credits_reserved, credits_used")
+      .eq("id", lastCreditPackage.id),
+  );
+  check(
+    lastCreditAfter.credits_available === 0 &&
+      lastCreditAfter.credits_reserved === 1 &&
+      lastCreditAfter.credits_used === 0,
+    "Ultimo credito termina com 0 disponiveis, 1 reservado e 0 consumidos",
+  );
+
+  const conflictCreditDate = isoDatePlusDays(138, fixtureBaseDate);
+  await prepareException(teacherClient, "Disponibilidade para conflito com credito", conflictCreditDate, "lesson-conflict-credit-date");
+  const conflictCreditStudent = await ensureTeacherStudent(
+    teacherClient,
+    teacherRecord,
+    `e2e.conflict.credit.${runId}@aulaflow.example.com`,
+    `Aluno conflito credito ${runId}`,
+  );
+  const conflictCreditPackage = await assignLessonPackage(
+    teacherClient,
+    conflictCreditStudent.id,
+    `Pacote conflito credito ${runId}`,
+    5,
+    deterministicUuid(`lesson-conflict-credit-package:${runId}`),
+  );
+  const conflictCreditClientA = client(url, anonKey);
+  const conflictCreditClientB = client(url, anonKey);
+  await signIn(conflictCreditClientA, credentials.teacherA.email, credentials.teacherA.password, "Professor A corrida conflito credito A");
+  await signIn(conflictCreditClientB, credentials.teacherA.email, credentials.teacherA.password, "Professor A corrida conflito credito B");
+  const conflictCreditRace = await Promise.all([
+    rpcOutcome(() =>
+      createLesson(conflictCreditClientA, {
+        p_starts_at: lisbonInstant(conflictCreditDate, "10:00"),
+        p_ends_at: lisbonInstant(conflictCreditDate, "11:00"),
+        p_title: `Aula E2E conflito credito A ${runId}`,
+        p_location_id: null,
+        p_location_resource_id: null,
+        p_student_id: conflictCreditStudent.id,
+        p_idempotency_key: deterministicUuid(`lesson-conflict-credit-a:${runId}`),
+      }),
+    ),
+    rpcOutcome(() =>
+      createLesson(conflictCreditClientB, {
+        p_starts_at: lisbonInstant(conflictCreditDate, "10:30"),
+        p_ends_at: lisbonInstant(conflictCreditDate, "11:30"),
+        p_title: `Aula E2E conflito credito B ${runId}`,
+        p_location_id: null,
+        p_location_resource_id: null,
+        p_student_id: conflictCreditStudent.id,
+        p_idempotency_key: deterministicUuid(`lesson-conflict-credit-b:${runId}`),
+      }),
+    ),
+  ]);
+  checkOneSuccessOneConflict("Corrida conflito e credito", conflictCreditRace, "outra aula");
+  const conflictCreditAfter = await getSingle(
+    "pacote depois da corrida conflito credito",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_available, credits_reserved, credits_used")
+      .eq("id", conflictCreditPackage.id),
+  );
+  check(
+    conflictCreditAfter.credits_available === 4 &&
+      conflictCreditAfter.credits_reserved === 1 &&
+      conflictCreditAfter.credits_used === 0,
+    "Conflito concorrente reserva credito apenas para a aula vencedora",
+  );
 
   const baseBreakLesson = await createLesson(teacherClient, {
     p_starts_at: lisbonInstant(minimumBreakDate, "10:00"),
@@ -2334,7 +2671,7 @@ try {
         p_organization_id: clubId,
         p_email: credentials.teacherB.email,
         p_role: "teacher",
-        p_idempotency_key: deterministicUuid(`lesson-resource-invite:${runId}`),
+        p_idempotency_key: deterministicUuid(`lesson-resource-invite:${runId}:${new Date().toISOString()}`),
       },
     );
     if (conflictInviteError || !conflictInviteId) {
@@ -2381,6 +2718,109 @@ try {
   ]);
   checkOneSuccessOneConflict("Corrida simultanea pelo mesmo recurso", resourceRace, "ocupado");
 
+  const groupLessonDate = isoDatePlusDays(139, fixtureBaseDate);
+  const groupRollbackDate = isoDatePlusDays(140, fixtureBaseDate);
+  await prepareException(teacherClient, "Disponibilidade para aula de turma", groupLessonDate, "lesson-group-date");
+  await prepareException(teacherClient, "Disponibilidade para rollback de turma", groupRollbackDate, "lesson-group-rollback-date");
+
+  const groupStudent = await ensureTeacherStudent(
+    teacherClient,
+    teacherRecord,
+    `e2e.group.student.${runId}@aulaflow.example.com`,
+    `Aluno turma ${runId}`,
+  );
+  await assignLessonPackage(
+    teacherClient,
+    groupStudent.id,
+    `Pacote turma E2E ${runId}`,
+    10,
+    deterministicUuid(`lesson-group-package:${runId}`),
+  );
+  const group = await ensureGroup(teacherClient, teacherRecord, `Turma E2E ${runId}`);
+  await ensureGroupMember(teacherClient, group.id, studentsA.id, "Aluno A");
+  await ensureGroupMember(teacherClient, group.id, groupStudent.id, "Aluno da turma");
+
+  const { data: groupLessonId, error: groupLessonError } = await createLesson(teacherClient, {
+    p_starts_at: lisbonInstant(groupLessonDate, "10:00"),
+    p_ends_at: lisbonInstant(groupLessonDate, "11:00"),
+    p_title: `Aula E2E turma ${runId}`,
+    p_location_id: null,
+    p_location_resource_id: null,
+    p_student_id: null,
+    p_group_id: group.id,
+    p_idempotency_key: deterministicUuid(`lesson-group:${runId}`),
+  });
+  if (groupLessonError || !groupLessonId) throw new Error(`Criar aula de turma: ${summarizeError(groupLessonError)}`);
+  const groupParticipants = await teacherClient
+    .from("teacher_lesson_participant_credit_records")
+    .select("student_id, billing_status, credits_reserved, package_name")
+    .eq("lesson_id", groupLessonId);
+  if (groupParticipants.error) throw new Error(`Participantes da turma: ${summarizeError(groupParticipants.error)}`);
+  check(
+    (groupParticipants.data ?? []).length >= 2 &&
+      (groupParticipants.data ?? []).every(
+        (participant) =>
+          participant.billing_status === "reserved" &&
+          participant.credits_reserved === 1 &&
+          participant.package_name !== null,
+      ),
+    "Aula de turma reserva pacote individual para cada participante",
+  );
+
+  const studentGroupLesson = await getSingle(
+    "aula de turma do aluno",
+    studentClient
+      .from("student_lesson_records")
+      .select("id, is_group_lesson, billing_status, credits_reserved, package_name")
+      .eq("id", groupLessonId),
+  );
+  check(
+    studentGroupLesson.is_group_lesson === true &&
+      studentGroupLesson.billing_status === "reserved" &&
+      studentGroupLesson.credits_reserved === 1 &&
+      studentGroupLesson.package_name !== null,
+    "Aluno ve apenas o proprio estado de credito na aula de turma",
+  );
+
+  const rollbackGroup = await ensureGroup(teacherClient, teacherRecord, `Turma E2E sem credito ${runId}`);
+  await ensureGroupMember(teacherClient, rollbackGroup.id, studentsA.id, "Aluno A rollback");
+  await ensureGroupMember(teacherClient, rollbackGroup.id, noCreditStudent.id, "Aluno sem credito");
+  const groupRollbackTitle = `Aula E2E turma rollback ${runId}`;
+  const packageBeforeGroupRollback = await getSingle(
+    "pacote antes do rollback de turma",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_available, credits_reserved")
+      .eq("id", lessonPackageA.id),
+  );
+  await mustReject("Turma com membro sem credito faz rollback integral", async () =>
+    createLesson(teacherClient, {
+      p_starts_at: lisbonInstant(groupRollbackDate, "10:00"),
+      p_ends_at: lisbonInstant(groupRollbackDate, "11:00"),
+      p_title: groupRollbackTitle,
+      p_location_id: null,
+      p_location_resource_id: null,
+      p_student_id: null,
+      p_group_id: rollbackGroup.id,
+      p_idempotency_key: deterministicUuid(`lesson-group-rollback:${runId}`),
+    }),
+  );
+  const packageAfterGroupRollback = await getSingle(
+    "pacote depois do rollback de turma",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_available, credits_reserved")
+      .eq("id", lessonPackageA.id),
+  );
+  check(
+    packageAfterGroupRollback.credits_available === packageBeforeGroupRollback.credits_available &&
+      packageAfterGroupRollback.credits_reserved === packageBeforeGroupRollback.credits_reserved,
+    "Rollback de turma conserva o saldo do aluno que tinha pacote",
+  );
+  await mustReturnNoRows("Aula de turma recusada nao fica visivel", () =>
+    teacherClient.from("teacher_lesson_schedule_records").select("id").eq("title", groupRollbackTitle),
+  );
+
   // ── Escrita direta ────────────────────────────────────────────────────────
 
   await mustReject("Professor nao insere aulas diretamente", async () =>
@@ -2409,7 +2849,7 @@ try {
       p_lesson_id: lessonId,
       p_starts_at: lisbonInstant(lessonDate, "10:00"),
       p_ends_at: lisbonInstant(lessonDate, "11:00"),
-      p_title: `Aula E2E ${runId}`,
+      p_title: lessonTitle,
       p_location_id: privateLocationId,
       p_location_resource_id: courtId,
       p_notes_for_students: "e2e_nota_publica",
@@ -2470,15 +2910,18 @@ try {
     "aula do aluno",
     studentClient
       .from("student_lesson_records")
-      .select("id, title, teacher_name, sport_name, location_name, location_resource_name, status, participation_status, is_group_lesson, notes_for_students")
+      .select("id, title, teacher_name, sport_name, location_name, location_resource_name, status, participation_status, billing_status, credits_reserved, package_name, is_group_lesson, notes_for_students")
       .eq("id", lessonId),
   );
   check(
     studentLesson.id === lessonId &&
       studentLesson.teacher_name !== null &&
       studentLesson.notes_for_students === "e2e_nota_publica" &&
+      studentLesson.billing_status === "reserved" &&
+      studentLesson.credits_reserved === 1 &&
+      studentLesson.package_name !== null &&
       studentLesson.is_group_lesson === false,
-    "Aluno ve a propria aula com professor, modalidade, local e observacoes publicas",
+    "Aluno ve a propria aula com professor, local e o proprio credito reservado",
   );
   check(
     forbiddenColumns(studentLesson, [
@@ -2488,6 +2931,9 @@ try {
       "club_organization_id",
       "group_id",
       "credit_cost",
+      "student_package_id",
+      "credits_available",
+      "credits_used",
       "created_by",
       "participant_count",
       "max_participants",

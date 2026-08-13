@@ -6,7 +6,7 @@
 
 **Documento vivo.** Atualizado no fim de cada fase com o que foi realmente construído.
 
-- **Estado atual:** Fases 1, 1.5, 2, 3 e 4 concluídas. A Fase 5 tem as **Etapas 5A a 5D.1** concluídas — disponibilidade, projeção segura, calendário visual refinado, clubes/workspaces/membros, calendário partilhado com consentimento, locais com moradas manuais, campos/salas/áreas, **criação e edição de aulas** e conflitos atómicos de professor/recurso. **Reserva de créditos e recorrência** continuam pendentes.
+- **Estado atual:** Fases 1, 1.5, 2, 3 e 4 concluídas. A Fase 5 tem as **Etapas 5A a 5D.2** concluídas — disponibilidade, projeção segura, calendário visual refinado, clubes/workspaces/membros, calendário partilhado com consentimento, locais com moradas manuais, campos/salas/áreas, **criação e edição de aulas**, conflitos atómicos de professor/recurso e reserva atómica de créditos. **Recorrência** continua pendente.
 - **Timezone do sistema:** `Europe/Lisbon`
 - **Idioma da interface:** Português (pt-PT)
 
@@ -446,11 +446,11 @@ A estrutura fica pronta para notificações push (Fase 8).
 | **2** | Perfis, definições e gestão administrativa básica de contas | **Concluído** |
 | **3** | Alunos, turmas, locais, política de cancelamento | **Concluído** |
 | **4** | Pacotes: modelos, atribuição, ajustes, painel de saldo | **Concluído** — Etapas 1A, 1B, 1C, 1D e 1E validadas |
-| **5** | Calendário e criação de aulas, com reserva de créditos | **Parcialmente concluído** — Etapas 5A, 5B e 5B.1: disponibilidade, projeção segura e refinamento visual do calendário |
+| **5** | Calendário e criação de aulas, com reserva de créditos | **Parcialmente concluído** — Etapas 5A a 5D.2: disponibilidade, calendário, clubes, locais, recursos, criação/edição de aulas, conflitos atómicos e reserva atómica de créditos. Falta recorrência e ciclo operacional posterior |
 | **6** | Cancelamento, reagendamento, presenças, histórico | **Planeado** |
 | **7** | Área do aluno: aulas, saldo, confirmação de presença | **Planeado** |
 | **8** | Notificações, lembretes e expiração agendada | **Planeado** |
-| **9** | Supabase real, concorrência, acessibilidade, deployment | **Parcialmente concluído** — Supabase/Auth reais validados para a Fase 4 e Etapas 5A-5B.1; concorrência real, acessibilidade completa e deployment pendentes |
+| **9** | Supabase real, concorrência, acessibilidade, deployment | **Parcialmente concluído** — Supabase/Auth reais validados para a Fase 4 e Etapas 5A-5D.2; concorrência real de aulas/créditos coberta, acessibilidade completa e deployment pendentes |
 
 A ordem segue as prioridades pedidas: primeiro a área do professor ao computador, depois as regras seguras de créditos, depois o aluno no telemóvel.
 
@@ -520,7 +520,7 @@ Estado atual: **concluída**.
 Concluído:
 
 - Projeto local ligado ao Supabase de desenvolvimento `fzkwacnpydoqhxipcvro`.
-- 27 migrações locais da Fase 4 aplicadas no remoto naquela etapa; o estado atual do projeto tem 30 migrações com as Etapas 5A e 5B, e a 5B.1 não acrescentou migração.
+- 27 migrações locais da Fase 4 aplicadas no remoto naquela etapa; o estado atual do projeto tem 44 migrações com as Etapas 5A a 5D.2.
 - Dependências Supabase auditadas: `@supabase/server` não é usado nem mantido; sessão/cookies continuam concentrados em `@supabase/ssr`, e `@supabase/supabase-js` fica para cliente admin server-only e tipos.
 - Variáveis de ambiente auditadas: o código lê `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `NEXT_PUBLIC_SITE_URL` e `SUPABASE_SERVICE_ROLE_KEY`; o exemplo não inclui chaves reais nem variáveis duplicadas de `SUPABASE_PUBLISHABLE_KEY`, `SUPABASE_SECRET_KEY` ou `SUPABASE_JWKS_URL`.
 - `scripts/verify-remote-supabase.mjs` valida o catálogo remoto sem escrever dados: migrações, tabelas, views, enums, índices, constraints, RLS, grants, assinaturas únicas de RPCs, `search_path` seguro, `EXECUTE` restrito e privacidade das views do aluno.
@@ -528,7 +528,7 @@ Concluído:
 - `scripts/verify-remote-auth.mjs` valida login real, JWT, PostgREST, RPCs de pacotes, idempotência, isolamento, conta bloqueada, anónimo, imutabilidade e privacidade usando URL pública e anon key.
 - `.env.local` local preenchido com `SUPABASE_SERVICE_ROLE_KEY` e credenciais `E2E_*`, mantendo o ficheiro ignorado e sem valores reais no repositório.
 - `npm run db:setup:e2e -- --confirm-development` executado com sucesso, criando ou reutilizando professor, aluno, segundo professor, segundo aluno, administrador e conta bloqueada de desenvolvimento.
-- `npm run db:verify:auth -- --confirm-development` executado com sucesso: a suite atual tem 270 verificações Auth/PostgREST reais, incluindo idempotência, privacidade do aluno, isolamento entre contas, recusas para anónimo/bloqueado, disponibilidade, calendário seguro, clubes, locais, recursos, aulas, conflitos concorrentes e imutabilidade.
+- `npm run db:verify:auth -- --confirm-development` executado com sucesso: a suite atual tem 295 verificações Auth/PostgREST reais, incluindo idempotência, privacidade do aluno, isolamento entre contas, recusas para anónimo/bloqueado, disponibilidade, calendário seguro, clubes, locais, recursos, aulas, reserva de créditos, rollback de turmas, conflitos concorrentes e imutabilidade.
 - Cenário em navegador real validado: professor em desktop autenticado abriu painel, alunos, pacotes, atribuição, histórico e detalhe de pacote; aluno em viewport mobile abriu `/aluno/pacotes`, viu apenas a projeção permitida e manteve sessão após refresh, sem overflow horizontal nem erros relevantes de console.
 - Verificações finais executadas com sucesso: `db:verify:remote`, `lint`, `typecheck`, `test`, `db:verify`, `build` e `check`.
 
@@ -561,7 +561,7 @@ Concluído:
 - Server Actions com Zod estrito e reautenticação de professor ativo; organização, professor, autoria e timestamps nunca vêm do formulário.
 - `scripts/verify-schema.mjs` ampliado para 336 verificações, cobrindo grants, RLS, idempotência, sobreposição, precedência, privacidade, calendário seguro, bloqueio de conta e recusa de aluno/admin/anónimo.
 - `scripts/verify-remote-supabase.mjs` ampliado para catálogo remoto da Etapa 5A.
-- `scripts/verify-remote-auth.mjs` ampliado para Auth/PostgREST real das Etapas 5A-5B.1; suite atual com 90 verificações reais.
+- `scripts/verify-remote-auth.mjs` ampliado naquela entrega para Auth/PostgREST real de disponibilidade e calendário seguro; a suite tinha 90 verificações reais nessa etapa.
 - Testes Vitest novos para domínio e validação de disponibilidade; suite atual com 260 testes.
 - Supabase remoto `fzkwacnpydoqhxipcvro` atualizado com 30 migrações locais aplicadas.
 
@@ -814,8 +814,10 @@ Ordem da Fase 5:
 4. 5B.3A — Locais e moradas manuais. **Concluída.**
 5. 5B.3B — Campos e recursos dos locais. **Concluída.**
 6. 5C — Criação e edição de aulas. **Concluída.**
-7. 5D — Recorrência, conflitos e reservas de créditos. **Próxima.**
-8. 5E — Revisão integrada.
+7. 5D.1 — Conflitos atómicos de professor e recurso. **Concluída.**
+8. 5D.2 — Seleção de pacote e reserva atómica de créditos. **Concluída.**
+9. 5D.3 — Recorrência e continuação operacional. **Próxima.**
+10. 5E — Revisão integrada.
 
 ### Concluído na Fase 5 — Etapa 5B.3A: locais e moradas manuais
 
@@ -903,7 +905,7 @@ Secção "Campos, salas e áreas" dentro de `/professor/locais/[id]`: lista com 
 
 Disponibilidade, horário ou reserva visual de um recurso; créditos; notificações; qualquer integração externa. Os recursos não têm estado próprio de ocupação — a interface não diz "livre", "ocupado" ou "reservado" no inventário. A colisão real é validada ao gravar aulas desde a 5D.1.
 
-### Concluído na Fase 5 — Etapa 5C: criação e edição segura de aulas
+### Concluído na Fase 5 — Etapas 5C, 5D.1 e 5D.2: criação, conflitos e reserva de créditos
 
 Estado: **concluída**.
 
@@ -933,17 +935,21 @@ Aula individual ou de turma, nunca as duas — XOR imposto na RPC e no schema Zo
 
 A Etapa 5D.1 acrescentou o motor de conflitos no PostgreSQL. O trigger `ensure_lesson_has_no_conflict()` usa locks transacionais por professor e por recurso, impede sobreposição de aulas ativas (`scheduled`/`confirmed`), aplica `teacher_profiles.minimum_break_minutes` e bloqueia dois professores no mesmo campo/sala/área ao mesmo horário. Estados históricos (`completed`, canceladas, reagendadas e faltas) não bloqueiam novas marcações.
 
-#### Pacotes: deliberadamente parados
+#### Pacotes: reserva atómica na criação
 
-`lesson_participants` nasce `billing_status='pending'`, zero reservado, `student_package_id` a `NULL`. As constraints permitiriam guardar um pacote "planeado" sem reserva — e é exatamente por isso que não se guarda: seria um ponteiro que a 5D leria como decidido, e que pode estar esgotado ou expirado quando ela chegar. A sugestão continua a ser leitura, no momento da reserva.
+Na 5D.2, `create_lesson()` deixou de gravar participantes pendentes quando existe pacote válido. Depois de materializar aluno ou turma, a RPC chama `reserve_participation_credits()` para cada participante dentro da mesma transação: o pacote é bloqueado, o saldo disponível passa a reservado, `student_package_id` fica na participação e o livro-razão recebe `credit_reserved`.
 
-#### Onde a 5D continua
+A seleção usa `select_package_for_student()` no PostgreSQL, filtrando professor/organização, aluno, modalidade, validade, estado e saldo. A interface mostra uma previsão segura por `selectPackageForLesson()`, mas não envia ID de pacote nem saldo final; o servidor decide outra vez ao criar.
 
-A 5D.1 já cobre conflitos de professor/recurso. A continuação da 5D deve escolher pacote e reservar crédito para cada participante materializado, sem reabrir escrita direta em `lessons` ou `lesson_participants`.
+Turmas são tudo ou nada: se qualquer membro ativo não tiver pacote válido, a aula, os participantes, o histórico e qualquer reserva já feita são desfeitos. A mesma `idempotency_key` continua idempotente e não duplica reservas.
+
+#### Edição com reservas já feitas
+
+`update_lesson()` continua sem trocar aluno, turma, modalidade ou contexto. Horário, local, recurso, título e observações podem mudar em `scheduled`/`confirmed`; as reservas existentes são mantidas. Se a data mudar, a RPC confirma que os pacotes reservados continuam válidos para a nova data antes de gravar.
 
 #### Não implementado
 
-Reserva de créditos na criação da aula, recorrência, presença, conclusão, falta, cancelamento e reagendamento operacionais, confirmação pelo aluno, lista de espera, notificações, pagamentos, calendários externos.
+Recorrência, presença, conclusão, falta, cancelamento e reagendamento operacionais, consumo/libertação de créditos pela interface, confirmação pelo aluno, lista de espera, notificações, pagamentos, calendários externos.
 
 ### Fase 2 — estado por item
 
@@ -959,7 +965,7 @@ Reserva de créditos na criação da aula, recorrência, presença, conclusão, 
 | Preferências de notificação | **Concluído** | Persistência de canais/eventos; entrega automática continua planeada para a Fase 8 |
 | Diretório administrativo | **Concluído** | Pesquisa, filtros, professores, detalhe, estados vazios/erro/loading e resposta mobile/desktop |
 | Bloqueio e reativação | **Concluído** | RPC exclusiva de admin, sem auto-bloqueio, motivo, auditoria e revogação efetiva por RLS |
-| Validação num Supabase remoto | **Concluído para a Fase 4 e Etapas 5A-5B.1** | Migrações, catálogo remoto, GoTrue/Auth, JWT/PostgREST, contas reais e browser desktop/mobile da Fase 4 validados; calendário seguro validado por RPC/Auth real |
+| Validação num Supabase remoto | **Concluído para a Fase 4 e Etapas 5A-5D.2** | Migrações, catálogo remoto, GoTrue/Auth, JWT/PostgREST, contas reais, calendário seguro, aulas, conflitos e reserva de créditos validados por RPC/Auth real |
 
 ### Concluído na Fase 2
 
@@ -987,12 +993,11 @@ Reserva de créditos na criação da aula, recorrência, presença, conclusão, 
 - **Não há upload de avatar.** Não existe bucket de Storage nem política de objetos; a interface usa iniciais e explica a limitação.
 - **Preferências de email não significam entrega automática.** Ficam persistidas, mas outbox/worker e lembretes agendados chegam na Fase 8.
 - **Preparar uma ligação não envia email.** A Fase 3 guarda apenas um estado auditável e sem segredo; entrega real por email continua fora desta etapa, embora o claim/Auth real já esteja coberto pelos testes remotos de desenvolvimento.
-- **A interface de pacotes ainda é parcial.** `/professor/pacotes` gere modelos, atribuição, consulta, ajustes administrativos e histórico; `/aluno/pacotes` mostra os próprios pacotes. Transferências/fusões/divisões e integração com aulas reais continuam pendentes.
+- **A interface de pacotes ainda é parcial.** `/professor/pacotes` gere modelos, atribuição, consulta, ajustes administrativos e histórico; `/aluno/pacotes` mostra os próprios pacotes. Transferências/fusões/divisões e o ciclo posterior de consumo/libertação continuam pendentes.
 - **A expiração de pacotes não é automática.** `refresh_package_status()` marca `expired` quando é chamada, mas nada corre à meia-noite. Precisa de uma tarefa agendada — Fase 8, com os lembretes.
 - **`credit_expired` e `credit_transferred_*` existem no enum mas não têm função.** Ficam para quando a expiração automática e a transferência entre pacotes forem implementadas numa fase futura.
-- **A validação remota da Fase 4 e das Etapas 5A-5B.1 cobre Auth/PostgREST real, mas não concorrência simultânea.** O catálogo remoto é verificado por `db:verify:remote` e o cenário com contas reais por `db:verify:auth`; duas ligações concorrentes sobre o último crédito ainda pertencem à Fase 9.
-- **A concorrência real não é reproduzida.** O teste sequencial confirma o resultado e as funções usam `FOR UPDATE`; duas ligações simultâneas ainda têm de ser testadas na Fase 9.
-- **Não existem Server Actions do ciclo de créditos.** As RPCs e decisões de domínio estão prontas, mas criar/cancelar/concluir/reagendar pela interface pertence às Fases 5–6.
+- **A validação remota já cobre concorrência real de aulas/créditos.** `db:verify:auth` abre sessões reais paralelas para disputar o último crédito e para combinar conflito de agenda com reserva; deployment e auditoria completa de acessibilidade continuam fora desta etapa.
+- **Server Actions do ciclo operacional ainda são parciais.** Criar aula já reserva créditos; cancelar, concluir, libertar, consumir e reagendar operacionalmente continuam nas Fases 5–6.
 
 ---
 
@@ -1080,9 +1085,9 @@ Ver secção 1.4. Preservar o que funciona; a separação por área é a pedida.
 **Alternativa:** `lessons.organization_id` passar a ser o clube nas aulas de clube.
 **Porquê:** `organization_id` é o eixo de tenancy que `auth_org_id()` lê. Mudá-lo nalgumas linhas alteraria em silêncio o significado de todas as policies que já comparam com ele — e a falha apareceria longe da causa. `club_organization_id` mantém o eixo intacto e torna o contexto explícito. O custo é uma coluna e uma constraint de coerência; o benefício é não ter de reauditar dez policies.
 
-### D-25 — Criar uma aula não reserva créditos
-**Alternativa:** guardar já o pacote sugerido em `lesson_participants.student_package_id`, sem mover saldo.
-**Porquê:** as constraints permitem-no, mas o ponteiro seria lido pela 5D como uma decisão tomada — quando na verdade é uma sugestão que pode estar esgotada ou expirada quando a reserva acontecer. Um `NULL` é honesto: ninguém decidiu nada ainda. O custo é a 5D voltar a chamar `select_package_for_student()`, que é uma leitura barata.
+### D-25 — A previsão de pacote não é a reserva
+**Alternativa:** guardar no browser ou na participação o pacote sugerido antes da submissão final.
+**Porquê:** a sugestão pode ficar errada entre a pré-visualização e o clique em criar aula: outro separador pode reservar o último crédito, o pacote pode expirar ou a data pode mudar. A interface mostra nome, modalidade e saldo previsto sem expor `student_package_id`; `create_lesson()` chama `select_package_for_student()` e `reserve_participation_credits()` na transação real. O custo é repetir uma leitura barata; o benefício é não transformar uma previsão em autorização.
 
 ### D-23 — Recursos apenas em locais privados e de clube
 **Alternativa:** permitir recursos também em locais públicos, geridos por quem propôs o local.

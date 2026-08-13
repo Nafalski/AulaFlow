@@ -36,7 +36,8 @@ export default async function NewLessonPage({
   const selectedDate = dateParam && DATE_PATTERN.test(dateParam) ? dateParam : today;
 
   const supabase = await createSupabaseServerClient();
-  const [students, groups, sports, clubs, locations, resources, profile] = await Promise.all([
+  const [students, groups, sports, clubs, locations, resources, packages, groupMembers, profile] =
+    await Promise.all([
     supabase
       .from("teacher_student_management_records")
       .select("id, full_name")
@@ -61,11 +62,17 @@ export default async function NewLessonPage({
       .from("schedulable_location_resource_records")
       .select("id, location_id, name, kind, display_order"),
     supabase
+      .from("teacher_package_records")
+      .select("student_id, name, sport_id, sport_name, credits_total, credits_available, credits_reserved, credits_used, starts_on, expires_on, status, created_at")
+      .in("status", ["active", "not_started"])
+      .gt("credits_available", 0),
+    supabase.from("group_members").select("group_id, student_id").eq("is_active", true),
+    supabase
       .from("teacher_profiles")
       .select("default_lesson_duration_minutes")
       .eq("id", user.teacherId ?? "")
       .maybeSingle(),
-  ]);
+    ]);
 
   for (const [label, result] of [
     ["os alunos", students],
@@ -74,13 +81,19 @@ export default async function NewLessonPage({
     ["os clubes", clubs],
     ["os locais", locations],
     ["os campos", resources],
+    ["os pacotes", packages],
+    ["os membros das turmas", groupMembers],
     ["as preferências", profile],
   ] as const) {
     if (result.error) throwReadError(label, result.error);
   }
 
+  const studentOptions = (students.data ?? []).map((row) => ({ id: row.id, name: row.full_name }));
+  const studentNames = new Map(studentOptions.map((student) => [student.id, student.name]));
+  const groupIds = new Set((groups.data ?? []).map((group) => group.id));
+
   const formData: LessonFormData = {
-    students: (students.data ?? []).map((row) => ({ id: row.id, name: row.full_name })),
+    students: studentOptions,
     groups: (groups.data ?? []).map((row) => ({ id: row.id, name: row.name })),
     sports: (sports.data ?? []).map((row) => ({ id: row.id, name: row.name })),
     clubs: (clubs.data ?? []).map((row) => ({
@@ -102,6 +115,27 @@ export default async function NewLessonPage({
       kind: row.kind,
       displayOrder: row.display_order,
     })),
+    packagePreviews: (packages.data ?? []).map((row) => ({
+      studentId: row.student_id,
+      name: row.name,
+      status: row.status,
+      creditsTotal: row.credits_total,
+      creditsAvailable: row.credits_available,
+      creditsReserved: row.credits_reserved,
+      creditsUsed: row.credits_used,
+      startsOn: row.starts_on,
+      expiresOn: row.expires_on,
+      sportId: row.sport_id,
+      sportName: row.sport_name,
+      createdAt: row.created_at,
+    })),
+    groupMembers: (groupMembers.data ?? [])
+      .filter((row) => groupIds.has(row.group_id) && studentNames.has(row.student_id))
+      .map((row) => ({
+        groupId: row.group_id,
+        studentId: row.student_id,
+        studentName: studentNames.get(row.student_id) ?? "Aluno",
+      })),
     defaultDurationMinutes: profile.data?.default_lesson_duration_minutes ?? 60,
   };
 

@@ -18,6 +18,7 @@ import {
 } from "@/lib/datetime";
 import { LESSON_CONTEXT_LABELS, lessonNotEditableReason } from "@/lib/domain/lesson-scheduling";
 import { LESSON_STATUS_META } from "@/lib/domain/lesson-status";
+import { BILLING_STATUS_META } from "@/lib/domain/packages";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { lessonIdSchema } from "@/lib/validation/lessons";
 
@@ -27,6 +28,10 @@ export const dynamic = "force-dynamic";
 function throwReadError(context: string, error: unknown): never {
   console.error(`[AulaFlow] Falha ao carregar ${context} da aula.`, error);
   throw new Error("Não foi possível carregar a aula.");
+}
+
+function creditsLabel(value: number): string {
+  return `${value} crédito${value === 1 ? "" : "s"}`;
 }
 
 export default async function LessonDetailPage({ params }: { params: Promise<{ id: string }> }) {
@@ -45,8 +50,8 @@ export default async function LessonDetailPage({ params }: { params: Promise<{ i
         .eq("id", parsed.data.lessonId)
         .maybeSingle(),
       supabase
-        .from("lesson_participant_directory")
-        .select("student_id, full_name, status")
+        .from("teacher_lesson_participant_credit_records")
+        .select("student_id, full_name, status, billing_status, credits_reserved, credits_consumed, package_name, package_sport_name, is_exception")
         .eq("lesson_id", parsed.data.lessonId),
       supabase
         .from("teacher_location_records")
@@ -96,6 +101,8 @@ export default async function LessonDetailPage({ params }: { params: Promise<{ i
       kind: row.kind,
       displayOrder: row.display_order,
     })),
+    packagePreviews: [],
+    groupMembers: [],
     defaultDurationMinutes: profileResult.data?.default_lesson_duration_minutes ?? 60,
   };
 
@@ -178,24 +185,53 @@ export default async function LessonDetailPage({ params }: { params: Promise<{ i
                 <p className="text-sm text-muted">Sem participantes registados.</p>
               ) : (
                 <ul className="flex flex-col gap-2">
-                  {participants.map((participant) => (
-                    <li
-                      key={participant.student_id}
-                      className="flex min-h-11 flex-wrap items-center justify-between gap-2 rounded-[var(--radius-field)] border border-line bg-surface px-3 py-2"
-                    >
-                      <span className="inline-flex min-w-0 items-center gap-2 text-sm font-semibold text-ink">
-                        <Users className="size-4 shrink-0 text-muted" aria-hidden="true" />
-                        <span className="break-words">{participant.full_name}</span>
-                      </span>
-                      <Badge tone="neutral">
-                        {participant.status === "confirmed" ? "Confirmado" : "Convidado"}
-                      </Badge>
-                    </li>
-                  ))}
+                  {participants.map((participant) => {
+                    const billingMeta = BILLING_STATUS_META[participant.billing_status];
+                    const quantity =
+                      participant.credits_reserved > 0
+                        ? ` · ${creditsLabel(participant.credits_reserved)} reservados`
+                        : participant.credits_consumed > 0
+                          ? ` · ${creditsLabel(participant.credits_consumed)} utilizados`
+                          : "";
+                    const packageName = participant.package_name
+                      ? `${participant.package_name}${
+                          participant.package_sport_name
+                            ? ` (${participant.package_sport_name})`
+                            : ""
+                        }`
+                      : null;
+
+                    return (
+                      <li
+                        key={participant.student_id}
+                        className="flex min-h-11 flex-col gap-2 rounded-[var(--radius-field)] border border-line bg-surface px-3 py-2 sm:flex-row sm:items-center sm:justify-between"
+                      >
+                        <div className="min-w-0">
+                          <span className="inline-flex min-w-0 items-center gap-2 text-sm font-semibold text-ink">
+                            <Users className="size-4 shrink-0 text-muted" aria-hidden="true" />
+                            <span className="break-words">{participant.full_name}</span>
+                          </span>
+                          <p className="mt-1 text-xs text-muted">
+                            Crédito: {billingMeta.label}
+                            {quantity}
+                            {packageName ? ` · Pacote: ${packageName}` : ""}
+                            {participant.is_exception ? " · Exceção autorizada" : ""}
+                          </p>
+                        </div>
+                        <div className="flex flex-wrap gap-1.5">
+                          <Badge tone={billingMeta.tone}>{billingMeta.label}</Badge>
+                          <Badge tone="neutral">
+                            {participant.status === "confirmed" ? "Confirmado" : "Convidado"}
+                          </Badge>
+                        </div>
+                      </li>
+                    );
+                  })}
                 </ul>
               )}
               <p className="mt-4 text-xs text-muted">
-                A reserva de créditos e a confirmação pelo aluno chegam nas etapas seguintes.
+                Os créditos são reservados na criação da aula. Consumo, presença e libertação por
+                cancelamento chegam em etapas seguintes.
               </p>
             </CardBody>
           </Card>

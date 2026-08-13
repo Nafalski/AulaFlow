@@ -233,6 +233,27 @@ describe("selectPackageForLesson", () => {
     selectPackageForLesson(lista, opts);
     expect(lista.map((p) => p.id)).toEqual(["b", "a"]);
   });
+
+  it("permite pré-visualização segura sem expor id de pacote", () => {
+    const basePreview = pack({
+      name: "Pacote visível",
+      expiresOn: "2026-10-31",
+    });
+    const preview = {
+      name: basePreview.name,
+      status: basePreview.status,
+      creditsTotal: basePreview.creditsTotal,
+      creditsAvailable: basePreview.creditsAvailable,
+      creditsReserved: basePreview.creditsReserved,
+      creditsUsed: basePreview.creditsUsed,
+      startsOn: basePreview.startsOn,
+      expiresOn: basePreview.expiresOn,
+      sportId: basePreview.sportId,
+      createdAt: basePreview.createdAt,
+    };
+
+    expect(selectPackageForLesson([preview], opts)?.name).toBe("Pacote visível");
+  });
 });
 
 // ═════════════════════════════════════════════════════════════════════════════

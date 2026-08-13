@@ -295,10 +295,11 @@ describe("lessonCalendarSlot", () => {
 });
 
 describe("honestidade sobre o que existe e o que ainda não existe", () => {
-  it("o aviso diz que conflitos já são protegidos e créditos ficam para depois", () => {
+  it("o aviso diz que conflitos e créditos são revalidados no banco", () => {
     expect(LESSON_CONFLICT_PROTECTION_NOTICE).toContain("sobreposição");
     expect(LESSON_CONFLICT_PROTECTION_NOTICE).toContain("intervalo mínimo");
     expect(LESSON_CONFLICT_PROTECTION_NOTICE).toContain("créditos");
+    expect(LESSON_CONFLICT_PROTECTION_NOTICE).toContain("revalidação final");
   });
 
   it("nada no módulo promete disponibilidade absoluta de um campo", () => {

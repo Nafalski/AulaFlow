@@ -25,10 +25,23 @@ import {
   type SchedulableLocation,
   type SchedulableResource,
 } from "@/lib/domain/lesson-scheduling";
+import {
+  selectPackageForLesson,
+  type PackageSelectionSnapshot,
+} from "@/lib/domain/packages";
 import { formatDuration } from "@/lib/datetime";
 import type { LessonContextKind } from "@/types/database";
 
 export type LessonFormOption = { id: string; name: string };
+export type LessonPackagePreview = PackageSelectionSnapshot & {
+  studentId: string;
+  sportName: string | null;
+};
+export type LessonGroupMemberPreview = {
+  groupId: string;
+  studentId: string;
+  studentName: string;
+};
 
 export type LessonFormValues = {
   lessonId?: string;
@@ -52,8 +65,127 @@ export type LessonFormData = {
   clubs: LessonFormOption[];
   locations: (SchedulableLocation & { name: string })[];
   resources: SchedulableResource[];
+  packagePreviews: LessonPackagePreview[];
+  groupMembers: LessonGroupMemberPreview[];
   defaultDurationMinutes: number;
 };
+
+const LESSON_CREATION_CREDIT_COST = 1;
+
+function creditsLabel(value: number): string {
+  return `${value} crédito${value === 1 ? "" : "s"}`;
+}
+
+function packageLine(pkg: PackageSelectionSnapshot & { sportName?: string | null }): string {
+  const sport = pkg.sportName ?? "Todas as modalidades";
+  const expiry = pkg.expiresOn ? ` · válido até ${pkg.expiresOn}` : "";
+  return `${pkg.name} · ${sport} · ${creditsLabel(pkg.creditsAvailable)} disponíveis${expiry}`;
+}
+
+function packagesForStudent(data: LessonFormData, studentId: string) {
+  return data.packagePreviews.filter((pack) => pack.studentId === studentId);
+}
+
+function LessonCreditPreview({
+  participantMode,
+  studentId,
+  groupId,
+  sportId,
+  lessonDate,
+  data,
+}: {
+  participantMode: LessonParticipantMode;
+  studentId: string;
+  groupId: string;
+  sportId: string;
+  lessonDate: string;
+  data: LessonFormData;
+}) {
+  if (!sportId || !lessonDate) return null;
+
+  const selectionOptions = {
+    credits: LESSON_CREATION_CREDIT_COST,
+    sportId,
+    today: lessonDate,
+    lessonDate,
+  };
+
+  if (participantMode === "student") {
+    if (!studentId) {
+      return (
+        <Alert tone="info" title="Crédito da aula">
+          Escolha um aluno para ver o pacote provável. A reserva final é confirmada ao criar.
+        </Alert>
+      );
+    }
+
+    const selected = selectPackageForLesson(
+      packagesForStudent(data, studentId),
+      selectionOptions,
+    );
+
+    if (!selected) {
+      return (
+        <Alert tone="warning" title="Crédito da aula">
+          Nenhum pacote compatível com saldo disponível para esta data. A criação será
+          revalidada pelo banco.
+        </Alert>
+      );
+    }
+
+    return (
+      <Alert tone="success" title="Pacote provável">
+        {packageLine(selected)}. A reserva final é confirmada ao criar.
+      </Alert>
+    );
+  }
+
+  if (!groupId) {
+    return (
+      <Alert tone="info" title="Créditos da turma">
+        Escolha uma turma para resumir os pacotes prováveis. A reserva final é confirmada ao criar.
+      </Alert>
+    );
+  }
+
+  const members = data.groupMembers.filter((member) => member.groupId === groupId);
+  if (members.length === 0) {
+    return (
+      <Alert tone="warning" title="Créditos da turma">
+        Esta turma não tem alunos ativos para reservar créditos.
+      </Alert>
+    );
+  }
+
+  const missing = members.filter(
+    (member) =>
+      selectPackageForLesson(packagesForStudent(data, member.studentId), selectionOptions) ===
+      null,
+  );
+
+  if (missing.length > 0) {
+    const names = missing
+      .slice(0, 3)
+      .map((member) => member.studentName)
+      .join(", ");
+    const suffix = missing.length > 3 ? ` e mais ${missing.length - 3}` : "";
+    return (
+      <Alert tone="warning" title="Créditos da turma">
+        {members.length - missing.length} de {members.length} participante
+        {members.length === 1 ? "" : "s"} têm pacote compatível. Sem crédito provável: {names}
+        {suffix}. A turma só é criada se todos passarem na reserva final.
+      </Alert>
+    );
+  }
+
+  return (
+    <Alert tone="success" title="Créditos da turma">
+      {members.length} participante{members.length === 1 ? "" : "s"} com pacote compatível
+      para {creditsLabel(LESSON_CREATION_CREDIT_COST)} cada. A reserva final é confirmada ao
+      criar.
+    </Alert>
+  );
+}
 
 /**
  * Formulário de aula.
@@ -86,6 +218,10 @@ export function LessonForm({
   const key = state.status === "success" && state.resourceId ? state.resourceId : initialKey;
 
   const [participantMode, setParticipantMode] = useState<LessonParticipantMode>("student");
+  const [studentId, setStudentId] = useState("");
+  const [groupId, setGroupId] = useState("");
+  const [sportId, setSportId] = useState(data.sports[0]?.id ?? "");
+  const [lessonDate, setLessonDate] = useState(values.date);
   const [contextKind, setContextKind] = useState<LessonContextKind>("personal");
   const [clubId, setClubId] = useState<string>(data.clubs[0]?.id ?? "");
   const [locationId, setLocationId] = useState<string>(values.locationId ?? "");
@@ -167,7 +303,8 @@ export function LessonForm({
                 <SelectField
                   name="studentId"
                   label="Aluno"
-                  defaultValue=""
+                  value={studentId}
+                  onChange={(event) => setStudentId(event.target.value)}
                   required
                   error={state.fieldErrors?.studentId}
                 >
@@ -182,7 +319,8 @@ export function LessonForm({
                 <SelectField
                   name="groupId"
                   label="Turma"
-                  defaultValue=""
+                  value={groupId}
+                  onChange={(event) => setGroupId(event.target.value)}
                   required
                   hint="Os alunos da turma são fixados agora. Alterar a turma depois não muda esta aula."
                   error={state.fieldErrors?.groupId}
@@ -199,7 +337,8 @@ export function LessonForm({
               <SelectField
                 name="sportId"
                 label="Modalidade"
-                defaultValue={data.sports[0]?.id ?? ""}
+                value={sportId}
+                onChange={(event) => setSportId(event.target.value)}
                 required
                 error={state.fieldErrors?.sportId}
               >
@@ -262,7 +401,12 @@ export function LessonForm({
               name="date"
               label="Data"
               type="date"
-              defaultValue={values.date}
+              {...(mode === "create"
+                ? {
+                    value: lessonDate,
+                    onChange: (event) => setLessonDate(event.target.value),
+                  }
+                : { defaultValue: values.date })}
               required
               error={state.fieldErrors?.date}
             />
@@ -290,6 +434,17 @@ export function LessonForm({
               </option>
             ))}
           </SelectField>
+
+          {mode === "create" && (
+            <LessonCreditPreview
+              participantMode={participantMode}
+              studentId={studentId}
+              groupId={groupId}
+              sportId={sportId}
+              lessonDate={lessonDate}
+              data={data}
+            />
+          )}
 
           {/* Local → recurso: mudar de local limpa o campo escolhido, porque um
               campo do local anterior deixaria de existir ali. */}

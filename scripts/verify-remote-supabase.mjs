@@ -101,6 +101,7 @@ const expectedViews = [
   "student_lesson_records",
   "schedulable_location_resource_records",
   "lesson_participant_directory",
+  "teacher_lesson_participant_credit_records",
 ];
 
 const expectedEnums = [
@@ -984,7 +985,7 @@ checks as (
   union all
   select
     'privacidade',
-    'a projecao do aluno nao expoe turma, custo, autoria nem contagem de colegas',
+    'a projecao do aluno nao expoe turma, custo, autoria, ids de pacote nem contagem de colegas',
     not exists (
       select 1
       from information_schema.columns
@@ -992,7 +993,8 @@ checks as (
         and table_name = 'student_lesson_records'
         and column_name in (
           'group_id', 'credit_cost', 'created_by', 'organization_id', 'teacher_id',
-          'private_notes', 'club_organization_id', 'participant_count', 'max_participants'
+          'private_notes', 'club_organization_id', 'participant_count', 'max_participants',
+          'student_package_id', 'credits_available', 'credits_used'
         )
     ),
     coalesce((
@@ -1002,20 +1004,78 @@ checks as (
         and table_name = 'student_lesson_records'
         and column_name in (
           'group_id', 'credit_cost', 'created_by', 'organization_id', 'teacher_id',
-          'private_notes', 'club_organization_id', 'participant_count', 'max_participants'
+          'private_notes', 'club_organization_id', 'participant_count', 'max_participants',
+          'student_package_id', 'credits_available', 'credits_used'
         )
     ), 'ok')
 
   union all
   select
+    'estrutura',
+    'a projecao do aluno inclui apenas o proprio estado de credito seguro',
+    exists (
+      select 1
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'student_lesson_records'
+        and column_name = 'billing_status'
+    )
+    and exists (
+      select 1
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'student_lesson_records'
+        and column_name = 'credits_reserved'
+    )
+    and exists (
+      select 1
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'student_lesson_records'
+        and column_name = 'package_name'
+    ),
+    'ok'
+
+  union all
+  select
     'privacidade',
-    'o diretorio de participantes nao expoe o identificador de conta do aluno',
+    'o diretorio simples de participantes nao expoe conta, credito nem saldos',
     not exists (
       select 1
       from information_schema.columns
       where table_schema = 'public'
         and table_name = 'lesson_participant_directory'
-        and column_name = 'profile_id'
+        and column_name in (
+          'profile_id', 'student_package_id', 'billing_status', 'credits_reserved',
+          'credits_consumed', 'credits_available', 'credits_used', 'package_name'
+        )
+    ),
+    'ok'
+
+  union all
+  select
+    'estrutura',
+    'a projecao financeira do professor inclui estado de credito por participante',
+    exists (
+      select 1
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'teacher_lesson_participant_credit_records'
+        and column_name = 'billing_status'
+    )
+    and exists (
+      select 1
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'teacher_lesson_participant_credit_records'
+        and column_name = 'credits_reserved'
+    )
+    and exists (
+      select 1
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'teacher_lesson_participant_credit_records'
+        and column_name = 'package_name'
     ),
     'ok'
 

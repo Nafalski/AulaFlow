@@ -219,10 +219,11 @@ export function lessonCalendarSlot(startsAt: string, endsAt: string): {
 /**
  * O aviso que acompanha a criação.
  *
- * O conflito de agenda já é protegido no banco. Créditos continuam fora desta
- * etapa, por isso a interface deve manter esse limite visível.
+ * Conflito e créditos já são protegidos no banco. A pré-visualização do
+ * formulário ajuda, mas não promete que o saldo ou o campo continuam iguais
+ * quando a pessoa clica em criar.
  */
 export const LESSON_CONFLICT_PROTECTION_NOTICE =
   "O horário é validado contra a sua disponibilidade, bloqueios, aulas ativas e " +
   "intervalo mínimo. Campos e salas também são protegidos contra sobreposição. " +
-  "A reserva de créditos chega numa etapa seguinte.";
+  "Os créditos são reservados ao criar a aula, depois de uma revalidação final.";

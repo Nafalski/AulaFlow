@@ -12,6 +12,7 @@ import {
   formatWeekdayDate,
 } from "@/lib/datetime";
 import { LESSON_STATUS_META } from "@/lib/domain/lesson-status";
+import { BILLING_STATUS_META } from "@/lib/domain/packages";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { firstName } from "@/lib/utils";
 
@@ -29,13 +30,13 @@ export default async function StudentHomePage() {
   const isLinked = user.studentId !== null;
 
   // A projeção já filtra por `current_student_id()`: nunca traz a aula de
-  // outro aluno, e não tem colegas, turma nem custo em créditos.
+  // outro aluno, e não tem colegas, turma, IDs de pacote nem custo em créditos.
   const lessons = isLinked
     ? await (async () => {
         const supabase = await createSupabaseServerClient();
         const { data, error } = await supabase
           .from("student_lesson_records")
-          .select("id, title, starts_at, ends_at, duration_minutes, status, sport_name, teacher_name, location_name, location_resource_name")
+          .select("id, title, starts_at, ends_at, duration_minutes, status, billing_status, package_name, sport_name, teacher_name, location_name, location_resource_name")
           .gte("starts_at", new Date().toISOString())
           .order("starts_at")
           .limit(UPCOMING_LIMIT);
@@ -83,6 +84,7 @@ export default async function StudentHomePage() {
           <ul className="flex flex-col gap-3">
             {lessons.map((lesson) => {
               const statusMeta = LESSON_STATUS_META[lesson.status];
+              const billingMeta = BILLING_STATUS_META[lesson.billing_status];
               const place = [lesson.location_name, lesson.location_resource_name]
                 .filter(Boolean)
                 .join(" · ");
@@ -99,6 +101,7 @@ export default async function StudentHomePage() {
                     <div className="flex flex-wrap gap-1.5">
                       <Badge tone={statusMeta.tone}>{statusMeta.label}</Badge>
                       <Badge tone="neutral">{lesson.sport_name}</Badge>
+                      <Badge tone={billingMeta.tone}>{billingMeta.label}</Badge>
                     </div>
                   </div>
 
@@ -119,6 +122,9 @@ export default async function StudentHomePage() {
                   )}
 
                   <p className="mt-1 text-sm text-muted">Com {lesson.teacher_name}</p>
+                  {lesson.package_name && (
+                    <p className="mt-1 text-sm text-muted">Pacote: {lesson.package_name}</p>
+                  )}
                 </li>
               );
             })}
