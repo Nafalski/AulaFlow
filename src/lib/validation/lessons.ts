@@ -4,10 +4,13 @@ import {
   LESSON_CONTEXT_KINDS,
   LESSON_DURATION_LIMITS,
   LESSON_PARTICIPANT_MODES,
+  LESSON_RECURRENCE_MODES,
   LESSON_TITLE_LIMITS,
+  WEEKLY_RECURRENCE_LIMITS,
 } from "@/lib/domain/lesson-scheduling";
 import {
   formString,
+  normalizeOptionalInteger,
   normalizeOptionalMultiline,
   normalizeOptionalUuid,
   normalizeRequiredInteger,
@@ -70,6 +73,22 @@ const lessonNotes = z.preprocess(
     .nullable(),
 );
 
+const recurrenceCount = z.preprocess(
+  normalizeOptionalInteger,
+  z
+    .number({ error: "Escolha o número de aulas da série." })
+    .int("O número de aulas tem de ser inteiro.")
+    .min(
+      WEEKLY_RECURRENCE_LIMITS.min,
+      `A série semanal precisa de pelo menos ${WEEKLY_RECURRENCE_LIMITS.min} aulas.`,
+    )
+    .max(
+      WEEKLY_RECURRENCE_LIMITS.max,
+      `A série semanal não pode ter mais de ${WEEKLY_RECURRENCE_LIMITS.max} aulas.`,
+    )
+    .nullable(),
+);
+
 const optionalId = (error: string) =>
   z.preprocess(normalizeOptionalUuid, z.uuid(error).nullable());
 
@@ -119,6 +138,13 @@ export const lessonCreateSchema = requireLocationForResource(
         normalizeRequiredUuid,
         z.uuid("Atualize a página antes de voltar a submeter este formulário."),
       ),
+      recurrenceMode: z.preprocess(
+        (value) => normalizeSingleLine(value) || undefined,
+        z
+          .enum(LESSON_RECURRENCE_MODES, { error: "Escolha se a aula se repete." })
+          .default("none"),
+      ),
+      recurrenceCount,
     })
     // XOR real, e não "pelo menos um": uma aula com aluno E turma seria duas
     // aulas diferentes a fingir que são uma.
@@ -141,6 +167,14 @@ export const lessonCreateSchema = requireLocationForResource(
     .refine((value) => value.contextKind === "club" || !value.clubOrganizationId, {
       error: "Uma aula própria não pertence a nenhum clube.",
       path: ["clubOrganizationId"],
+    })
+    .refine((value) => value.recurrenceMode !== "weekly" || value.recurrenceCount !== null, {
+      error: "Escolha quantas aulas semanais quer criar.",
+      path: ["recurrenceCount"],
+    })
+    .refine((value) => value.recurrenceMode === "weekly" || value.recurrenceCount === null, {
+      error: "A quantidade de aulas só é enviada quando a repetição semanal está ativa.",
+      path: ["recurrenceCount"],
     }),
 );
 
@@ -179,6 +213,8 @@ export const LESSON_CREATE_FIELDS = [
   "studentId",
   "groupId",
   "idempotencyKey",
+  "recurrenceMode",
+  "recurrenceCount",
 ] as const;
 
 export const LESSON_UPDATE_FIELDS = [...LESSON_PLACEMENT_FIELDS, "lessonId"] as const;
@@ -206,6 +242,8 @@ export function readLessonCreateFormData(formData: FormData) {
     studentId: formString(formData, "studentId"),
     groupId: formString(formData, "groupId"),
     idempotencyKey: formString(formData, "idempotencyKey"),
+    recurrenceMode: formString(formData, "recurrenceMode"),
+    recurrenceCount: formString(formData, "recurrenceCount"),
   };
 }
 

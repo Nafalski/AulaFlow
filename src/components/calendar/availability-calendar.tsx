@@ -187,7 +187,7 @@ function isAllDayItem(item: AvailabilityCalendarItem): boolean {
 
 function availablePeriods(items: AvailabilityCalendarItem[]): TimeSlot[] {
   return items
-    .filter((item) => item.status === "available" && item.startsAt && item.endsAt)
+    .filter((item) => !item.lesson && item.status === "available" && item.startsAt && item.endsAt)
     .map((item) => ({
       startsAt: item.startsAt?.slice(0, 5) ?? "",
       endsAt: item.endsAt?.slice(0, 5) ?? "",
@@ -629,9 +629,9 @@ function SlotPreview({
         Inícios possíveis
       </p>
       <div className="flex flex-wrap gap-1.5">
-        {slots.slice(0, 10).map((slot) => (
+        {slots.slice(0, 10).map((slot, index) => (
           <span
-            key={`${slot.startsAt}-${slot.endsAt}`}
+            key={`${slot.startsAt}-${slot.endsAt}-${index}`}
             className="rounded-[var(--radius-field)] border border-brand-soft bg-brand-tint px-2 py-1 text-xs font-semibold text-brand-deep"
           >
             {slot.startsAt}

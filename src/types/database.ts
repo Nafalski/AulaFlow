@@ -1133,6 +1133,11 @@ export type TeacherLessonScheduleRecord = {
   status: LessonStatus;
   requires_confirmation: boolean;
   credit_cost: number;
+  is_recurring: boolean;
+  recurrence_group_id: UUID | null;
+  recurrence_frequency: RecurrenceFrequency | null;
+  recurrence_occurrence_index: number | null;
+  recurrence_occurrence_count: number | null;
   notes_for_students: string | null;
   private_notes: string | null;
   cancellation_reason: string | null;
@@ -1173,6 +1178,10 @@ export type StudentLessonRecord = {
   location_resource_name: string | null;
   notes_for_students: string | null;
   is_group_lesson: boolean;
+  is_recurring: boolean;
+  recurrence_frequency: RecurrenceFrequency | null;
+  recurrence_occurrence_index: number | null;
+  recurrence_occurrence_count: number | null;
   cancellation_reason: string | null;
 };
 
@@ -2139,6 +2148,25 @@ export type Database = {
           p_idempotency_key?: UUID | null;
         };
         Returns: UUID;
+      };
+      create_recurring_lessons: {
+        Args: {
+          p_sport_id: UUID;
+          p_starts_at: Timestamp;
+          p_ends_at: Timestamp;
+          p_title: string;
+          p_occurrence_count: number;
+          p_context_kind?: LessonContextKind;
+          p_club_organization_id?: UUID | null;
+          p_location_id?: UUID | null;
+          p_location_resource_id?: UUID | null;
+          p_student_id?: UUID | null;
+          p_group_id?: UUID | null;
+          p_notes_for_students?: string | null;
+          p_private_notes?: string | null;
+          p_idempotency_key?: UUID | null;
+        };
+        Returns: Json;
       };
       update_lesson: {
         Args: {

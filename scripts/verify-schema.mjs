@@ -7563,6 +7563,47 @@ const createLessonAs = (uid, args) =>
     ),
   );
 
+const createRecurringLessonsAs = async (uid, args) => {
+  const row = await asDatabaseRole("authenticated", uid, () =>
+    one(
+      `select public.create_recurring_lessons(
+         p_sport_id => $1::uuid,
+         p_starts_at => $2::timestamptz,
+         p_ends_at => $3::timestamptz,
+         p_title => $4::text,
+         p_occurrence_count => $5::int,
+         p_context_kind => $6::public.lesson_context_kind,
+         p_club_organization_id => $7::uuid,
+         p_location_id => $8::uuid,
+         p_location_resource_id => $9::uuid,
+         p_student_id => $10::uuid,
+         p_group_id => $11::uuid,
+         p_notes_for_students => $12::text,
+         p_private_notes => $13::text,
+         p_idempotency_key => $14::uuid
+       ) as result`,
+      [
+        args.sportId ?? sport,
+        args.start,
+        args.end,
+        args.title ?? "Série 5D.3",
+        args.count ?? 4,
+        args.contextKind ?? "personal",
+        args.clubId ?? null,
+        args.locationId ?? null,
+        args.resourceId ?? null,
+        args.studentId ?? null,
+        args.groupId ?? null,
+        args.notes ?? null,
+        args.privateNotes ?? null,
+        args.idempotencyKey ?? randomUUID(),
+      ],
+    ),
+  );
+
+  return typeof row.result === "string" ? JSON.parse(row.result) : row.result;
+};
+
 const lessonCount = async () =>
   Number((await one(`select count(*)::int as total from public.lessons`)).total);
 
@@ -8278,6 +8319,480 @@ await mustReject("professor não usa aluno de outro professor numa aula de clube
   }),
 );
 
+// ── Recorrência semanal segura (Etapa 5D.3) ────────────────────────────────
+
+const recurringStudent = await one(
+  `insert into public.student_profiles (organization_id, created_by_teacher_id, full_name, email)
+   values ($1,$2,'Rita Recorrente','rita.recorrente@exemplo.pt') returning id`,
+  [org, teacher.id],
+);
+const recurringPack = await assignPackageAs(TEACHER_UID, {
+  student: recurringStudent.id,
+  name: "Pacote série DST 5D.3",
+  credits: 20,
+  sportId: sport,
+  starts: "2026-10-01",
+  expires: "2026-11-30",
+});
+const recurringKey = randomUUID();
+const recurringBefore = await pkg(recurringPack.id);
+const recurringSeries = await createRecurringLessonsAs(TEACHER_UID, {
+  studentId: recurringStudent.id,
+  title: "Série semanal DST 5D.3",
+  start: "2026-10-19 17:00+00",
+  end: "2026-10-19 18:00+00",
+  count: 4,
+  idempotencyKey: recurringKey,
+});
+const recurringIds = recurringSeries.lesson_ids ?? [];
+check(
+  Array.isArray(recurringIds) &&
+    recurringIds.length === 4 &&
+    recurringSeries.occurrence_count === 4 &&
+    recurringSeries.recurrence_group_id,
+  "série semanal cria 4 aulas reais e devolve o grupo da recorrência",
+);
+
+const recurringRows = await rows(
+  `select id, is_recurring, recurrence_group_id,
+          recurrence_rule ->> 'frequency' as frequency,
+          (recurrence_rule ->> 'occurrence_index')::int as occurrence_index,
+          (recurrence_rule ->> 'occurrence_count')::int as occurrence_count,
+          to_char(starts_at at time zone 'Europe/Lisbon', 'YYYY-MM-DD HH24:MI') as local_start,
+          to_char(starts_at at time zone 'UTC', 'YYYY-MM-DD HH24:MI') as utc_start,
+          creation_idempotency_key
+     from public.lessons
+    where id = any($1::uuid[])
+    order by starts_at`,
+  [recurringIds],
+);
+check(
+  recurringRows.length === 4 &&
+    recurringRows.every((row) => row.is_recurring === true) &&
+    new Set(recurringRows.map((row) => row.recurrence_group_id)).size === 1 &&
+    recurringRows.map((row) => row.frequency).join(",") === "weekly,weekly,weekly,weekly" &&
+    recurringRows.map((row) => row.occurrence_index).join(",") === "1,2,3,4" &&
+    recurringRows.every((row) => row.occurrence_count === 4),
+  "cada ocorrência recebe metadados de recorrência consistentes",
+);
+check(
+  recurringRows.map((row) => row.local_start).join(",") ===
+    "2026-10-19 18:00,2026-10-26 18:00,2026-11-02 18:00,2026-11-09 18:00" &&
+    recurringRows.map((row) => row.utc_start).join(",") ===
+      "2026-10-19 17:00,2026-10-26 18:00,2026-11-02 18:00,2026-11-09 18:00",
+  "recorrência semanal preserva a hora civil de Lisboa ao atravessar a mudança da hora",
+);
+check(
+  recurringRows[0].creation_idempotency_key === recurringKey &&
+    recurringRows.slice(1).every((row) => row.creation_idempotency_key !== null) &&
+    new Set(recurringRows.map((row) => row.creation_idempotency_key)).size === 4,
+  "ocorrências recebem chaves internas determinísticas e distintas",
+);
+
+const recurringParticipants = await rows(
+  `select lesson_id, billing_status::text, credits_reserved, student_package_id
+     from public.lesson_participants
+    where lesson_id = any($1::uuid[])
+    order by lesson_id`,
+  [recurringIds],
+);
+check(
+  recurringParticipants.length === 4 &&
+    recurringParticipants.every(
+      (participant) =>
+        participant.billing_status === "reserved" &&
+        participant.credits_reserved === 1 &&
+        participant.student_package_id === recurringPack.id,
+    ),
+  "cada ocorrência da série materializa participante e reserva crédito",
+);
+const recurringLedger = await one(
+  `select count(*)::int as total
+     from public.package_credit_transactions
+    where student_package_id=$1 and lesson_id = any($2::uuid[]) and type='credit_reserved'`,
+  [recurringPack.id, recurringIds],
+);
+const recurringAfter = await pkg(recurringPack.id);
+check(
+  Number(recurringLedger.total) === 4 &&
+    recurringAfter.credits_available === recurringBefore.credits_available - 4 &&
+    recurringAfter.credits_reserved === recurringBefore.credits_reserved + 4,
+  "série semanal reserva um crédito por ocorrência e deixa ledger por aula",
+);
+
+const recurringRepeatBefore = await pkg(recurringPack.id);
+const recurringLedgerBeforeRepeat = await one(
+  `select count(*)::int as total
+     from public.package_credit_transactions
+    where student_package_id=$1 and lesson_id = any($2::uuid[]) and type='credit_reserved'`,
+  [recurringPack.id, recurringIds],
+);
+const recurringRepeat = await createRecurringLessonsAs(TEACHER_UID, {
+  studentId: recurringStudent.id,
+  title: "Série semanal DST 5D.3",
+  start: "2026-10-19 17:00+00",
+  end: "2026-10-19 18:00+00",
+  count: 4,
+  idempotencyKey: recurringKey,
+});
+const recurringRepeatAfter = await pkg(recurringPack.id);
+const recurringLedgerAfterRepeat = await one(
+  `select count(*)::int as total
+     from public.package_credit_transactions
+    where student_package_id=$1 and lesson_id = any($2::uuid[]) and type='credit_reserved'`,
+  [recurringPack.id, recurringIds],
+);
+check(
+  JSON.stringify(recurringRepeat.lesson_ids) === JSON.stringify(recurringIds) &&
+    recurringRepeatAfter.credits_available === recurringRepeatBefore.credits_available &&
+    recurringRepeatAfter.credits_reserved === recurringRepeatBefore.credits_reserved &&
+    Number(recurringLedgerAfterRepeat.total) === Number(recurringLedgerBeforeRepeat.total),
+  "repetir a série com a mesma chave não duplica aulas, reservas nem ledger",
+);
+
+await mustReject("série semanal com apenas 1 aula é recusada", () =>
+  createRecurringLessonsAs(TEACHER_UID, {
+    studentId: recurringStudent.id,
+    title: "Série curta demais",
+    start: "2026-11-16 18:00+00",
+    end: "2026-11-16 19:00+00",
+    count: 1,
+  }),
+);
+await mustReject("série semanal com mais de 12 aulas é recusada", () =>
+  createRecurringLessonsAs(TEACHER_UID, {
+    studentId: recurringStudent.id,
+    title: "Série longa demais",
+    start: "2026-11-16 18:00+00",
+    end: "2026-11-16 19:00+00",
+    count: 13,
+  }),
+);
+
+const conflictSeriesStudent = await one(
+  `insert into public.student_profiles (organization_id, created_by_teacher_id, full_name, email)
+   values ($1,$2,'Carla Conflito Série','carla.conflito.serie@exemplo.pt') returning id`,
+  [org, teacher.id],
+);
+const conflictSeriesPack = await assignPackageAs(TEACHER_UID, {
+  student: conflictSeriesStudent.id,
+  name: "Pacote conflito série 5D.3",
+  credits: 10,
+  sportId: sport,
+  starts: "2026-11-01",
+  expires: "2026-12-31",
+});
+await assignPackageAs(TEACHER_UID, {
+  student: ana.id,
+  name: "Pacote bloqueador professor 5D.3",
+  credits: 10,
+  sportId: sport,
+  starts: "2026-12-01",
+  expires: "2026-12-31",
+});
+await createLessonAs(TEACHER_UID, {
+  studentId: ana.id,
+  title: "Bloqueador professor série",
+  start: "2026-12-07 18:00+00",
+  end: "2026-12-07 19:00+00",
+});
+const conflictSeriesBeforeCount = await lessonCount();
+const conflictSeriesBeforePack = await pkg(conflictSeriesPack.id);
+await mustReject(
+  "série semanal com conflito na ocorrência intermédia faz rollback",
+  () =>
+    createRecurringLessonsAs(TEACHER_UID, {
+      studentId: conflictSeriesStudent.id,
+      title: "Série conflito meio 5D.3",
+      start: "2026-11-30 18:00+00",
+      end: "2026-11-30 19:00+00",
+      count: 3,
+    }),
+  "aula 2 de 3",
+);
+const conflictSeriesAfterPack = await pkg(conflictSeriesPack.id);
+const conflictSeriesRows = await rows(
+  `select id from public.lessons where title='Série conflito meio 5D.3'`,
+);
+check(
+  (await lessonCount()) === conflictSeriesBeforeCount &&
+    conflictSeriesRows.length === 0 &&
+    conflictSeriesAfterPack.credits_available === conflictSeriesBeforePack.credits_available &&
+    conflictSeriesAfterPack.credits_reserved === conflictSeriesBeforePack.credits_reserved,
+  "falha intermédia de professor não deixa ocorrência nem reserva parcial",
+);
+
+await assignPackageAs(OTHER_TEACHER_UID, {
+  student: otherStudent.id,
+  name: "Pacote bloqueador recurso 5D.3",
+  credits: 10,
+  sportId: sport,
+  starts: "2026-12-01",
+  expires: "2026-12-31",
+});
+await createLessonAs(OTHER_TEACHER_UID, {
+  studentId: otherStudent.id,
+  contextKind: "club",
+  clubId: clubA.id,
+  locationId: clubLocation.id,
+  resourceId: clubCourt1.id,
+  title: "Bloqueador recurso série",
+  start: "2026-12-21 18:00+00",
+  end: "2026-12-21 19:00+00",
+});
+const resourceSeriesStudent = await one(
+  `insert into public.student_profiles (organization_id, created_by_teacher_id, full_name, email)
+   values ($1,$2,'Rui Recurso Série','rui.recurso.serie@exemplo.pt') returning id`,
+  [org, teacher.id],
+);
+const resourceSeriesPack = await assignPackageAs(TEACHER_UID, {
+  student: resourceSeriesStudent.id,
+  name: "Pacote recurso série 5D.3",
+  credits: 10,
+  sportId: sport,
+  starts: "2026-12-01",
+  expires: "2026-12-31",
+});
+const resourceSeriesBeforePack = await pkg(resourceSeriesPack.id);
+await mustReject(
+  "série semanal recusa recurso ocupado numa ocorrência intermédia",
+  () =>
+    createRecurringLessonsAs(TEACHER_UID, {
+      studentId: resourceSeriesStudent.id,
+      contextKind: "club",
+      clubId: clubA.id,
+      locationId: clubLocation.id,
+      resourceId: clubCourt1.id,
+      title: "Série recurso ocupado 5D.3",
+      start: "2026-12-14 18:00+00",
+      end: "2026-12-14 19:00+00",
+      count: 2,
+    }),
+  "ocupado",
+);
+const resourceSeriesAfterPack = await pkg(resourceSeriesPack.id);
+check(
+  resourceSeriesAfterPack.credits_available === resourceSeriesBeforePack.credits_available &&
+    resourceSeriesAfterPack.credits_reserved === resourceSeriesBeforePack.credits_reserved,
+  "falha por recurso ocupado não reserva crédito em ocorrência anterior",
+);
+
+await createLessonAs(TEACHER_UID, {
+  studentId: ana.id,
+  title: "Bloqueador intervalo série",
+  start: "2026-12-28 17:00+00",
+  end: "2026-12-28 17:50+00",
+});
+const breakSeriesStudent = await one(
+  `insert into public.student_profiles (organization_id, created_by_teacher_id, full_name, email)
+   values ($1,$2,'Bia Intervalo Série','bia.intervalo.serie@exemplo.pt') returning id`,
+  [org, teacher.id],
+);
+const breakSeriesPack = await assignPackageAs(TEACHER_UID, {
+  student: breakSeriesStudent.id,
+  name: "Pacote intervalo série 5D.3",
+  credits: 10,
+  sportId: sport,
+  starts: "2026-12-01",
+  expires: "2026-12-31",
+});
+const breakSeriesBeforePack = await pkg(breakSeriesPack.id);
+await mustReject(
+  "série semanal respeita intervalo mínimo em ocorrência intermédia",
+  () =>
+    createRecurringLessonsAs(TEACHER_UID, {
+      studentId: breakSeriesStudent.id,
+      title: "Série intervalo mínimo 5D.3",
+      start: "2026-12-21 18:00+00",
+      end: "2026-12-21 19:00+00",
+      count: 2,
+    }),
+  "intervalo mínimo",
+);
+const breakSeriesAfterPack = await pkg(breakSeriesPack.id);
+check(
+  breakSeriesAfterPack.credits_available === breakSeriesBeforePack.credits_available &&
+    breakSeriesAfterPack.credits_reserved === breakSeriesBeforePack.credits_reserved,
+  "falha por intervalo mínimo faz rollback integral da série",
+);
+
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.upsert_teacher_schedule_block(
+       '2027-01-11 18:00+00'::timestamptz,
+       '2027-01-11 19:00+00'::timestamptz,
+       false,
+       'Bloqueio de recorrência',
+       'personal',
+       $1,
+       null,
+       null
+     ) as id`,
+    [randomUUID()],
+  ),
+);
+const availabilitySeriesStudent = await one(
+  `insert into public.student_profiles (organization_id, created_by_teacher_id, full_name, email)
+   values ($1,$2,'Alice Disponibilidade Série','alice.disponibilidade.serie@exemplo.pt') returning id`,
+  [org, teacher.id],
+);
+const availabilitySeriesPack = await assignPackageAs(TEACHER_UID, {
+  student: availabilitySeriesStudent.id,
+  name: "Pacote disponibilidade série 5D.3",
+  credits: 10,
+  sportId: sport,
+  starts: "2027-01-01",
+  expires: "2027-01-31",
+});
+const availabilitySeriesBeforePack = await pkg(availabilitySeriesPack.id);
+await mustReject(
+  "série semanal recusa bloqueio de disponibilidade numa ocorrência intermédia",
+  () =>
+    createRecurringLessonsAs(TEACHER_UID, {
+      studentId: availabilitySeriesStudent.id,
+      title: "Série bloqueio disponibilidade 5D.3",
+      start: "2027-01-04 18:00+00",
+      end: "2027-01-04 19:00+00",
+      count: 2,
+    }),
+  "disponibilidade",
+);
+const availabilitySeriesAfterPack = await pkg(availabilitySeriesPack.id);
+check(
+  availabilitySeriesAfterPack.credits_available === availabilitySeriesBeforePack.credits_available &&
+    availabilitySeriesAfterPack.credits_reserved === availabilitySeriesBeforePack.credits_reserved,
+  "falha por disponibilidade não deixa reserva parcial",
+);
+
+const shortCreditStudent = await one(
+  `insert into public.student_profiles (organization_id, created_by_teacher_id, full_name, email)
+   values ($1,$2,'Ivo Poucos Créditos','ivo.poucos.creditos@exemplo.pt') returning id`,
+  [org, teacher.id],
+);
+const shortCreditPack = await assignPackageAs(TEACHER_UID, {
+  student: shortCreditStudent.id,
+  name: "Pacote curto série 5D.3",
+  credits: 2,
+  sportId: sport,
+  starts: "2027-01-01",
+  expires: "2027-02-28",
+});
+const shortCreditBefore = await pkg(shortCreditPack.id);
+await mustReject(
+  "série semanal com crédito insuficiente faz rollback integral",
+  () =>
+    createRecurringLessonsAs(TEACHER_UID, {
+      studentId: shortCreditStudent.id,
+      title: "Série sem saldo 5D.3",
+      start: "2027-01-18 18:00+00",
+      end: "2027-01-18 19:00+00",
+      count: 3,
+    }),
+  "créditos",
+);
+const shortCreditAfter = await pkg(shortCreditPack.id);
+check(
+  shortCreditAfter.credits_available === shortCreditBefore.credits_available &&
+    shortCreditAfter.credits_reserved === shortCreditBefore.credits_reserved,
+  "crédito insuficiente na série conserva o saldo original",
+);
+
+const packageSwitchStudent = await one(
+  `insert into public.student_profiles (organization_id, created_by_teacher_id, full_name, email)
+   values ($1,$2,'Paula Troca Pacote','paula.troca.pacote@exemplo.pt') returning id`,
+  [org, teacher.id],
+);
+const packageSwitchFirst = await assignPackageAs(TEACHER_UID, {
+  student: packageSwitchStudent.id,
+  name: "Pacote série primeira metade",
+  credits: 2,
+  sportId: sport,
+  starts: "2027-03-01",
+  expires: "2027-03-08",
+});
+const packageSwitchSecond = await assignPackageAs(TEACHER_UID, {
+  student: packageSwitchStudent.id,
+  name: "Pacote série segunda metade",
+  credits: 2,
+  sportId: sport,
+  starts: "2027-03-09",
+  expires: "2027-03-31",
+});
+const packageSwitchSeries = await createRecurringLessonsAs(TEACHER_UID, {
+  studentId: packageSwitchStudent.id,
+  title: "Série troca pacote 5D.3",
+  start: "2027-03-01 18:00+00",
+  end: "2027-03-01 19:00+00",
+  count: 4,
+});
+const packageSwitchParticipants = await rows(
+  `select participant.student_package_id
+     from public.lesson_participants participant
+     join public.lessons lesson on lesson.id = participant.lesson_id
+    where lesson.id = any($1::uuid[])
+    order by lesson.starts_at`,
+  [packageSwitchSeries.lesson_ids],
+);
+check(
+  packageSwitchParticipants.map((row) => row.student_package_id).join(",") ===
+    [packageSwitchFirst.id, packageSwitchFirst.id, packageSwitchSecond.id, packageSwitchSecond.id].join(","),
+  "cada ocorrência seleciona pacote conforme validade e saldo naquela data",
+);
+
+const groupSeriesAnaPack = await assignPackageAs(TEACHER_UID, {
+  student: ana.id,
+  name: "Pacote Ana turma série 5D.3",
+  credits: 10,
+  sportId: sport,
+  starts: "2027-04-01",
+  expires: "2027-04-30",
+});
+const groupSeriesBrunoPack = await assignPackageAs(TEACHER_UID, {
+  student: bruno.id,
+  name: "Pacote Bruno turma série 5D.3",
+  credits: 10,
+  sportId: sport,
+  starts: "2027-04-01",
+  expires: "2027-04-30",
+});
+const groupSeries = await createRecurringLessonsAs(TEACHER_UID, {
+  groupId: managedGroup.id,
+  title: "Série turma 5D.3",
+  start: "2027-04-05 17:00+00",
+  end: "2027-04-05 18:00+00",
+  count: 3,
+});
+const groupSeriesParticipants = await rows(
+  `select lesson_id, student_id, student_package_id, billing_status::text
+     from public.lesson_participants
+    where lesson_id = any($1::uuid[])
+    order by lesson_id, student_id`,
+  [groupSeries.lesson_ids],
+);
+check(
+  groupSeriesParticipants.length === groupMembersBefore.length * 3 &&
+    groupSeriesParticipants.every((participant) => participant.billing_status === "reserved") &&
+    groupSeriesParticipants.some((participant) => participant.student_package_id === groupSeriesAnaPack.id) &&
+    groupSeriesParticipants.some((participant) => participant.student_package_id === groupSeriesBrunoPack.id),
+  "série de turma materializa e reserva todos os membros em cada ocorrência",
+);
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(`select public.remove_group_member($1,$2)`, [managedGroup.id, bruno.id]),
+);
+const groupSeriesAfterMembershipChange = await rows(
+  `select lesson_id, student_id
+     from public.lesson_participants
+    where lesson_id = any($1::uuid[]) and student_id=$2`,
+  [groupSeries.lesson_ids, bruno.id],
+);
+check(
+  groupSeriesAfterMembershipChange.length === 3,
+  "alterar a turma depois não remove participantes já materializados na série",
+);
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(`select public.add_group_member($1,$2)`, [managedGroup.id, bruno.id]),
+);
+
 // ── Aluno, turma e modalidade ───────────────────────────────────────────────
 
 await mustReject("aluno de outra organização", () =>
@@ -8504,6 +9019,23 @@ check(
   "professor vê nomes resolvidos, observações privadas e contagem de participantes",
 );
 
+const teacherRecurringProjection = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select is_recurring, recurrence_frequency::text, recurrence_occurrence_index,
+            recurrence_occurrence_count, recurrence_group_id
+       from public.teacher_lesson_schedule_records where id=$1`,
+    [recurringIds[2]],
+  ),
+);
+check(
+  teacherRecurringProjection?.is_recurring === true &&
+    teacherRecurringProjection.recurrence_frequency === "weekly" &&
+    teacherRecurringProjection.recurrence_occurrence_index === 3 &&
+    teacherRecurringProjection.recurrence_occurrence_count === 4 &&
+    teacherRecurringProjection.recurrence_group_id === recurringSeries.recurrence_group_id,
+  "professor vê o indicador e o grupo da série nas próprias aulas",
+);
+
 const otherTeacherLessons = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
   rows(`select id from public.teacher_lesson_schedule_records where id=$1`, [individualLesson.id]),
 );
@@ -8560,6 +9092,34 @@ const anaSeesGroupLesson = await asDatabaseRole("authenticated", ANA_UID, () =>
 check(
   anaSeesGroupLesson.length === 1 && anaSeesGroupLesson[0].is_group_lesson === true,
   "aluno de uma aula de turma vê que é uma aula de grupo",
+);
+
+const anaSeesRecurringGroupLesson = await asDatabaseRole("authenticated", ANA_UID, () =>
+  one(
+    `select id, is_group_lesson, is_recurring, recurrence_frequency::text,
+            recurrence_occurrence_index, recurrence_occurrence_count
+       from public.student_lesson_records where id=$1`,
+    [groupSeries.lesson_ids[1]],
+  ),
+);
+check(
+  anaSeesRecurringGroupLesson?.id === groupSeries.lesson_ids[1] &&
+    anaSeesRecurringGroupLesson.is_group_lesson === true &&
+    anaSeesRecurringGroupLesson.is_recurring === true &&
+    anaSeesRecurringGroupLesson.recurrence_frequency === "weekly" &&
+    anaSeesRecurringGroupLesson.recurrence_occurrence_index === 2 &&
+    anaSeesRecurringGroupLesson.recurrence_occurrence_count === 3,
+  "aluno vê indicadores seguros da própria ocorrência recorrente",
+);
+check(
+  forbiddenColumns(anaSeesRecurringGroupLesson ?? {}, [
+    "recurrence_group_id",
+    "recurrence_rule",
+    "group_id",
+    "participant_count",
+    "student_package_id",
+  ]).length === 0,
+  "indicadores de recorrência do aluno não expõem grupo da série nem regra JSON",
 );
 
 const anaSeesColleagues = await asDatabaseRole("authenticated", ANA_UID, () =>
@@ -8663,7 +9223,9 @@ const lessonFunctionAnon = await rows(
   `select proc.proname from pg_proc proc
      join pg_namespace ns on ns.oid = proc.pronamespace
     where ns.nspname='public'
-      and proc.proname in ('create_lesson','update_lesson','can_schedule_at_location',
+      and proc.proname in ('create_lesson','create_recurring_lessons','update_lesson',
+                           'can_schedule_at_location','stable_uuid_from_text',
+                           'lock_lesson_creation_intention','create_lesson_occurrence',
                            'lesson_fits_teacher_availability','validate_lesson_scope',
                            'lesson_blocks_conflicts','lock_lesson_conflict_scopes',
                            'ensure_lesson_has_no_conflict')
@@ -8671,11 +9233,25 @@ const lessonFunctionAnon = await rows(
 );
 check(lessonFunctionAnon.length === 0, "anon não executa nenhuma função de aulas");
 
+const lessonAuthenticatedPublicFunctions = await rows(
+  `select proc.proname from pg_proc proc
+     join pg_namespace ns on ns.oid = proc.pronamespace
+    where ns.nspname='public'
+      and proc.proname in ('create_lesson','create_recurring_lessons','update_lesson')
+      and has_function_privilege('authenticated', proc.oid, 'EXECUTE')`,
+);
+check(
+  new Set(lessonAuthenticatedPublicFunctions.map((row) => row.proname)).size === 3,
+  "authenticated executa as RPCs públicas de aula única, série semanal e edição",
+);
+
 const lessonInternalFunctions = await rows(
   `select proc.proname from pg_proc proc
      join pg_namespace ns on ns.oid = proc.pronamespace
     where ns.nspname='public'
       and proc.proname in ('lesson_fits_teacher_availability','validate_lesson_scope',
+                           'stable_uuid_from_text','lock_lesson_creation_intention',
+                           'create_lesson_occurrence',
                            'lesson_blocks_conflicts','lock_lesson_conflict_scopes',
                            'ensure_lesson_has_no_conflict')
       and has_function_privilege('authenticated', proc.oid, 'EXECUTE')`,
@@ -8689,7 +9265,9 @@ const lessonSearchPath = await rows(
   `select proc.proname from pg_proc proc
      join pg_namespace ns on ns.oid = proc.pronamespace
     where ns.nspname='public'
-      and proc.proname in ('create_lesson','update_lesson','can_schedule_at_location',
+      and proc.proname in ('create_lesson','create_recurring_lessons','update_lesson',
+                           'can_schedule_at_location','stable_uuid_from_text',
+                           'lock_lesson_creation_intention','create_lesson_occurrence',
                            'lesson_fits_teacher_availability','validate_lesson_scope',
                            'lesson_blocks_conflicts','lock_lesson_conflict_scopes',
                            'ensure_lesson_has_no_conflict')

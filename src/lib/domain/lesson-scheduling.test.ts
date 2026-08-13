@@ -6,7 +6,10 @@ import {
   LESSON_CONTEXT_KINDS,
   LESSON_CONTEXT_LABELS,
   LESSON_DURATION_LIMITS,
+  LESSON_RECURRENCE_LABELS,
+  LESSON_RECURRENCE_MODES,
   PARTICIPANT_MODE_LABELS,
+  WEEKLY_RECURRENCE_LIMITS,
   addDurationToTime,
   durationChoices,
   isLessonEditable,
@@ -15,8 +18,11 @@ import {
   lessonNotEditableReason,
   locationsForContext,
   minutesBetweenTimes,
+  recurringLessonLabel,
   resourcesForLocation,
   suggestedLessonTitle,
+  weeklyRecurrenceSummary,
+  weeklyRecurrenceWindows,
   type LessonDraft,
   type SchedulableLocation,
   type SchedulableResource,
@@ -48,6 +54,12 @@ describe("contexto da aula", () => {
   it("nomeia os dois modos de participante", () => {
     expect(PARTICIPANT_MODE_LABELS.student).toBe("Aluno");
     expect(PARTICIPANT_MODE_LABELS.group).toBe("Turma");
+  });
+
+  it("limita a recorrência semanal a séries pequenas", () => {
+    expect(LESSON_RECURRENCE_MODES).toEqual(["none", "weekly"]);
+    expect(LESSON_RECURRENCE_LABELS.weekly).toBe("Semanalmente");
+    expect(WEEKLY_RECURRENCE_LIMITS).toEqual({ min: 2, max: 12 });
   });
 });
 
@@ -291,6 +303,64 @@ describe("lessonCalendarSlot", () => {
     expect(lessonCalendarSlot("2026-08-24T23:30:00Z", "2026-08-25T00:30:00Z").date).toBe(
       "2026-08-25",
     );
+  });
+});
+
+describe("recorrência semanal", () => {
+  it("resume a série sem prometer disponibilidade futura", () => {
+    expect(
+      weeklyRecurrenceSummary({
+        date: "2026-08-24",
+        time: "18:00",
+        occurrenceCount: 8,
+      }),
+    ).toBe("8 aulas semanais a partir de 24/08/2026, sempre às 18:00.");
+  });
+
+  it("mantém a mesma hora civil de Lisboa quando atravessa a mudança da hora", () => {
+    const windows = weeklyRecurrenceWindows({
+      date: "2026-10-19",
+      time: "18:00",
+      durationMinutes: 60,
+      occurrenceCount: 2,
+    });
+
+    expect(windows.map((window) => window.date)).toEqual(["2026-10-19", "2026-10-26"]);
+    expect(windows.map((window) => window.startsAt)).toEqual([
+      "2026-10-19T18:00:00.000+01:00",
+      "2026-10-26T18:00:00.000+00:00",
+    ]);
+    expect(
+      new Date(windows[1]?.startsAt ?? "").getTime() -
+        new Date(windows[0]?.startsAt ?? "").getTime(),
+    ).toBe(169 * 60 * 60 * 1000);
+  });
+
+  it("nomeia uma ocorrência concreta quando tem índice e total", () => {
+    expect(
+      recurringLessonLabel({
+        isRecurring: true,
+        frequency: "weekly",
+        occurrenceIndex: 3,
+        occurrenceCount: 8,
+      }),
+    ).toBe("Aula recorrente 3 de 8");
+  });
+
+  it("cai para série semanal quando a regra está incompleta", () => {
+    expect(
+      recurringLessonLabel({
+        isRecurring: true,
+        frequency: null,
+        occurrenceIndex: null,
+        occurrenceCount: null,
+      }),
+    ).toBe("Série semanal");
+    expect(
+      recurringLessonLabel({
+        isRecurring: false,
+      }),
+    ).toBeNull();
   });
 });
 

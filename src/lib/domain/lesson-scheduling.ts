@@ -1,20 +1,20 @@
 /**
- * Regras puras da criação e edição de aulas (Etapas 5C e 5D.1).
+ * Regras puras da criação, edição e recorrência de aulas (Etapas 5C a 5D.3).
  *
  * Sem I/O, sem Supabase, sem React. Decide o que a interface pode oferecer; a
  * autorização real é sempre da RPC e do RLS.
  *
  * O QUE NÃO EXISTE AQUI, E PORQUÊ
  *
- * A deteção de conflitos é uma garantia do banco, não do cliente: a 5D.1
- * protege professor, intervalo mínimo e recurso físico dentro da transação.
- * Este ficheiro só decide o que o formulário pode oferecer. Ainda não há
- * reserva de créditos: criar uma aula não move saldo nenhum.
+ * A deteção de conflitos, a materialização da série e a reserva de créditos são
+ * garantias do banco, não do cliente. Este ficheiro só decide o que o
+ * formulário pode oferecer e como explicar a intenção ao professor.
  */
 
-import { lisbonDateKey, toTimeInput } from "@/lib/datetime";
+import { addMinutes, lisbonDateKey, lisbonInputToInstant, toTimeInput } from "@/lib/datetime";
 import type {
   LessonContextKind,
+  RecurrenceFrequency,
   LessonStatus,
   LocationResourceKind,
 } from "@/types/database";
@@ -42,6 +42,16 @@ export const PARTICIPANT_MODE_LABELS: Record<LessonParticipantMode, string> = {
 
 export const LESSON_DURATION_LIMITS = { min: 10, max: 720 } as const;
 export const LESSON_TITLE_LIMITS = { min: 2, max: 120 } as const;
+
+export const LESSON_RECURRENCE_MODES = ["none", "weekly"] as const;
+export type LessonRecurrenceMode = (typeof LESSON_RECURRENCE_MODES)[number];
+
+export const LESSON_RECURRENCE_LABELS: Record<LessonRecurrenceMode, string> = {
+  none: "Não repetir",
+  weekly: "Semanalmente",
+};
+
+export const WEEKLY_RECURRENCE_LIMITS = { min: 2, max: 12 } as const;
 
 /** Durações oferecidas no formulário. A preferência do professor entra à parte. */
 export const LESSON_DURATION_CHOICES = [30, 45, 60, 75, 90, 120] as const;
@@ -214,6 +224,94 @@ export function lessonCalendarSlot(startsAt: string, endsAt: string): {
     startTime: `${toTimeInput(startsAt)}:00`,
     endTime: `${toTimeInput(endsAt)}:00`,
   };
+}
+
+function addDaysToDateInput(dateInput: string, days: number): string {
+  const [year = 1970, month = 1, day = 1] = dateInput.split("-").map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day + days));
+  return [
+    date.getUTCFullYear(),
+    String(date.getUTCMonth() + 1).padStart(2, "0"),
+    String(date.getUTCDate()).padStart(2, "0"),
+  ].join("-");
+}
+
+function formatDateInputPt(dateInput: string): string {
+  const [year = "", month = "", day = ""] = dateInput.split("-");
+  return [day, month, year].filter(Boolean).join("/");
+}
+
+export type WeeklyOccurrenceWindow = {
+  date: string;
+  startsAt: string;
+  endsAt: string;
+};
+
+/**
+ * Gera janelas semanais por data/hora civil de Lisboa.
+ *
+ * Isto é deliberadamente diferente de somar 7 dias ao instante UTC: quando a
+ * hora muda, a aula continua a aparecer à mesma hora local.
+ */
+export function weeklyRecurrenceWindows({
+  date,
+  time,
+  durationMinutes,
+  occurrenceCount,
+}: {
+  date: string;
+  time: string;
+  durationMinutes: number;
+  occurrenceCount: number;
+}): WeeklyOccurrenceWindow[] {
+  return Array.from({ length: occurrenceCount }, (_, index) => {
+    const localDate = addDaysToDateInput(date, index * 7);
+    const startsAt = lisbonInputToInstant(localDate, time);
+    const endsAt = addMinutes(startsAt, durationMinutes);
+    return {
+      date: localDate,
+      startsAt: startsAt.toISOString(),
+      endsAt: endsAt.toISOString(),
+    };
+  });
+}
+
+export function weeklyRecurrenceSummary({
+  date,
+  time,
+  occurrenceCount,
+}: {
+  date: string;
+  time: string;
+  occurrenceCount: number;
+}): string {
+  return `${occurrenceCount} aulas semanais a partir de ${formatDateInputPt(date)}, sempre às ${time}.`;
+}
+
+export function recurringLessonLabel({
+  isRecurring,
+  frequency,
+  occurrenceIndex,
+  occurrenceCount,
+}: {
+  isRecurring: boolean;
+  frequency?: RecurrenceFrequency | null;
+  occurrenceIndex?: number | null;
+  occurrenceCount?: number | null;
+}): string | null {
+  if (!isRecurring) return null;
+  if (
+    frequency === "weekly" &&
+    typeof occurrenceIndex === "number" &&
+    typeof occurrenceCount === "number" &&
+    Number.isInteger(occurrenceIndex) &&
+    Number.isInteger(occurrenceCount) &&
+    occurrenceIndex > 0 &&
+    occurrenceCount > 1
+  ) {
+    return `Aula recorrente ${occurrenceIndex} de ${occurrenceCount}`;
+  }
+  return "Série semanal";
 }
 
 /**

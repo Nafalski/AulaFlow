@@ -11,6 +11,7 @@ import {
   formatTimeRange,
   formatWeekdayDate,
 } from "@/lib/datetime";
+import { recurringLessonLabel } from "@/lib/domain/lesson-scheduling";
 import { LESSON_STATUS_META } from "@/lib/domain/lesson-status";
 import { BILLING_STATUS_META } from "@/lib/domain/packages";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
@@ -36,7 +37,7 @@ export default async function StudentHomePage() {
         const supabase = await createSupabaseServerClient();
         const { data, error } = await supabase
           .from("student_lesson_records")
-          .select("id, title, starts_at, ends_at, duration_minutes, status, billing_status, package_name, sport_name, teacher_name, location_name, location_resource_name")
+          .select("id, title, starts_at, ends_at, duration_minutes, status, billing_status, package_name, sport_name, teacher_name, location_name, location_resource_name, is_recurring, recurrence_frequency, recurrence_occurrence_index, recurrence_occurrence_count")
           .gte("starts_at", new Date().toISOString())
           .order("starts_at")
           .limit(UPCOMING_LIMIT);
@@ -88,6 +89,12 @@ export default async function StudentHomePage() {
               const place = [lesson.location_name, lesson.location_resource_name]
                 .filter(Boolean)
                 .join(" · ");
+              const recurrenceLabel = recurringLessonLabel({
+                isRecurring: lesson.is_recurring,
+                frequency: lesson.recurrence_frequency,
+                occurrenceIndex: lesson.recurrence_occurrence_index,
+                occurrenceCount: lesson.recurrence_occurrence_count,
+              });
 
               return (
                 <li
@@ -102,6 +109,7 @@ export default async function StudentHomePage() {
                       <Badge tone={statusMeta.tone}>{statusMeta.label}</Badge>
                       <Badge tone="neutral">{lesson.sport_name}</Badge>
                       <Badge tone={billingMeta.tone}>{billingMeta.label}</Badge>
+                      {recurrenceLabel && <Badge tone="neutral">{recurrenceLabel}</Badge>}
                     </div>
                   </div>
 

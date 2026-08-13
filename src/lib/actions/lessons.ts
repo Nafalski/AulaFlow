@@ -37,11 +37,31 @@ function lessonMessage(message: string | undefined, fallback: string): string {
     return fallback;
   }
 
-  return /disponibilidade|bloqueio|aluno|turma|clube|local|campo|sala|modalidade|permissão|autoriza|ativa|horário|aula|crédito|créditos|pacote|saldo|reserva/i.test(
+  return /disponibilidade|bloqueio|aluno|turma|clube|local|campo|sala|modalidade|permissão|autoriza|ativa|horário|aula|série|crédito|créditos|pacote|saldo|reserva/i.test(
     raw,
   )
     ? raw
     : fallback;
+}
+
+type RecurringLessonRpcResult = {
+  lesson_ids?: unknown;
+  occurrence_count?: unknown;
+};
+
+function readRecurringLessonResult(data: unknown): { firstLessonId: string; count: number } | null {
+  if (!data || typeof data !== "object") return null;
+  const result = data as RecurringLessonRpcResult;
+  if (!Array.isArray(result.lesson_ids)) return null;
+
+  const lessonIds = result.lesson_ids.filter((entry): entry is string => typeof entry === "string");
+  const count =
+    typeof result.occurrence_count === "number" && Number.isInteger(result.occurrence_count)
+      ? result.occurrence_count
+      : lessonIds.length;
+
+  if (!lessonIds[0] || count < 2) return null;
+  return { firstLessonId: lessonIds[0], count };
 }
 
 /**
@@ -80,7 +100,7 @@ export async function createLessonAction(
   try {
     const { startsAt, endsAt } = lessonWindow(parsed.data);
     const supabase = await createSupabaseServerClient();
-    const { data, error } = await supabase.rpc("create_lesson", {
+    const commonPayload = {
       p_sport_id: parsed.data.sportId,
       p_starts_at: startsAt.toISOString(),
       p_ends_at: endsAt.toISOString(),
@@ -97,6 +117,37 @@ export async function createLessonAction(
       p_notes_for_students: parsed.data.notesForStudents,
       p_private_notes: parsed.data.privateNotes,
       p_idempotency_key: parsed.data.idempotencyKey,
+    };
+
+    if (parsed.data.recurrenceMode === "weekly") {
+      const { data, error } = await supabase.rpc("create_recurring_lessons", {
+        ...commonPayload,
+        p_occurrence_count: parsed.data.recurrenceCount ?? 0,
+      });
+
+      const recurring = readRecurringLessonResult(data);
+      if (error || !recurring) {
+        return persistenceState(
+          "Falha ao criar uma série de aulas.",
+          error,
+          lessonMessage(
+            error?.message,
+            "Não foi possível criar a série de aulas. Tente novamente.",
+          ),
+        );
+      }
+
+      revalidateLessons(recurring.firstLessonId);
+      return {
+        status: "success",
+        message: `${recurring.count} aulas criadas com sucesso.`,
+        resourceId: recurring.firstLessonId,
+        resourceCount: recurring.count,
+      };
+    }
+
+    const { data, error } = await supabase.rpc("create_lesson", {
+      ...commonPayload,
     });
 
     if (error || !data) {

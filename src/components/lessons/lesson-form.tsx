@@ -1,6 +1,6 @@
 "use client";
 
-import { CalendarPlus, Info, Save } from "lucide-react";
+import { CalendarDays, CalendarPlus, Info, Repeat2, Save } from "lucide-react";
 import Link from "next/link";
 import { useActionState, useState } from "react";
 
@@ -17,11 +17,16 @@ import {
   LESSON_CONTEXT_DESCRIPTIONS,
   LESSON_CONTEXT_LABELS,
   LESSON_CONFLICT_PROTECTION_NOTICE,
+  LESSON_RECURRENCE_LABELS,
+  LESSON_RECURRENCE_MODES,
   PARTICIPANT_MODE_LABELS,
+  WEEKLY_RECURRENCE_LIMITS,
   durationChoices,
   locationsForContext,
+  weeklyRecurrenceSummary,
   resourcesForLocation,
   type LessonParticipantMode,
+  type LessonRecurrenceMode,
   type SchedulableLocation,
   type SchedulableResource,
 } from "@/lib/domain/lesson-scheduling";
@@ -222,10 +227,13 @@ export function LessonForm({
   const [groupId, setGroupId] = useState("");
   const [sportId, setSportId] = useState(data.sports[0]?.id ?? "");
   const [lessonDate, setLessonDate] = useState(values.date);
+  const [lessonTime, setLessonTime] = useState(values.time);
   const [contextKind, setContextKind] = useState<LessonContextKind>("personal");
   const [clubId, setClubId] = useState<string>(data.clubs[0]?.id ?? "");
   const [locationId, setLocationId] = useState<string>(values.locationId ?? "");
   const [resourceId, setResourceId] = useState<string>(values.locationResourceId ?? "");
+  const [recurrenceMode, setRecurrenceMode] = useState<LessonRecurrenceMode>("none");
+  const [recurrenceCount, setRecurrenceCount] = useState("4");
 
   // Na edição o contexto está fixo na aula, e é ELE que decide os locais
   // válidos. Oferecer a lista toda mostraria o pavilhão do clube numa aula
@@ -238,6 +246,20 @@ export function LessonForm({
   );
   const resourceOptions = resourcesForLocation(data.resources, locationId || null);
   const created = mode === "create" && state.status === "success" && state.resourceId;
+  const createdSeries = Boolean(created && state.resourceCount && state.resourceCount > 1);
+  const recurrenceCountNumber = Number(recurrenceCount);
+  const recurrenceSummary =
+    mode === "create" &&
+    recurrenceMode === "weekly" &&
+    Number.isInteger(recurrenceCountNumber) &&
+    recurrenceCountNumber >= WEEKLY_RECURRENCE_LIMITS.min &&
+    recurrenceCountNumber <= WEEKLY_RECURRENCE_LIMITS.max
+      ? weeklyRecurrenceSummary({
+          date: lessonDate,
+          time: lessonTime,
+          occurrenceCount: recurrenceCountNumber,
+        })
+      : null;
 
   return (
     <Card>
@@ -414,7 +436,12 @@ export function LessonForm({
               name="time"
               label="Hora de início"
               type="time"
-              defaultValue={values.time}
+              {...(mode === "create"
+                ? {
+                    value: lessonTime,
+                    onChange: (event) => setLessonTime(event.target.value),
+                  }
+                : { defaultValue: values.time })}
               step={300}
               required
               error={state.fieldErrors?.time}
@@ -434,6 +461,65 @@ export function LessonForm({
               </option>
             ))}
           </SelectField>
+
+          {mode === "create" && (
+            <fieldset className="flex flex-col gap-2">
+              <legend className="text-sm font-bold text-ink">Repetição</legend>
+              <div className="flex flex-wrap gap-2">
+                {LESSON_RECURRENCE_MODES.map((option) => (
+                  <label
+                    key={option}
+                    className={`inline-flex min-h-11 cursor-pointer items-center gap-2 rounded-[var(--radius-pill)] border px-4 text-sm font-semibold transition-colors ${
+                      recurrenceMode === option
+                        ? "border-brand bg-brand-tint text-brand-deep"
+                        : "border-line bg-surface text-ink-soft hover:border-brand/40"
+                    }`}
+                  >
+                    <input
+                      type="radio"
+                      name="recurrenceMode"
+                      value={option}
+                      checked={recurrenceMode === option}
+                      onChange={() => setRecurrenceMode(option)}
+                      className="size-4 accent-[var(--color-brand)]"
+                    />
+                    {option === "weekly" && <Repeat2 className="size-4" aria-hidden="true" />}
+                    {LESSON_RECURRENCE_LABELS[option]}
+                  </label>
+                ))}
+              </div>
+              {state.fieldErrors?.recurrenceMode && (
+                <p role="alert" className="text-sm font-medium text-state-danger">
+                  {state.fieldErrors.recurrenceMode}
+                </p>
+              )}
+            </fieldset>
+          )}
+
+          {mode === "create" && recurrenceMode === "weekly" && (
+            <>
+              <TextField
+                name="recurrenceCount"
+                label="Número de aulas"
+                type="number"
+                min={WEEKLY_RECURRENCE_LIMITS.min}
+                max={WEEKLY_RECURRENCE_LIMITS.max}
+                step={1}
+                value={recurrenceCount}
+                onChange={(event) => setRecurrenceCount(event.target.value)}
+                required
+                error={state.fieldErrors?.recurrenceCount}
+              />
+              {recurrenceSummary && (
+                <Alert tone="info" title="Série semanal">
+                  <span className="inline-flex items-start gap-2">
+                    <CalendarDays className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
+                    {recurrenceSummary} Cada aula será criada e revalidada no banco.
+                  </span>
+                </Alert>
+              )}
+            </>
+          )}
 
           {mode === "create" && (
             <LessonCreditPreview
@@ -555,7 +641,15 @@ export function LessonForm({
                 href={`/professor/aulas/${state.resourceId}`}
                 className={buttonClasses({ variant: "outline" })}
               >
-                Abrir aula
+                {createdSeries ? "Abrir primeira aula" : "Abrir aula"}
+              </Link>
+            )}
+            {createdSeries && (
+              <Link
+                href="/professor/calendario"
+                className={buttonClasses({ variant: "ghost" })}
+              >
+                Ver no calendário
               </Link>
             )}
           </div>

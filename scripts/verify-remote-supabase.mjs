@@ -284,7 +284,11 @@ const expectedFunctions = [
   "lesson_blocks_conflicts",
   "lock_lesson_conflict_scopes",
   "ensure_lesson_has_no_conflict",
+  "stable_uuid_from_text",
+  "lock_lesson_creation_intention",
+  "create_lesson_occurrence",
   "create_lesson",
+  "create_recurring_lessons",
   "update_lesson",
 ];
 
@@ -337,6 +341,7 @@ const authenticatedRpc = [
   "set_location_resource_active",
   "can_schedule_at_location",
   "create_lesson",
+  "create_recurring_lessons",
   "update_lesson",
 ];
 
@@ -363,6 +368,9 @@ const internalFunctions = [
   "lesson_blocks_conflicts",
   "lock_lesson_conflict_scopes",
   "ensure_lesson_has_no_conflict",
+  "stable_uuid_from_text",
+  "lock_lesson_creation_intention",
+  "create_lesson_occurrence",
 ];
 
 const sql = `
@@ -1035,6 +1043,52 @@ checks as (
         and column_name = 'package_name'
     ),
     'ok'
+
+  union all
+  select
+    'estrutura',
+    'as projecoes de aulas incluem indicadores seguros de recorrencia',
+    exists (
+      select 1
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'teacher_lesson_schedule_records'
+        and column_name = 'recurrence_occurrence_index'
+    )
+    and exists (
+      select 1
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'student_lesson_records'
+        and column_name = 'recurrence_occurrence_count'
+    )
+    and exists (
+      select 1
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'student_lesson_records'
+        and column_name = 'is_recurring'
+    ),
+    'ok'
+
+  union all
+  select
+    'privacidade',
+    'a projecao do aluno nao expoe o grupo da serie nem a regra JSON de recorrencia',
+    not exists (
+      select 1
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'student_lesson_records'
+        and column_name in ('recurrence_group_id', 'recurrence_rule')
+    ),
+    coalesce((
+      select string_agg(column_name, ', ')
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'student_lesson_records'
+        and column_name in ('recurrence_group_id', 'recurrence_rule')
+    ), 'ok')
 
   union all
   select

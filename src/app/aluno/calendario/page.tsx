@@ -9,7 +9,7 @@ import { Alert } from "@/components/ui/alert";
 import { Card } from "@/components/ui/card";
 import { requireRole } from "@/lib/auth/session";
 import { lisbonDateKey, lisbonDayRange } from "@/lib/datetime";
-import { lessonCalendarSlot } from "@/lib/domain/lesson-scheduling";
+import { lessonCalendarSlot, recurringLessonLabel } from "@/lib/domain/lesson-scheduling";
 import { BILLING_STATUS_META } from "@/lib/domain/packages";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import {
@@ -105,7 +105,7 @@ export default async function StudentCalendarPage({
     // aula de outro, e não tem colegas, turma, IDs de pacote nem custo.
     supabase
       .from("student_lesson_records")
-      .select("id, title, starts_at, ends_at, status, billing_status, package_name, sport_name, location_name, is_group_lesson")
+      .select("id, title, starts_at, ends_at, status, billing_status, package_name, sport_name, location_name, is_group_lesson, is_recurring, recurrence_frequency, recurrence_occurrence_index, recurrence_occurrence_count")
       .gte("starts_at", windowStart.toISOString())
       .lt("starts_at", windowEnd.toISOString())
       .order("starts_at"),
@@ -118,6 +118,12 @@ export default async function StudentCalendarPage({
   const lessonItems: AvailabilityCalendarItem[] = (lessonsResult.data ?? []).map((lesson) => {
     const slot = lessonCalendarSlot(lesson.starts_at, lesson.ends_at);
     const billingLabel = BILLING_STATUS_META[lesson.billing_status].label;
+    const recurrenceLabel = recurringLessonLabel({
+      isRecurring: lesson.is_recurring,
+      frequency: lesson.recurrence_frequency,
+      occurrenceIndex: lesson.recurrence_occurrence_index,
+      occurrenceCount: lesson.recurrence_occurrence_count,
+    });
     return {
       date: slot.date,
       startsAt: slot.startTime,
@@ -128,7 +134,7 @@ export default async function StudentCalendarPage({
         title: lesson.title,
         // Modalidade, local e o próprio estado de crédito — nunca colegas nem IDs internos.
         subtitle:
-          [lesson.sport_name, lesson.location_name, billingLabel, lesson.package_name]
+          [lesson.sport_name, lesson.location_name, billingLabel, lesson.package_name, recurrenceLabel]
             .filter(Boolean)
             .join(" · ") || null,
         href: null,

@@ -2323,6 +2323,38 @@ try {
       ...overrides,
     });
 
+  const createRecurringLessons = (client, overrides = {}) =>
+    client.rpc("create_recurring_lessons", {
+      p_sport_id: sportRow.id,
+      p_starts_at: lisbonInstant(lessonDate, "10:00"),
+      p_ends_at: lisbonInstant(lessonDate, "11:00"),
+      p_title: `Serie E2E 5D3 ${runId}`,
+      p_occurrence_count: 4,
+      p_context_kind: "personal",
+      p_club_organization_id: null,
+      p_location_id: null,
+      p_location_resource_id: null,
+      p_student_id: studentsA.id,
+      p_group_id: null,
+      p_notes_for_students: "e2e_serie_publica",
+      p_private_notes: "e2e_serie_privada",
+      p_idempotency_key: deterministicUuid(`lesson-series-5d3:${runId}`),
+      ...overrides,
+    });
+
+  const readRecurringResult = (value, label) => {
+    const result = typeof value === "string" ? JSON.parse(value) : value;
+    if (
+      !result ||
+      typeof result !== "object" ||
+      !Array.isArray(result.lesson_ids) ||
+      result.lesson_ids.length === 0
+    ) {
+      throw new Error(`${label}: resposta de serie inesperada`);
+    }
+    return result;
+  };
+
   const existingLessonBefore = await maybeSingle(
     "aula individual E2E existente",
     teacherClient
@@ -2479,6 +2511,12 @@ try {
       p_idempotency_key: deterministicUuid(`${keyPrefix}:${runId}`),
     });
     if (error) throw new Error(`${label}: ${summarizeError(error)}`);
+  };
+
+  const prepareExceptions = async (supabase, label, dates, keyPrefix) => {
+    for (const [index, dateOnly] of dates.entries()) {
+      await prepareException(supabase, `${label} ${index + 1}`, dateOnly, `${keyPrefix}-${index + 1}`);
+    }
   };
 
   await prepareException(teacherClient, "Disponibilidade para conflito do Professor A", conflictDate, "lesson-conflict-date-a");
@@ -2819,6 +2857,467 @@ try {
   );
   await mustReturnNoRows("Aula de turma recusada nao fica visivel", () =>
     teacherClient.from("teacher_lesson_schedule_records").select("id").eq("title", groupRollbackTitle),
+  );
+
+  // ── Recorrencia semanal segura ───────────────────────────────────────────
+
+  const seriesDates = [76, 83, 90, 97].map((days) => isoDatePlusDays(days, fixtureBaseDate));
+  await prepareExceptions(teacherClient, "Disponibilidade para serie pessoal", seriesDates, "lesson-series-date");
+
+  const seriesTitle = `Serie E2E 5D3 pessoal ${runId}`;
+  const existingSeriesBefore = await maybeSingle(
+    "serie pessoal E2E existente",
+    teacherClient
+      .from("teacher_lesson_schedule_records")
+      .select("id")
+      .eq("title", seriesTitle)
+      .limit(1),
+  );
+  const packageBeforeSeries = await getSingle(
+    "pacote antes da serie pessoal",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_available, credits_reserved, credits_used")
+      .eq("id", lessonPackageA.id),
+  );
+  const { data: seriesData, error: seriesError } = await createRecurringLessons(teacherClient, {
+    p_starts_at: lisbonInstant(seriesDates[0], "10:00"),
+    p_ends_at: lisbonInstant(seriesDates[0], "11:00"),
+    p_title: seriesTitle,
+    p_occurrence_count: 4,
+    p_location_id: null,
+    p_location_resource_id: null,
+    p_idempotency_key: deterministicUuid(`lesson-series-personal:${runId}`),
+  });
+  if (seriesError) throw new Error(`Criar serie pessoal: ${summarizeError(seriesError)}`);
+  const seriesResult = readRecurringResult(seriesData, "serie pessoal");
+  const seriesLessonIds = seriesResult.lesson_ids;
+  check(seriesLessonIds.length === 4, "Serie pessoal criou quatro ocorrencias reais");
+
+  const { data: seriesRepeatData, error: seriesRepeatError } = await createRecurringLessons(teacherClient, {
+    p_starts_at: lisbonInstant(seriesDates[0], "10:00"),
+    p_ends_at: lisbonInstant(seriesDates[0], "11:00"),
+    p_title: seriesTitle,
+    p_occurrence_count: 4,
+    p_location_id: null,
+    p_location_resource_id: null,
+    p_idempotency_key: deterministicUuid(`lesson-series-personal:${runId}`),
+  });
+  if (seriesRepeatError) throw new Error(`Repetir serie pessoal: ${summarizeError(seriesRepeatError)}`);
+  const seriesRepeatResult = readRecurringResult(seriesRepeatData, "serie pessoal repetida");
+  check(
+    JSON.stringify(seriesRepeatResult.lesson_ids) === JSON.stringify(seriesLessonIds),
+    "Criar serie com a mesma chave devolve as mesmas ocorrencias",
+  );
+
+  const seriesRecords = await teacherClient
+    .from("teacher_lesson_schedule_records")
+    .select(
+      "id, title, starts_at, is_recurring, recurrence_group_id, recurrence_frequency, recurrence_occurrence_index, recurrence_occurrence_count, private_notes",
+    )
+    .in("id", seriesLessonIds)
+    .order("starts_at", { ascending: true });
+  if (seriesRecords.error) throw new Error(`Consultar serie pessoal: ${summarizeError(seriesRecords.error)}`);
+  check(
+    (seriesRecords.data ?? []).length === 4 &&
+      (seriesRecords.data ?? []).every(
+        (row, index) =>
+          row.is_recurring === true &&
+          row.recurrence_group_id === seriesResult.recurrence_group_id &&
+          row.recurrence_frequency === "weekly" &&
+          row.recurrence_occurrence_index === index + 1 &&
+          row.recurrence_occurrence_count === 4 &&
+          row.private_notes === "e2e_serie_privada",
+      ),
+    "Projecao do professor mostra recorrencia semanal sem expor IDs ao aluno",
+  );
+
+  const localSeriesTimes = (seriesRecords.data ?? []).map((row) =>
+    new Intl.DateTimeFormat("pt-PT", {
+      timeZone: "Europe/Lisbon",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+    }).format(new Date(row.starts_at)),
+  );
+  check(
+    localSeriesTimes.every((value) => value.endsWith("10:00")),
+    "Serie preserva a hora civil de Lisboa nas ocorrencias reais",
+  );
+
+  const seriesParticipants = await teacherClient
+    .from("teacher_lesson_participant_credit_records")
+    .select("lesson_id, student_id, billing_status, credits_reserved, package_name")
+    .in("lesson_id", seriesLessonIds)
+    .eq("student_id", studentsA.id);
+  if (seriesParticipants.error) {
+    throw new Error(`Participantes da serie pessoal: ${summarizeError(seriesParticipants.error)}`);
+  }
+  check(
+    (seriesParticipants.data ?? []).length === 4 &&
+      (seriesParticipants.data ?? []).every(
+        (participant) =>
+          participant.billing_status === "reserved" &&
+          participant.credits_reserved === 1 &&
+          participant.package_name !== null,
+      ),
+    "Serie pessoal reserva um credito por ocorrencia",
+  );
+  const packageAfterSeries = await getSingle(
+    "pacote depois da serie pessoal",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_available, credits_reserved, credits_used")
+      .eq("id", lessonPackageA.id),
+  );
+  const expectedSeriesDelta = existingSeriesBefore ? 0 : 4;
+  check(
+    packageAfterSeries.credits_available === packageBeforeSeries.credits_available - expectedSeriesDelta &&
+      packageAfterSeries.credits_reserved === packageBeforeSeries.credits_reserved + expectedSeriesDelta &&
+      packageAfterSeries.credits_used === packageBeforeSeries.credits_used,
+    "Serie pessoal move no maximo quatro reservas e nao consome credito",
+  );
+
+  const studentSeriesRecords = await studentClient
+    .from("student_lesson_records")
+    .select(
+      "id, title, is_recurring, recurrence_frequency, recurrence_occurrence_index, recurrence_occurrence_count, billing_status, credits_reserved, package_name",
+    )
+    .in("id", seriesLessonIds)
+    .order("starts_at", { ascending: true });
+  if (studentSeriesRecords.error) throw new Error(`Serie do aluno: ${summarizeError(studentSeriesRecords.error)}`);
+  check(
+    (studentSeriesRecords.data ?? []).length === 4 &&
+      (studentSeriesRecords.data ?? []).every(
+        (row, index) =>
+          row.is_recurring === true &&
+          row.recurrence_frequency === "weekly" &&
+          row.recurrence_occurrence_index === index + 1 &&
+          row.recurrence_occurrence_count === 4 &&
+          row.billing_status === "reserved" &&
+          row.credits_reserved === 1 &&
+          row.package_name !== null,
+      ),
+    "Aluno ve as suas ocorrencias recorrentes com apenas o proprio credito",
+  );
+  check(
+    forbiddenColumns(studentSeriesRecords.data?.[0] ?? {}, [
+      "private_notes",
+      "recurrence_group_id",
+      "recurrence_rule",
+      "group_id",
+      "participant_count",
+      "student_package_id",
+    ]).length === 0,
+    "Projecao recorrente do aluno nao expoe serie interna, turma nem pacote bruto",
+  );
+
+  const clubSeriesDates = [98, 105].map((days) => isoDatePlusDays(days, fixtureBaseDate));
+  await prepareExceptions(teacherClient, "Disponibilidade para serie de clube", clubSeriesDates, "lesson-club-series-date");
+  const { data: clubSeriesData, error: clubSeriesError } = await createRecurringLessons(teacherClient, {
+    p_starts_at: lisbonInstant(clubSeriesDates[0], "10:00"),
+    p_ends_at: lisbonInstant(clubSeriesDates[0], "11:00"),
+    p_title: `Serie E2E 5D3 clube ${runId}`,
+    p_occurrence_count: 2,
+    p_context_kind: "club",
+    p_club_organization_id: clubId,
+    p_location_id: clubLocationId,
+    p_location_resource_id: clubResourceId,
+    p_idempotency_key: deterministicUuid(`lesson-series-club:${runId}`),
+  });
+  if (clubSeriesError) throw new Error(`Criar serie de clube: ${summarizeError(clubSeriesError)}`);
+  const clubSeriesResult = readRecurringResult(clubSeriesData, "serie de clube");
+  const clubSeriesRecords = await teacherClient
+    .from("teacher_lesson_schedule_records")
+    .select("id, context_kind, club_organization_id, location_resource_name, is_recurring")
+    .in("id", clubSeriesResult.lesson_ids);
+  if (clubSeriesRecords.error) throw new Error(`Consultar serie de clube: ${summarizeError(clubSeriesRecords.error)}`);
+  check(
+    (clubSeriesRecords.data ?? []).length === 2 &&
+      (clubSeriesRecords.data ?? []).every(
+        (row) =>
+          row.context_kind === "club" &&
+          row.club_organization_id === clubId &&
+          row.location_resource_name !== null &&
+          row.is_recurring === true,
+      ),
+    "Professor cria serie no contexto do clube usando recurso do clube",
+  );
+
+  await mustReject("Professor nao cria serie para aluno de outro professor", async () =>
+    createRecurringLessons(teacherBClient, {
+      p_starts_at: lisbonInstant(clubSeriesDates[0], "10:00"),
+      p_ends_at: lisbonInstant(clubSeriesDates[0], "11:00"),
+      p_title: `Serie E2E aluno alheio ${runId}`,
+      p_occurrence_count: 2,
+      p_student_id: studentsA.id,
+      p_idempotency_key: deterministicUuid(`lesson-series-foreign-student:${runId}`),
+    }),
+  );
+
+  const seriesConflictDates = [82, 89, 96, 103].map((days) => isoDatePlusDays(days, fixtureBaseDate));
+  await prepareExceptions(
+    teacherClient,
+    "Disponibilidade para conflito intermediario de serie",
+    seriesConflictDates,
+    "lesson-series-conflict-date",
+  );
+  const baseSeriesConflict = await createLesson(teacherClient, {
+    p_starts_at: lisbonInstant(seriesConflictDates[2], "10:30"),
+    p_ends_at: lisbonInstant(seriesConflictDates[2], "11:30"),
+    p_title: `Aula E2E bloqueia serie ${runId}`,
+    p_location_id: null,
+    p_location_resource_id: null,
+    p_idempotency_key: deterministicUuid(`lesson-series-conflict-base:${runId}`),
+  });
+  if (baseSeriesConflict.error || !baseSeriesConflict.data) {
+    throw new Error(`Criar conflito intermediario de serie: ${summarizeError(baseSeriesConflict.error)}`);
+  }
+  const seriesConflictTitle = `Serie E2E 5D3 conflito ${runId}`;
+  const packageBeforeSeriesConflict = await getSingle(
+    "pacote antes do rollback por conflito de serie",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_available, credits_reserved")
+      .eq("id", lessonPackageA.id),
+  );
+  const seriesConflictError = await mustReject("Conflito na ocorrencia intermediaria rejeita a serie inteira", async () =>
+    createRecurringLessons(teacherClient, {
+      p_starts_at: lisbonInstant(seriesConflictDates[0], "10:00"),
+      p_ends_at: lisbonInstant(seriesConflictDates[0], "11:00"),
+      p_title: seriesConflictTitle,
+      p_occurrence_count: 4,
+      p_location_id: null,
+      p_location_resource_id: null,
+      p_idempotency_key: deterministicUuid(`lesson-series-conflict:${runId}`),
+    }),
+  );
+  check(
+    summarizeError(seriesConflictError).toLowerCase().includes("serie") ||
+      summarizeError(seriesConflictError).toLowerCase().includes("série"),
+    "Erro de conflito intermediario indica falha da serie",
+  );
+  const packageAfterSeriesConflict = await getSingle(
+    "pacote depois do rollback por conflito de serie",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_available, credits_reserved")
+      .eq("id", lessonPackageA.id),
+  );
+  check(
+    packageAfterSeriesConflict.credits_available === packageBeforeSeriesConflict.credits_available &&
+      packageAfterSeriesConflict.credits_reserved === packageBeforeSeriesConflict.credits_reserved,
+    "Rollback por conflito intermediario conserva reservas do pacote",
+  );
+  await mustReturnNoRows("Serie recusada por conflito nao deixa ocorrencias", () =>
+    teacherClient.from("teacher_lesson_schedule_records").select("id").eq("title", seriesConflictTitle),
+  );
+
+  const shortCreditDates = [77, 84, 91].map((days) => isoDatePlusDays(days, fixtureBaseDate));
+  await prepareExceptions(
+    teacherClient,
+    "Disponibilidade para serie sem credito suficiente",
+    shortCreditDates,
+    "lesson-series-short-credit-date",
+  );
+  const shortCreditStudent = await ensureTeacherStudent(
+    teacherClient,
+    teacherRecord,
+    `e2e.series.short.credit.${runId}@aulaflow.example.com`,
+    `Aluno serie sem credito ${runId}`,
+  );
+  const shortCreditPackage = await assignLessonPackage(
+    teacherClient,
+    shortCreditStudent.id,
+    `Pacote serie sem credito ${runId}`,
+    2,
+    deterministicUuid(`lesson-series-short-credit-package:${runId}`),
+  );
+  const shortCreditTitle = `Serie E2E 5D3 sem credito ${runId}`;
+  await mustReject("Credito insuficiente no meio da serie faz rollback integral", async () =>
+    createRecurringLessons(teacherClient, {
+      p_starts_at: lisbonInstant(shortCreditDates[0], "10:00"),
+      p_ends_at: lisbonInstant(shortCreditDates[0], "11:00"),
+      p_title: shortCreditTitle,
+      p_occurrence_count: 3,
+      p_location_id: null,
+      p_location_resource_id: null,
+      p_student_id: shortCreditStudent.id,
+      p_idempotency_key: deterministicUuid(`lesson-series-short-credit:${runId}`),
+    }),
+  );
+  const shortCreditAfter = await getSingle(
+    "pacote depois do rollback por credito de serie",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_available, credits_reserved")
+      .eq("id", shortCreditPackage.id),
+  );
+  check(
+    shortCreditAfter.credits_available === 2 && shortCreditAfter.credits_reserved === 0,
+    "Rollback por credito insuficiente nao reserva ocorrencias parciais",
+  );
+  await mustReturnNoRows("Serie recusada por credito nao aparece no calendario", () =>
+    teacherClient.from("teacher_lesson_schedule_records").select("id").eq("title", shortCreditTitle),
+  );
+
+  const seriesRaceDates = [78, 85].map((days) => isoDatePlusDays(days, fixtureBaseDate));
+  await prepareExceptions(teacherClient, "Disponibilidade para corrida de series", seriesRaceDates, "lesson-series-race-date");
+  const seriesRaceClientA = client(url, anonKey);
+  const seriesRaceClientB = client(url, anonKey);
+  await signIn(seriesRaceClientA, credentials.teacherA.email, credentials.teacherA.password, "Professor A corrida serie A");
+  await signIn(seriesRaceClientB, credentials.teacherA.email, credentials.teacherA.password, "Professor A corrida serie B");
+  const seriesTeacherRace = await Promise.all([
+    rpcOutcome(() =>
+      createRecurringLessons(seriesRaceClientA, {
+        p_starts_at: lisbonInstant(seriesRaceDates[0], "10:00"),
+        p_ends_at: lisbonInstant(seriesRaceDates[0], "11:00"),
+        p_title: `Serie E2E corrida A ${runId}`,
+        p_occurrence_count: 2,
+        p_location_id: null,
+        p_location_resource_id: null,
+        p_idempotency_key: deterministicUuid(`lesson-series-race-a:${runId}`),
+      }),
+    ),
+    rpcOutcome(() =>
+      createRecurringLessons(seriesRaceClientB, {
+        p_starts_at: lisbonInstant(seriesRaceDates[0], "10:30"),
+        p_ends_at: lisbonInstant(seriesRaceDates[0], "11:30"),
+        p_title: `Serie E2E corrida B ${runId}`,
+        p_occurrence_count: 2,
+        p_location_id: null,
+        p_location_resource_id: null,
+        p_idempotency_key: deterministicUuid(`lesson-series-race-b:${runId}`),
+      }),
+    ),
+  ]);
+  checkOneSuccessOneConflict("Corrida simultanea de series do mesmo professor", seriesTeacherRace, "outra aula");
+
+  const seriesCreditRaceDatesA = [79, 86].map((days) => isoDatePlusDays(days, fixtureBaseDate));
+  const seriesCreditRaceDatesB = [80, 87].map((days) => isoDatePlusDays(days, fixtureBaseDate));
+  await prepareExceptions(
+    teacherClient,
+    "Disponibilidade para corrida de credito serie A",
+    seriesCreditRaceDatesA,
+    "lesson-series-credit-race-date-a",
+  );
+  await prepareExceptions(
+    teacherClient,
+    "Disponibilidade para corrida de credito serie B",
+    seriesCreditRaceDatesB,
+    "lesson-series-credit-race-date-b",
+  );
+  const seriesCreditRaceStudent = await ensureTeacherStudent(
+    teacherClient,
+    teacherRecord,
+    `e2e.series.credit.race.${runId}@aulaflow.example.com`,
+    `Aluno corrida credito serie ${runId}`,
+  );
+  const seriesCreditRacePackage = await assignLessonPackage(
+    teacherClient,
+    seriesCreditRaceStudent.id,
+    `Pacote corrida credito serie ${runId}`,
+    2,
+    deterministicUuid(`lesson-series-credit-race-package:${runId}`),
+  );
+  const seriesCreditRaceClientA = client(url, anonKey);
+  const seriesCreditRaceClientB = client(url, anonKey);
+  await signIn(seriesCreditRaceClientA, credentials.teacherA.email, credentials.teacherA.password, "Professor A corrida credito serie A");
+  await signIn(seriesCreditRaceClientB, credentials.teacherA.email, credentials.teacherA.password, "Professor A corrida credito serie B");
+  const seriesCreditRace = await Promise.all([
+    rpcOutcome(() =>
+      createRecurringLessons(seriesCreditRaceClientA, {
+        p_starts_at: lisbonInstant(seriesCreditRaceDatesA[0], "10:00"),
+        p_ends_at: lisbonInstant(seriesCreditRaceDatesA[0], "11:00"),
+        p_title: `Serie E2E credito corrida A ${runId}`,
+        p_occurrence_count: 2,
+        p_location_id: null,
+        p_location_resource_id: null,
+        p_student_id: seriesCreditRaceStudent.id,
+        p_idempotency_key: deterministicUuid(`lesson-series-credit-race-a:${runId}`),
+      }),
+    ),
+    rpcOutcome(() =>
+      createRecurringLessons(seriesCreditRaceClientB, {
+        p_starts_at: lisbonInstant(seriesCreditRaceDatesB[0], "10:00"),
+        p_ends_at: lisbonInstant(seriesCreditRaceDatesB[0], "11:00"),
+        p_title: `Serie E2E credito corrida B ${runId}`,
+        p_occurrence_count: 2,
+        p_location_id: null,
+        p_location_resource_id: null,
+        p_student_id: seriesCreditRaceStudent.id,
+        p_idempotency_key: deterministicUuid(`lesson-series-credit-race-b:${runId}`),
+      }),
+    ),
+  ]);
+  checkOneSuccessOneInsufficientCredit("Corrida simultanea de series pelo mesmo saldo", seriesCreditRace);
+  const seriesCreditRaceAfter = await getSingle(
+    "pacote depois da corrida de credito por serie",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_available, credits_reserved, credits_used")
+      .eq("id", seriesCreditRacePackage.id),
+  );
+  check(
+    seriesCreditRaceAfter.credits_available === 0 &&
+      seriesCreditRaceAfter.credits_reserved === 2 &&
+      seriesCreditRaceAfter.credits_used === 0,
+    "Corrida de series pelo mesmo saldo termina com apenas uma serie reservada",
+  );
+
+  const groupSeriesDates = [81, 88, 95].map((days) => isoDatePlusDays(days, fixtureBaseDate));
+  await prepareExceptions(teacherClient, "Disponibilidade para serie de turma", groupSeriesDates, "lesson-group-series-date");
+  await ensureGroupMember(teacherClient, group.id, groupStudent.id, "Aluno da turma para serie");
+  const { data: groupSeriesData, error: groupSeriesError } = await createRecurringLessons(teacherClient, {
+    p_starts_at: lisbonInstant(groupSeriesDates[0], "10:00"),
+    p_ends_at: lisbonInstant(groupSeriesDates[0], "11:00"),
+    p_title: `Serie E2E turma ${runId}`,
+    p_occurrence_count: 3,
+    p_location_id: null,
+    p_location_resource_id: null,
+    p_student_id: null,
+    p_group_id: group.id,
+    p_idempotency_key: deterministicUuid(`lesson-group-series:${runId}`),
+  });
+  if (groupSeriesError || !groupSeriesData) throw new Error(`Criar serie de turma: ${summarizeError(groupSeriesError)}`);
+  const groupSeriesResult = readRecurringResult(groupSeriesData, "serie de turma");
+  const groupSeriesParticipants = await teacherClient
+    .from("teacher_lesson_participant_credit_records")
+    .select("lesson_id, student_id, billing_status, credits_reserved")
+    .in("lesson_id", groupSeriesResult.lesson_ids);
+  if (groupSeriesParticipants.error) {
+    throw new Error(`Participantes da serie de turma: ${summarizeError(groupSeriesParticipants.error)}`);
+  }
+  check(
+    (groupSeriesParticipants.data ?? []).length >= 6 &&
+      groupSeriesResult.lesson_ids.every(
+        (lessonIdValue) =>
+          (groupSeriesParticipants.data ?? []).filter((row) => row.lesson_id === lessonIdValue).length >= 2,
+      ) &&
+      (groupSeriesParticipants.data ?? []).every(
+        (participant) => participant.billing_status === "reserved" && participant.credits_reserved === 1,
+      ),
+    "Serie de turma materializa participantes e reserva creditos por ocorrencia",
+  );
+  const { error: removeGroupMemberError } = await teacherClient.rpc("remove_group_member", {
+    p_group_id: group.id,
+    p_student_id: groupStudent.id,
+  });
+  if (removeGroupMemberError) throw new Error(`Remover membro depois da serie: ${summarizeError(removeGroupMemberError)}`);
+  const groupSeriesParticipantsAfterRemoval = await teacherClient
+    .from("teacher_lesson_participant_credit_records")
+    .select("lesson_id, student_id")
+    .in("lesson_id", groupSeriesResult.lesson_ids)
+    .eq("student_id", groupStudent.id);
+  if (groupSeriesParticipantsAfterRemoval.error) {
+    throw new Error(`Snapshot da turma depois da remocao: ${summarizeError(groupSeriesParticipantsAfterRemoval.error)}`);
+  }
+  check(
+    (groupSeriesParticipantsAfterRemoval.data ?? []).length === groupSeriesResult.lesson_ids.length,
+    "Remover membro depois da criacao nao altera o snapshot das ocorrencias recorrentes",
   );
 
   // ── Escrita direta ────────────────────────────────────────────────────────

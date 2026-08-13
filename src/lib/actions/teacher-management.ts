@@ -10,6 +10,7 @@ export type TeacherManagementActionState = {
   message?: string;
   fieldErrors?: Record<string, string>;
   resourceId?: string;
+  resourceCount?: number;
 };
 
 type TeacherAuthorization =

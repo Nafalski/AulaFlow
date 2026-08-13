@@ -47,6 +47,8 @@ describe("lessonCreateSchema", () => {
       notesForStudents: null,
       privateNotes: null,
       idempotencyKey: KEY,
+      recurrenceMode: "none",
+      recurrenceCount: null,
     });
   });
 
@@ -164,6 +166,43 @@ describe("lessonCreateSchema", () => {
   it("exige a chave de idempotência", () => {
     const withoutKey = { ...base, idempotencyKey: "" };
     expect(lessonCreateSchema.safeParse(withoutKey).success).toBe(false);
+  });
+
+  // ── Recorrência ──────────────────────────────────────────────────────────
+
+  it("aceita uma série semanal entre 2 e 12 aulas", () => {
+    expect(
+      lessonCreateSchema.parse({
+        ...base,
+        recurrenceMode: "weekly",
+        recurrenceCount: "8",
+      }),
+    ).toMatchObject({
+      recurrenceMode: "weekly",
+      recurrenceCount: 8,
+    });
+  });
+
+  it("recusa repetição semanal sem quantidade", () => {
+    expect(
+      lessonCreateSchema.safeParse({ ...base, recurrenceMode: "weekly" }).success,
+    ).toBe(false);
+  });
+
+  it("recusa séries semanais fora dos limites", () => {
+    for (const bad of ["1", "13", "2.5", "muitas"]) {
+      expect(
+        lessonCreateSchema.safeParse({
+          ...base,
+          recurrenceMode: "weekly",
+          recurrenceCount: bad,
+        }).success,
+      ).toBe(false);
+    }
+  });
+
+  it("recusa quantidade de recorrência quando a aula não se repete", () => {
+    expect(lessonCreateSchema.safeParse({ ...base, recurrenceCount: "4" }).success).toBe(false);
   });
 
   it("recusa identificadores que não são UUID", () => {

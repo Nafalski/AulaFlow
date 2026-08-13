@@ -10,6 +10,7 @@ import { lisbonDateKey, lisbonDayRange } from "@/lib/datetime";
 import {
   LESSON_CONFLICT_PROTECTION_NOTICE,
   lessonCalendarSlot,
+  recurringLessonLabel,
 } from "@/lib/domain/lesson-scheduling";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import {
@@ -74,7 +75,7 @@ export default async function TeacherCalendarPage({
     }),
     supabase
       .from("teacher_lesson_schedule_records")
-      .select("id, title, starts_at, ends_at, status, group_name, sport_name, participant_count")
+      .select("id, title, starts_at, ends_at, status, group_name, sport_name, participant_count, is_recurring, recurrence_frequency, recurrence_occurrence_index, recurrence_occurrence_count")
       .gte("starts_at", windowStart.toISOString())
       .lt("starts_at", windowEnd.toISOString())
       .order("starts_at"),
@@ -87,6 +88,15 @@ export default async function TeacherCalendarPage({
 
   const lessonItems: AvailabilityCalendarItem[] = (lessonsResult.data ?? []).map((lesson) => {
     const slot = lessonCalendarSlot(lesson.starts_at, lesson.ends_at);
+    const recurrenceLabel = recurringLessonLabel({
+      isRecurring: lesson.is_recurring,
+      frequency: lesson.recurrence_frequency,
+      occurrenceIndex: lesson.recurrence_occurrence_index,
+      occurrenceCount: lesson.recurrence_occurrence_count,
+    });
+    const participantLabel =
+      lesson.group_name ??
+      (lesson.participant_count === 1 ? "Aula individual" : `${lesson.participant_count} alunos`);
     return {
       date: slot.date,
       startsAt: slot.startTime,
@@ -97,9 +107,7 @@ export default async function TeacherCalendarPage({
       lesson: {
         id: lesson.id,
         title: lesson.title,
-        subtitle:
-          lesson.group_name ??
-          (lesson.participant_count === 1 ? "Aula individual" : `${lesson.participant_count} alunos`),
+        subtitle: [participantLabel, recurrenceLabel].filter(Boolean).join(" · "),
         href: `/professor/aulas/${lesson.id}`,
       },
     };

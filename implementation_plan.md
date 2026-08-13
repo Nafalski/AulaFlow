@@ -6,7 +6,7 @@
 
 **Documento vivo.** Atualizado no fim de cada fase com o que foi realmente construído.
 
-- **Estado atual:** Fases 1, 1.5, 2, 3 e 4 concluídas. A Fase 5 tem as **Etapas 5A a 5D.2** concluídas — disponibilidade, projeção segura, calendário visual refinado, clubes/workspaces/membros, calendário partilhado com consentimento, locais com moradas manuais, campos/salas/áreas, **criação e edição de aulas**, conflitos atómicos de professor/recurso e reserva atómica de créditos. **Recorrência** continua pendente.
+- **Estado atual:** Fases 1, 1.5, 2, 3 e 4 concluídas. A Fase 5 tem as **Etapas 5A a 5D.3** concluídas — disponibilidade, projeção segura, calendário visual refinado, clubes/workspaces/membros, calendário partilhado com consentimento, locais com moradas manuais, campos/salas/áreas, **criação e edição de aulas**, conflitos atómicos de professor/recurso, reserva atómica de créditos e recorrência semanal segura.
 - **Timezone do sistema:** `Europe/Lisbon`
 - **Idioma da interface:** Português (pt-PT)
 
@@ -446,11 +446,11 @@ A estrutura fica pronta para notificações push (Fase 8).
 | **2** | Perfis, definições e gestão administrativa básica de contas | **Concluído** |
 | **3** | Alunos, turmas, locais, política de cancelamento | **Concluído** |
 | **4** | Pacotes: modelos, atribuição, ajustes, painel de saldo | **Concluído** — Etapas 1A, 1B, 1C, 1D e 1E validadas |
-| **5** | Calendário e criação de aulas, com reserva de créditos | **Parcialmente concluído** — Etapas 5A a 5D.2: disponibilidade, calendário, clubes, locais, recursos, criação/edição de aulas, conflitos atómicos e reserva atómica de créditos. Falta recorrência e ciclo operacional posterior |
+| **5** | Calendário e criação de aulas, com reserva de créditos | **Parcialmente concluído** — Etapas 5A a 5D.3: disponibilidade, calendário, clubes, locais, recursos, criação/edição de aulas, conflitos atómicos, reserva atómica de créditos e recorrência semanal segura. Falta revisão integrada e ciclo operacional posterior |
 | **6** | Cancelamento, reagendamento, presenças, histórico | **Planeado** |
 | **7** | Área do aluno: aulas, saldo, confirmação de presença | **Planeado** |
 | **8** | Notificações, lembretes e expiração agendada | **Planeado** |
-| **9** | Supabase real, concorrência, acessibilidade, deployment | **Parcialmente concluído** — Supabase/Auth reais validados para a Fase 4 e Etapas 5A-5D.2; concorrência real de aulas/créditos coberta, acessibilidade completa e deployment pendentes |
+| **9** | Supabase real, concorrência, acessibilidade, deployment | **Parcialmente concluído** — Supabase/Auth reais validados para a Fase 4 e Etapas 5A-5D.3; concorrência real de aulas/créditos/recorrência coberta, acessibilidade completa e deployment pendentes |
 
 A ordem segue as prioridades pedidas: primeiro a área do professor ao computador, depois as regras seguras de créditos, depois o aluno no telemóvel.
 
@@ -520,7 +520,7 @@ Estado atual: **concluída**.
 Concluído:
 
 - Projeto local ligado ao Supabase de desenvolvimento `fzkwacnpydoqhxipcvro`.
-- 27 migrações locais da Fase 4 aplicadas no remoto naquela etapa; o estado atual do projeto tem 44 migrações com as Etapas 5A a 5D.2.
+- 27 migrações locais da Fase 4 aplicadas no remoto naquela etapa; o estado atual do projeto tem 45 migrações com as Etapas 5A a 5D.3.
 - Dependências Supabase auditadas: `@supabase/server` não é usado nem mantido; sessão/cookies continuam concentrados em `@supabase/ssr`, e `@supabase/supabase-js` fica para cliente admin server-only e tipos.
 - Variáveis de ambiente auditadas: o código lê `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `NEXT_PUBLIC_SITE_URL` e `SUPABASE_SERVICE_ROLE_KEY`; o exemplo não inclui chaves reais nem variáveis duplicadas de `SUPABASE_PUBLISHABLE_KEY`, `SUPABASE_SECRET_KEY` ou `SUPABASE_JWKS_URL`.
 - `scripts/verify-remote-supabase.mjs` valida o catálogo remoto sem escrever dados: migrações, tabelas, views, enums, índices, constraints, RLS, grants, assinaturas únicas de RPCs, `search_path` seguro, `EXECUTE` restrito e privacidade das views do aluno.
@@ -528,7 +528,7 @@ Concluído:
 - `scripts/verify-remote-auth.mjs` valida login real, JWT, PostgREST, RPCs de pacotes, idempotência, isolamento, conta bloqueada, anónimo, imutabilidade e privacidade usando URL pública e anon key.
 - `.env.local` local preenchido com `SUPABASE_SERVICE_ROLE_KEY` e credenciais `E2E_*`, mantendo o ficheiro ignorado e sem valores reais no repositório.
 - `npm run db:setup:e2e -- --confirm-development` executado com sucesso, criando ou reutilizando professor, aluno, segundo professor, segundo aluno, administrador e conta bloqueada de desenvolvimento.
-- `npm run db:verify:auth -- --confirm-development` executado com sucesso: a suite atual tem 295 verificações Auth/PostgREST reais, incluindo idempotência, privacidade do aluno, isolamento entre contas, recusas para anónimo/bloqueado, disponibilidade, calendário seguro, clubes, locais, recursos, aulas, reserva de créditos, rollback de turmas, conflitos concorrentes e imutabilidade.
+- `npm run db:verify:auth -- --confirm-development` executado com sucesso: a suite atual tem 326 verificações Auth/PostgREST reais, incluindo idempotência, privacidade do aluno, isolamento entre contas, recusas para anónimo/bloqueado, disponibilidade, calendário seguro, clubes, locais, recursos, aulas, reserva de créditos, recorrência semanal, rollback de turmas, conflitos concorrentes e imutabilidade.
 - Cenário em navegador real validado: professor em desktop autenticado abriu painel, alunos, pacotes, atribuição, histórico e detalhe de pacote; aluno em viewport mobile abriu `/aluno/pacotes`, viu apenas a projeção permitida e manteve sessão após refresh, sem overflow horizontal nem erros relevantes de console.
 - Verificações finais executadas com sucesso: `db:verify:remote`, `lint`, `typecheck`, `test`, `db:verify`, `build` e `check`.
 
@@ -816,8 +816,9 @@ Ordem da Fase 5:
 6. 5C — Criação e edição de aulas. **Concluída.**
 7. 5D.1 — Conflitos atómicos de professor e recurso. **Concluída.**
 8. 5D.2 — Seleção de pacote e reserva atómica de créditos. **Concluída.**
-9. 5D.3 — Recorrência e continuação operacional. **Próxima.**
-10. 5E — Revisão integrada.
+9. 5D.3 — Recorrência semanal segura. **Concluída.**
+10. 5D.4 — Revisão integrada do fluxo de agendamento. **Próxima.**
+11. 5E — Continuação operacional.
 
 ### Concluído na Fase 5 — Etapa 5B.3A: locais e moradas manuais
 
@@ -905,7 +906,7 @@ Secção "Campos, salas e áreas" dentro de `/professor/locais/[id]`: lista com 
 
 Disponibilidade, horário ou reserva visual de um recurso; créditos; notificações; qualquer integração externa. Os recursos não têm estado próprio de ocupação — a interface não diz "livre", "ocupado" ou "reservado" no inventário. A colisão real é validada ao gravar aulas desde a 5D.1.
 
-### Concluído na Fase 5 — Etapas 5C, 5D.1 e 5D.2: criação, conflitos e reserva de créditos
+### Concluído na Fase 5 — Etapas 5C, 5D.1, 5D.2 e 5D.3: criação, conflitos, reserva de créditos e recorrência
 
 Estado: **concluída**.
 
@@ -947,9 +948,23 @@ Turmas são tudo ou nada: se qualquer membro ativo não tiver pacote válido, a 
 
 `update_lesson()` continua sem trocar aluno, turma, modalidade ou contexto. Horário, local, recurso, título e observações podem mudar em `scheduled`/`confirmed`; as reservas existentes são mantidas. Se a data mudar, a RPC confirma que os pacotes reservados continuam válidos para a nova data antes de gravar.
 
+#### Recorrência semanal segura
+
+A 5D.3 acrescentou `create_recurring_lessons()` sem criar uma tabela paralela de séries. Cada ocorrência continua a ser uma linha real em `lessons`, agrupada por `recurrence_group_id` e descrita por metadados internos em `recurrence_rule`.
+
+O escopo é deliberadamente pequeno: apenas frequência semanal, intervalo fixo de uma semana e contagem entre 2 e 12 aulas. Não há recorrência diária/mensal, RRULE livre, repetição infinita, edição de série inteira, cancelamento de série inteira nem "esta e futuras".
+
+A geração usa data e hora civis em `Europe/Lisbon`. Ao atravessar a mudança de horário, a aula continua às 18:00 locais mesmo que o intervalo em UTC não seja exatamente 168 horas. Cada ocorrência revalida disponibilidade, bloqueios, conflito do professor, conflito do recurso físico, contexto pessoal/clube, participantes, pacote e reserva de créditos.
+
+A transação é tudo ou nada: se a terceira aula de uma série falhar por conflito, falta de crédito, recurso ocupado ou indisponibilidade, nenhuma das ocorrências anteriores fica gravada. A mesma chave de idempotência devolve a série já criada sem duplicar aulas, participantes ou lançamentos no livro-razão.
+
+Em turmas, os membros ativos são materializados ocorrência a ocorrência no momento da criação da série; alterar a turma depois não muda o histórico já criado. Como cada ocorrência escolhe pacote pela própria data, uma série pode consumir créditos de pacotes diferentes quando a validade ou o saldo exigir.
+
+O professor vê os indicadores da série e a posição "N de M" nas suas projeções. O aluno recebe apenas indicadores seguros de recorrência; não recebe `recurrence_group_id`, regra completa, colegas, turma, custo, pacote, saldos internos nem notas privadas.
+
 #### Não implementado
 
-Recorrência, presença, conclusão, falta, cancelamento e reagendamento operacionais, consumo/libertação de créditos pela interface, confirmação pelo aluno, lista de espera, notificações, pagamentos, calendários externos.
+Presença, conclusão, falta, cancelamento e reagendamento operacionais, edição/cancelamento de série inteira, consumo/libertação de créditos pela interface, confirmação pelo aluno, lista de espera, notificações, pagamentos, calendários externos.
 
 ### Fase 2 — estado por item
 
@@ -965,7 +980,7 @@ Recorrência, presença, conclusão, falta, cancelamento e reagendamento operaci
 | Preferências de notificação | **Concluído** | Persistência de canais/eventos; entrega automática continua planeada para a Fase 8 |
 | Diretório administrativo | **Concluído** | Pesquisa, filtros, professores, detalhe, estados vazios/erro/loading e resposta mobile/desktop |
 | Bloqueio e reativação | **Concluído** | RPC exclusiva de admin, sem auto-bloqueio, motivo, auditoria e revogação efetiva por RLS |
-| Validação num Supabase remoto | **Concluído para a Fase 4 e Etapas 5A-5D.2** | Migrações, catálogo remoto, GoTrue/Auth, JWT/PostgREST, contas reais, calendário seguro, aulas, conflitos e reserva de créditos validados por RPC/Auth real |
+| Validação num Supabase remoto | **Concluído para a Fase 4 e Etapas 5A-5D.3** | Migrações, catálogo remoto, GoTrue/Auth, JWT/PostgREST, contas reais, calendário seguro, aulas, conflitos, reserva de créditos e recorrência semanal validados por RPC/Auth real |
 
 ### Concluído na Fase 2
 
@@ -996,7 +1011,7 @@ Recorrência, presença, conclusão, falta, cancelamento e reagendamento operaci
 - **A interface de pacotes ainda é parcial.** `/professor/pacotes` gere modelos, atribuição, consulta, ajustes administrativos e histórico; `/aluno/pacotes` mostra os próprios pacotes. Transferências/fusões/divisões e o ciclo posterior de consumo/libertação continuam pendentes.
 - **A expiração de pacotes não é automática.** `refresh_package_status()` marca `expired` quando é chamada, mas nada corre à meia-noite. Precisa de uma tarefa agendada — Fase 8, com os lembretes.
 - **`credit_expired` e `credit_transferred_*` existem no enum mas não têm função.** Ficam para quando a expiração automática e a transferência entre pacotes forem implementadas numa fase futura.
-- **A validação remota já cobre concorrência real de aulas/créditos.** `db:verify:auth` abre sessões reais paralelas para disputar o último crédito e para combinar conflito de agenda com reserva; deployment e auditoria completa de acessibilidade continuam fora desta etapa.
+- **A validação remota já cobre concorrência real de aulas/créditos/recorrência.** `db:verify:auth` abre sessões reais paralelas para disputar o último crédito, combinar conflito de agenda com reserva e testar séries incompatíveis; deployment e auditoria completa de acessibilidade continuam fora desta etapa.
 - **Server Actions do ciclo operacional ainda são parciais.** Criar aula já reserva créditos; cancelar, concluir, libertar, consumir e reagendar operacionalmente continuam nas Fases 5–6.
 
 ---

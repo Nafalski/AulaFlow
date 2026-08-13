@@ -160,7 +160,8 @@ update public.profiles set role = 'admin' where email = 'voce@exemplo.pt';
 │   ├── ..._phase5_location_resources.sql Etapa 5B.3B: campos, salas e áreas de um local
 │   ├── ..._phase5c_lesson_scheduling.sql Etapa 5C: contexto, recurso e RPCs de aulas
 │   ├── ..._phase5d1_lesson_conflicts.sql Etapa 5D.1: conflitos atómicos de professor e recurso
-│   └── ..._phase5d2_lesson_credit_reservation.sql Etapa 5D.2: reserva atómica de créditos da aula
+│   ├── ..._phase5d2_lesson_credit_reservation.sql Etapa 5D.2: reserva atómica de créditos da aula
+│   └── ..._phase5d3_weekly_lesson_recurrence.sql Etapa 5D.3: recorrência semanal segura
 │
 └── src/
     ├── proxy.ts             Renova a sessão e protege rotas (era middleware.ts)
@@ -358,9 +359,9 @@ View: `teacher_location_resource_records` — é o contrato que a Etapa 5C vai c
 
 **Não implementado nesta camada de inventário:** disponibilidade/horário/reserva visual de recurso, créditos e notificações. Aulas existem na 5C, e a colisão real de recurso é validada só ao criar/editar aulas na 5D.1.
 
-### Criação, edição, conflitos e créditos de aulas (Etapas 5C, 5D.1 e 5D.2)
+### Criação, edição, conflitos, créditos e recorrência de aulas (Etapas 5C, 5D.1, 5D.2 e 5D.3)
 
-As aulas existem no esquema desde a Fase 1, mas só a 5C lhes deu um caminho de escrita real. A 5D.1 acrescenta a garantia transacional de conflitos de professor e recurso. A 5D.2 liga a aula ao ciclo financeiro: `create_lesson()` materializa participantes, seleciona pacote válido e reserva créditos na mesma transação.
+As aulas existem no esquema desde a Fase 1, mas só a 5C lhes deu um caminho de escrita real. A 5D.1 acrescenta a garantia transacional de conflitos de professor e recurso. A 5D.2 liga a aula ao ciclo financeiro: `create_lesson()` materializa participantes, seleciona pacote válido e reserva créditos na mesma transação. A 5D.3 acrescenta séries semanais seguras através de `create_recurring_lessons()`.
 
 **Nunca escrever "campo livre", "vaga garantida" ou "crédito garantido" antes da submissão.** O banco impede sobreposição e reserva créditos no momento de gravar, mas a interface não deve apresentar disponibilidade futura como garantia absoluta antes da submissão. `LESSON_CONFLICT_PROTECTION_NOTICE` em `lib/domain/lesson-scheduling.ts` é o texto de limite do produto e está sob teste.
 
@@ -368,7 +369,7 @@ As aulas existem no esquema desde a Fase 1, mas só a 5C lhes deu um caminho de 
 
 **Cada professor cria e edita as suas aulas, inclusive dentro do clube.** `create_lesson()` **não tem parâmetro de professor**: deriva-o de `current_teacher_id()`. Ver o calendário de um colega — com o consentimento da 5B.2B — não é autorização para lhe escrever na agenda. Não acrescentar esse parâmetro sem uma necessidade de produto explícita.
 
-**Escrita só por RPC.** `create_lesson()` e `update_lesson()`. A Fase 1 tinha dado ao cliente `insert` em `lessons`/`lesson_participants` e `update` numa lista larga de colunas; a 5C revoga tudo isso. Com escrita direta, um PATCH contornaria disponibilidade, local, recurso e participantes.
+**Escrita só por RPC.** `create_lesson()`, `create_recurring_lessons()` e `update_lesson()`. A Fase 1 tinha dado ao cliente `insert` em `lessons`/`lesson_participants` e `update` numa lista larga de colunas; a 5C revoga tudo isso. Com escrita direta, um PATCH contornaria disponibilidade, local, recurso e participantes.
 
 | Validação | Onde |
 |---|---|
@@ -379,6 +380,7 @@ As aulas existem no esquema desde a Fase 1, mas só a 5C lhes deu um caminho de 
 | Sobreposição de professor, intervalo mínimo e recurso físico | trigger `ensure_lesson_has_no_conflict()` |
 | Clube ativo e membership | `create_lesson()` |
 | Seleção de pacote, saldo e validade | `select_package_for_student()` + `reserve_participation_credits()` |
+| Recorrência semanal segura | `create_recurring_lessons()` + `create_lesson_occurrence()` interna |
 
 `lesson_fits_teacher_availability()` reutiliza `resolve_teacher_availability_windows()` e `resolve_teacher_block_segments()` da 5B.2B — não duplicar a precedência nem a conversão de fuso. Funde períodos contíguos: uma aula das 12:30 às 13:30 cabe em `09:00–12:00` + `12:00–15:00`. Um intervalo real (o espaço entre `09:00–13:00` e `15:00–20:00`) continua a recusar. É **interna**: expô-la deixaria um professor sondar a agenda de outro por tentativa e erro.
 
@@ -392,12 +394,20 @@ As aulas existem no esquema desde a Fase 1, mas só a 5C lhes deu um caminho de 
 
 **Turma: tudo ou nada.** Se qualquer membro materializado não tiver pacote válido/saldo, a criação inteira falha e a transação desfaz aula, participantes, histórico, reservas e livro-razão. A mesma `idempotency_key` devolve a aula existente e não duplica reservas.
 
+**Recorrência semanal: limitada e transacional.** Só existe repetição `weekly`, com intervalo fixo de 1 semana e contagem de 2 a 12 aulas. Não há recorrência diária, mensal, RRULE livre, repetição infinita, edição de série inteira nem "esta e futuras". A série é gerada por data e hora civis em `Europe/Lisbon`; não usar `starts_at + interval '7 days'` em UTC, porque a mudança de horário tem de preservar a hora local escolhida pelo professor.
+
+`create_recurring_lessons()` é a única entrada pública da 5D.3. O browser envia intenção de recorrência, não envia lista de instantes, índice, grupo, pacote ou reserva. Cada ocorrência passa pela mesma validação de aula real: contexto, local, recurso, disponibilidade, conflitos, intervalo mínimo, materialização de aluno/turma, seleção de pacote e reserva de créditos. Se qualquer ocorrência falhar, a transação desfaz todas as ocorrências anteriores.
+
+`lessons.recurrence_group_id` e `lessons.recurrence_rule` são metadados internos da série. A vista do professor mostra o grupo e os índices; a vista do aluno expõe só indicadores seguros, como "aula recorrente" e posição na série. Não acrescentar `recurrence_group_id`, regra completa, colegas, turma, custo, pacote ou notas privadas à projeção do aluno.
+
+Cada ocorrência é editada como aula individual. Alterar a turma depois de criar uma série não muda os participantes já materializados, e cada ocorrência pode escolher um pacote diferente se a validade/saldo assim exigir.
+
 **Projeções, e o que cada uma não tem:**
 
 | View | Público | Nunca inclui |
 |---|---|---|
 | `teacher_lesson_schedule_records` | Professor da sessão | — (é o dono; inclui `private_notes`) |
-| `student_lesson_records` | Aluno participante | colegas, contagem de participantes, turma, custo em créditos, `student_package_id`, saldos do pacote, `private_notes`, organização, `teacher_id`, autoria, recorrência |
+| `student_lesson_records` | Aluno participante | colegas, contagem de participantes, turma, custo em créditos, `student_package_id`, saldos do pacote, `private_notes`, organização, `teacher_id`, autoria, `recurrence_group_id`, regra completa de recorrência |
 | `lesson_participant_directory` | **Professor da aula** | `profile_id`; e o aluno já não a lê de todo |
 | `teacher_lesson_participant_credit_records` | Professor da aula | `profile_id`, `student_package_id` e saldos totais do pacote |
 | `schedulable_location_resource_records` | Professor | locais públicos (não têm recursos) |
@@ -408,7 +418,7 @@ As aulas existem no esquema desde a Fase 1, mas só a 5C lhes deu um caminho de 
 
 **Edição:** só horário, local, recurso, título e observações, e só em `scheduled`/`confirmed`. Participante, modalidade e contexto não se editam — trocar o aluno é criar outra aula. As reservas já feitas são mantidas; ao mover a data, `update_lesson()` confirma que os pacotes reservados continuam válidos nessa nova data. O histórico é escrito pelo trigger `log_lesson_change()` da Fase 1, que também trata o caso "nada mudou": um `update_lesson()` sem alterações devolve `false` e não gera entrada.
 
-**Não implementado:** recorrência, presença, conclusão, cancelamento e reagendamento operacionais, libertação/consumo de créditos pela interface, confirmação pelo aluno, lista de espera, notificações.
+**Não implementado:** presença, conclusão, cancelamento e reagendamento operacionais, edição/cancelamento de série inteira, libertação/consumo de créditos pela interface, confirmação pelo aluno, lista de espera, notificações.
 
 ### Ao criar uma tabela nova
 
@@ -440,7 +450,7 @@ npm run typecheck
 
 ### `npm run db:verify`
 
-Executa **todas** as migrações, a partir de uma base vazia, contra PostgreSQL compilado para WebAssembly (PGlite), e volta a aplicá-las para confirmar idempotência. Depois exerce 676 garantias: RLS com papéis `authenticated`/`anon`, isolamento entre organizações e professores, privilégios das RPCs, perfis/claim/bloqueio, convites sem segredo, alunos, turmas, locais, modelos, atribuição, consulta e ajustes administrativos de pacotes, disponibilidade do professor, calendário seguro, clubes, memberships, convites de workspace, papéis internos, contexto ativo, suspensão, consentimento de partilha por clube, projeção do calendário partilhado, grants estritos das views, políticas, reserva, consumo, libertação, reagendamento, exceções, correções, imutabilidade do livro-razão, locais, campos/salas/áreas, criação/edição de aulas, conflitos, reserva de créditos de aula, materialização de turmas e privacidade das projeções de aula.
+Executa **todas** as migrações, a partir de uma base vazia, contra PostgreSQL compilado para WebAssembly (PGlite), e volta a aplicá-las para confirmar idempotência. Depois exerce 702 garantias: RLS com papéis `authenticated`/`anon`, isolamento entre organizações e professores, privilégios das RPCs, perfis/claim/bloqueio, convites sem segredo, alunos, turmas, locais, modelos, atribuição, consulta e ajustes administrativos de pacotes, disponibilidade do professor, calendário seguro, clubes, memberships, convites de workspace, papéis internos, contexto ativo, suspensão, consentimento de partilha por clube, projeção do calendário partilhado, grants estritos das views, políticas, reserva, consumo, libertação, reagendamento, exceções, correções, imutabilidade do livro-razão, locais, campos/salas/áreas, criação/edição de aulas, conflitos, reserva de créditos de aula, recorrência semanal, materialização de turmas e privacidade das projeções de aula.
 
 Corre em segundos, sem Docker e sem projeto na nuvem — serve para o CI.
 
@@ -653,7 +663,7 @@ Na Etapa 5B.1, a apresentação visual passou a usar:
 
 `src/lib/domain/calendar.ts` centraliza janela selecionada, navegação civil, faixa horária visível, labels de horas, posição proporcional dos blocos e camada visual. O componente cliente recebe apenas strings, números, booleanos, arrays e objetos literais.
 
-**Ainda não implementado:** criação de aulas, calendário de aulas reais, recorrência, participantes, reservas/consumo de créditos, presenças, cancelamentos/reagendamentos de aulas, confirmação do aluno, lista de espera, notificações, calendário compartilhado entre professores, recursos/campos de clube, Google Calendar, Apple Calendar, ICS e drag-and-drop.
+**Fora do âmbito original destas etapas:** criação de aulas, calendário de aulas reais, recorrência, participantes, reservas/consumo de créditos, presenças, cancelamentos/reagendamentos de aulas, confirmação do aluno, lista de espera, notificações, calendário compartilhado entre professores, recursos/campos de clube, Google Calendar, Apple Calendar, ICS e drag-and-drop. Parte desse trabalho já avançou em etapas posteriores; manter esta lista como memória histórica da 5A/5B.
 
 ### Clubes, workspaces e membros (Etapa 5B.2A)
 
@@ -730,7 +740,7 @@ Interface em `/professor/clubes/[id]/calendario`, com filtro por professor no UR
 
 **Não implementado:** aulas, participantes, locais, campos, recursos, conflitos, reservas e créditos. Os únicos estados são disponível e indisponível — não escrever "ocupado", "reservado", "lotado", "vagas" ou "conflito", porque nada disso existe ainda para ser verdade.
 
-Ordem: 5D recorrência, conflitos e reservas de créditos → 5E revisão integrada.
+Ordem atual: 5D.3 recorrência fechada → 5D.4 revisão integrada do agendamento → ciclo operacional posterior.
 
 ### `src/types/database.ts`
 
@@ -742,7 +752,7 @@ As linhas são declaradas com `type`, **nunca com `interface`**. Um `interface` 
 
 Vitest, ambiente Node, `TZ=Europe/Lisbon` fixo para que um teste que passa localmente passe também no CI (que corre em UTC).
 
-Cobertura atual: **478 testes** em vinte e seis ficheiros — testes de domínio, regressões de respostas/autenticação do proxy, formulários da Fase 2, validação/normalização da gestão da Fase 3, modelos, atribuição, apresentação, navegação, ajustes administrativos de pacotes, disponibilidade do professor, calendário, permissões de clube, validação de workspaces, regras do calendário partilhado, domínio de locais, recursos de locais e agendamento de aulas com reserva de créditos.
+Cobertura atual: **487 testes** em vinte e seis ficheiros — testes de domínio, regressões de respostas/autenticação do proxy, formulários da Fase 2, validação/normalização da gestão da Fase 3, modelos, atribuição, apresentação, navegação, ajustes administrativos de pacotes, disponibilidade do professor, calendário, permissões de clube, validação de workspaces, regras do calendário partilhado, domínio de locais, recursos de locais e agendamento de aulas com reserva de créditos e recorrência semanal.
 
 Os testes de domínio exercem funções puras, sem base de dados nem mocks. Os testes de validação garantem normalização, limites, identificadores, estados, valores monetários em cêntimos, datas civis e rejeição de campos extra/protegidos. A integração SQL fica separada em `db:verify`.
 
@@ -765,11 +775,11 @@ Não existe um comando de formatação separado. Use `npm run lint:fix` apenas p
 | 2 | Perfis, definições e gestão administrativa básica de contas | **Concluído** |
 | 3 | Alunos, turmas, locais, política de cancelamento | **Concluído** |
 | 4 | Interfaces de modelos, atribuição, ajustes e saldos | **Concluído** — Etapas 1A, 1B, 1C, 1D e 1E validadas com Auth/PostgREST reais e browser desktop/mobile |
-| 5 | Calendário e criação de aulas com reserva | **Parcialmente concluído** — Etapas 5A a 5D.2: disponibilidade, projeção segura, refinamento visual, clubes/membros, calendário partilhado, locais com moradas manuais, campos/salas/áreas, criação/edição de aulas, conflitos atómicos e reserva atómica de créditos. Falta recorrência e ciclo operacional posterior |
+| 5 | Calendário e criação de aulas com reserva | **Parcialmente concluído** — Etapas 5A a 5D.3: disponibilidade, projeção segura, refinamento visual, clubes/membros, calendário partilhado, locais com moradas manuais, campos/salas/áreas, criação/edição de aulas, conflitos atómicos, reserva atómica de créditos e recorrência semanal segura. Falta revisão integrada e ciclo operacional posterior |
 | 6 | Cancelamento, reagendamento, presenças e histórico | **Planeado** |
 | 7 | Área do aluno: aulas, créditos e confirmação | **Planeado** |
 | 8 | Notificações, lembretes e expiração agendada | **Planeado** |
-| 9 | Supabase real, concorrência, acessibilidade e deployment | **Parcialmente concluído** — RLS em PGlite e validação real da Fase 4/Etapas 5A-5D.2 feitos; concorrência real de aulas/créditos coberta, acessibilidade completa e deployment pendentes |
+| 9 | Supabase real, concorrência, acessibilidade e deployment | **Parcialmente concluído** — RLS em PGlite e validação real da Fase 4/Etapas 5A-5D.3 feitos; concorrência real de aulas/créditos/recorrência coberta, acessibilidade completa e deployment pendentes |
 
 **Ao concluir uma fase ou etapa:** `npm run check`, corrigir tudo o que falhe, atualizar `implementation_plan.md`, e resumir o que foi criado e como testar manualmente.
 
