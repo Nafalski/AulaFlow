@@ -265,11 +265,13 @@ export const lessonIdSchema = z.strictObject({
   lessonId: z.preprocess(normalizeRequiredUuid, z.uuid("A aula selecionada é inválida.")),
 });
 
-const formBoolean = z.preprocess(
+const attendanceStatus = z.preprocess(
   (value) => normalizeSingleLine(value),
   z
-    .enum(["true", "false"], { error: "O estado de presença é inválido." })
-    .transform((value) => value === "true"),
+    .enum(["present", "absent", "unconfirmed"], {
+      error: "O estado de presença é inválido.",
+    })
+    .transform((value) => (value === "unconfirmed" ? null : value)),
 );
 
 export const lessonAttendanceSchema = z.strictObject({
@@ -278,26 +280,49 @@ export const lessonAttendanceSchema = z.strictObject({
     normalizeRequiredUuid,
     z.uuid("O participante selecionado é inválido."),
   ),
-  present: formBoolean,
+  attendanceStatus,
 });
 
 export type LessonAttendanceInput = z.infer<typeof lessonAttendanceSchema>;
 
 export const lessonCompleteSchema = lessonIdSchema;
+export const lessonCancelSchema = lessonIdSchema;
+export const lessonParticipantCancelSchema = z.strictObject({
+  lessonId: z.preprocess(normalizeRequiredUuid, z.uuid("A aula selecionada é inválida.")),
+  participantId: z.preprocess(
+    normalizeRequiredUuid,
+    z.uuid("O participante selecionado é inválido."),
+  ),
+});
 
-export const LESSON_ATTENDANCE_FIELDS = ["lessonId", "participantId", "present"] as const;
+export const LESSON_ATTENDANCE_FIELDS = [
+  "lessonId",
+  "participantId",
+  "attendanceStatus",
+] as const;
 export const LESSON_COMPLETE_FIELDS = ["lessonId"] as const;
+export const LESSON_CANCEL_FIELDS = ["lessonId"] as const;
+export const LESSON_PARTICIPANT_CANCEL_FIELDS = ["lessonId", "participantId"] as const;
 
 export function readLessonAttendanceFormData(formData: FormData) {
   return {
     lessonId: formString(formData, "lessonId"),
     participantId: formString(formData, "participantId"),
-    present: formString(formData, "present"),
+    attendanceStatus: formString(formData, "attendanceStatus"),
   };
 }
 
 export function readLessonCompleteFormData(formData: FormData) {
   return {
     lessonId: formString(formData, "lessonId"),
+  };
+}
+
+export const readLessonCancelFormData = readLessonCompleteFormData;
+
+export function readLessonParticipantCancelFormData(formData: FormData) {
+  return {
+    lessonId: formString(formData, "lessonId"),
+    participantId: formString(formData, "participantId"),
   };
 }

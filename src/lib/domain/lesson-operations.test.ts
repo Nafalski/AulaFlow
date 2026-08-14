@@ -8,9 +8,15 @@ import {
   LESSON_COMPLETION_INVALID_RESERVATION_MESSAGE,
   LESSON_COMPLETION_NO_PARTICIPANTS_MESSAGE,
   LESSON_COMPLETION_NOT_ACTIVE_MESSAGE,
+  LESSON_PARTICIPATION_CANCEL_INDIVIDUAL_MESSAGE,
+  LESSON_PARTICIPATION_CANCEL_LAST_MESSAGE,
+  LESSON_PARTICIPATION_CANCEL_STARTED_MESSAGE,
   attendanceDisplayMeta,
+  canCancelLesson,
   canEditLessonAttendance,
+  canMarkLessonAbsence,
   lessonCompletionAvailability,
+  lessonParticipationCancellationAvailability,
   type LessonOperationParticipant,
 } from "./lesson-operations";
 
@@ -22,6 +28,7 @@ function participant(
   extra: Partial<LessonOperationParticipant> = {},
 ): LessonOperationParticipant {
   return {
+    status: "invited",
     attendanceStatus: "present",
     billingStatus: "reserved",
     creditsReserved: 1,
@@ -44,6 +51,13 @@ describe("attendanceDisplayMeta", () => {
       tone: "success",
     });
   });
+
+  it("mostra falta/no-show com o rótulo operacional da 6B", () => {
+    expect(attendanceDisplayMeta("absent")).toMatchObject({
+      label: "Falta",
+      tone: "danger",
+    });
+  });
 });
 
 describe("canEditLessonAttendance", () => {
@@ -63,6 +77,71 @@ describe("canEditLessonAttendance", () => {
     expect(
       canEditLessonAttendance({ lessonStatus: "completed", startsAt: PAST, now: NOW }),
     ).toBe(false);
+  });
+});
+
+describe("canMarkLessonAbsence", () => {
+  it("permite falta apenas depois do fim da aula", () => {
+    expect(canMarkLessonAbsence({ lessonStatus: "scheduled", endsAt: PAST, now: NOW })).toBe(true);
+    expect(canMarkLessonAbsence({ lessonStatus: "scheduled", endsAt: FUTURE, now: NOW })).toBe(
+      false,
+    );
+    expect(canMarkLessonAbsence({ lessonStatus: "completed", endsAt: PAST, now: NOW })).toBe(false);
+  });
+});
+
+describe("cancelamentos operacionais", () => {
+  it("só permite cancelar aulas operacionais", () => {
+    expect(canCancelLesson("scheduled")).toBe(true);
+    expect(canCancelLesson("confirmed")).toBe(true);
+    expect(canCancelLesson("completed")).toBe(false);
+    expect(canCancelLesson("cancelled_by_teacher")).toBe(false);
+  });
+
+  it("permite cancelar participante ativo de turma antes do início", () => {
+    expect(
+      lessonParticipationCancellationAvailability({
+        lessonStatus: "scheduled",
+        startsAt: FUTURE,
+        now: NOW,
+        isGroupLesson: true,
+        activeParticipantCount: 2,
+        participantStatus: "invited",
+      }),
+    ).toEqual({ canCancel: true, message: null });
+  });
+
+  it("recusa cancelamento individual depois do início, em aula individual e no último ativo", () => {
+    expect(
+      lessonParticipationCancellationAvailability({
+        lessonStatus: "scheduled",
+        startsAt: PAST,
+        now: NOW,
+        isGroupLesson: true,
+        activeParticipantCount: 2,
+        participantStatus: "invited",
+      }),
+    ).toMatchObject({ message: LESSON_PARTICIPATION_CANCEL_STARTED_MESSAGE });
+    expect(
+      lessonParticipationCancellationAvailability({
+        lessonStatus: "scheduled",
+        startsAt: FUTURE,
+        now: NOW,
+        isGroupLesson: false,
+        activeParticipantCount: 1,
+        participantStatus: "invited",
+      }),
+    ).toMatchObject({ message: LESSON_PARTICIPATION_CANCEL_INDIVIDUAL_MESSAGE });
+    expect(
+      lessonParticipationCancellationAvailability({
+        lessonStatus: "scheduled",
+        startsAt: FUTURE,
+        now: NOW,
+        isGroupLesson: true,
+        activeParticipantCount: 1,
+        participantStatus: "invited",
+      }),
+    ).toMatchObject({ message: LESSON_PARTICIPATION_CANCEL_LAST_MESSAGE });
   });
 });
 
@@ -110,7 +189,7 @@ describe("lessonCompletionAvailability", () => {
     });
   });
 
-  it("exige todos os participantes com presença confirmada", () => {
+  it("exige todos os participantes ativos com presença ou falta resolvida", () => {
     expect(
       lessonCompletionAvailability({
         lessonStatus: "scheduled",
@@ -122,6 +201,36 @@ describe("lessonCompletionAvailability", () => {
       state: "missing-attendance",
       message: LESSON_COMPLETION_INCOMPLETE_ATTENDANCE_MESSAGE,
     });
+  });
+
+  it("aceita falta como desfecho final antes de consumir na conclusão", () => {
+    expect(
+      lessonCompletionAvailability({
+        lessonStatus: "scheduled",
+        endsAt: PAST,
+        now: NOW,
+        participants: [participant({ attendanceStatus: "absent" })],
+      }),
+    ).toEqual({ state: "ready", canComplete: true, message: null });
+  });
+
+  it("aceita participação cancelada quando a reserva já foi devolvida", () => {
+    expect(
+      lessonCompletionAvailability({
+        lessonStatus: "confirmed",
+        endsAt: PAST,
+        now: NOW,
+        participants: [
+          participant({ attendanceStatus: "present" }),
+          participant({
+            status: "declined",
+            attendanceStatus: null,
+            billingStatus: "released",
+            creditsReserved: 0,
+          }),
+        ],
+      }),
+    ).toEqual({ state: "ready", canComplete: true, message: null });
   });
 
   it("recusa concluir uma aula sem participantes", () => {

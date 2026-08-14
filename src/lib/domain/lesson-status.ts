@@ -121,7 +121,7 @@ export const PARTICIPANT_STATUS_META: Record<
 > = {
   invited: { label: "Por confirmar", tone: "neutral" },
   confirmed: { label: "Confirmado", tone: "success" },
-  declined: { label: "Não vem", tone: "danger" },
+  declined: { label: "Participação cancelada", tone: "danger" },
   removed: { label: "Removido", tone: "warning" },
 };
 
@@ -130,7 +130,7 @@ export const ATTENDANCE_STATUS_META: Record<
   { label: string; tone: StatusTone }
 > = {
   present: { label: "Presente", tone: "success" },
-  absent: { label: "Faltou", tone: "danger" },
+  absent: { label: "Falta", tone: "danger" },
   late: { label: "Atrasado", tone: "warning" },
   excused: { label: "Falta justificada", tone: "neutral" },
 };

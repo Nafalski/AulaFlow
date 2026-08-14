@@ -13,16 +13,22 @@ import { addMinutes, lisbonInputToInstant } from "@/lib/datetime";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import {
   LESSON_ATTENDANCE_FIELDS,
+  LESSON_CANCEL_FIELDS,
   LESSON_CREATE_FIELDS,
   LESSON_COMPLETE_FIELDS,
+  LESSON_PARTICIPANT_CANCEL_FIELDS,
   LESSON_UPDATE_FIELDS,
   lessonAttendanceSchema,
+  lessonCancelSchema,
   lessonCompleteSchema,
   lessonCreateSchema,
+  lessonParticipantCancelSchema,
   lessonUpdateSchema,
   readLessonAttendanceFormData,
+  readLessonCancelFormData,
   readLessonCompleteFormData,
   readLessonCreateFormData,
+  readLessonParticipantCancelFormData,
   readLessonUpdateFormData,
   unexpectedLessonFields,
 } from "@/lib/validation/lessons";
@@ -32,9 +38,6 @@ const CALENDAR_PATH = "/professor/calendario";
 const TEACHER_DASHBOARD_PATH = "/professor";
 const TEACHER_PACKAGES_PATH = "/professor/pacotes";
 const TEACHER_PACKAGE_HISTORY_PATH = "/professor/pacotes/historico";
-const STUDENT_DASHBOARD_PATH = "/aluno";
-const STUDENT_CALENDAR_PATH = "/aluno/calendario";
-const STUDENT_PACKAGES_PATH = "/aluno/pacotes";
 
 /**
  * As RPCs de aulas falam português e podem ser mostradas tal como estão.
@@ -49,7 +52,7 @@ function lessonMessage(message: string | undefined, fallback: string): string {
     return fallback;
   }
 
-  return /disponibilidade|bloqueio|aluno|turma|clube|local|campo|sala|modalidade|permissão|autoriza|ativa|horário|aula|série|crédito|créditos|pacote|saldo|reserva|presença|participante|concluída|concluir/i.test(
+  return /disponibilidade|bloqueio|aluno|turma|clube|local|campo|sala|modalidade|permissão|autoriza|ativa|horário|aula|série|crédito|créditos|pacote|saldo|reserva|presença|falta|cancel|participante|concluída|concluir/i.test(
     raw,
   )
     ? raw
@@ -88,8 +91,22 @@ function lessonWindow(input: { date: string; time: string; durationMinutes: numb
   return { startsAt, endsAt: addMinutes(startsAt, input.durationMinutes) };
 }
 
+/**
+ * Revalida apenas o que o router DESTE utilizador tem em cache.
+ *
+ * Chegou a revalidar-se também `/aluno`, `/aluno/calendario` e
+ * `/aluno/pacotes` — rotas que a sessão do professor nunca visitou. Além de não
+ * servir para nada (não estão na cache deste cliente), obrigava o Next.js a
+ * renderizá-las do lado do servidor como parte da resposta da Action; e
+ * renderizar `/aluno` com sessão de professor bate no guarda de papel e produz
+ * um reencaminhamento a meio da resposta. Em produção isso deixava a segunda
+ * submissão da página sem resolução, e o botão preso em "A marcar…".
+ *
+ * O aluno vê o estado novo porque as páginas dele são `force-dynamic`: leem a
+ * base de dados a cada pedido. A revalidação cruzada nunca foi o que o fazia
+ * funcionar.
+ */
 function revalidateLessons(lessonId?: string) {
-  revalidatePath(LESSONS_PATH);
   revalidatePath(CALENDAR_PATH);
   revalidatePath(TEACHER_DASHBOARD_PATH);
   if (lessonId) revalidatePath(`${LESSONS_PATH}/${lessonId}`);
@@ -97,15 +114,27 @@ function revalidateLessons(lessonId?: string) {
 
 function revalidateLessonOperation(lessonId: string, includePackages = false) {
   revalidateLessons(lessonId);
-  revalidatePath(STUDENT_DASHBOARD_PATH);
-  revalidatePath(STUDENT_CALENDAR_PATH);
 
   if (includePackages) {
     revalidatePath(TEACHER_PACKAGES_PATH);
     revalidatePath(TEACHER_PACKAGE_HISTORY_PATH);
-    revalidatePath(STUDENT_PACKAGES_PATH);
   }
 }
+
+/**
+ * Porque é que estas operações NÃO redirecionam.
+ *
+ * Chegaram a fazer `redirect()` para a própria aula com um sufixo `?atualizado=`
+ * variável, para forçar o router a recarregar. Era desnecessário e custava caro:
+ * o Next.js 16 já inclui uma nova renderização da rota atual na MESMA resposta
+ * da Action quando ela chama `revalidatePath()` — e uma Action que redireciona
+ * nunca devolve estado, pelo que `useActionState` ficava sem resolução e o
+ * botão permanecia em "A cancelar…" mesmo depois de a mutação ter sido
+ * confirmada no PostgreSQL.
+ *
+ * Devolver um estado serializável fecha o ciclo: o pending termina, a página
+ * já vem repintada com o estado persistido, e o URL fica limpo.
+ */
 
 export async function createLessonAction(
   _previousState: TeacherManagementActionState,
@@ -239,6 +268,20 @@ export async function updateLessonAction(
   }
 }
 
+/** Presença, falta e "não confirmado" partilham a Action mas não a mensagem. */
+function attendanceSuccessMessage(
+  status: "present" | "absent" | null,
+  unchanged: boolean,
+): string {
+  if (status === "present") {
+    return unchanged ? "Já estava marcado como presente." : "Presença registada.";
+  }
+  if (status === "absent") {
+    return unchanged ? "Já estava marcado como falta." : "Falta registada.";
+  }
+  return unchanged ? "Já estava por confirmar." : "Presença por confirmar.";
+}
+
 export async function setLessonAttendanceAction(
   _previousState: TeacherManagementActionState,
   formData: FormData,
@@ -256,10 +299,10 @@ export async function setLessonAttendanceAction(
 
   try {
     const supabase = await createSupabaseServerClient();
-    const { data, error } = await supabase.rpc("set_lesson_attendance", {
+    const { data, error } = await supabase.rpc("set_lesson_attendance_status", {
       p_lesson_id: parsed.data.lessonId,
       p_lesson_participant_id: parsed.data.participantId,
-      p_present: parsed.data.present,
+      p_attendance_status: parsed.data.attendanceStatus,
     });
 
     if (error) {
@@ -272,23 +315,104 @@ export async function setLessonAttendanceAction(
 
     revalidateLessonOperation(parsed.data.lessonId);
 
-    if (data === false) {
-      return {
-        status: "success",
-        message: parsed.data.present
-          ? "A presença já estava confirmada."
-          : "A presença já estava por confirmar.",
-      };
-    }
-
     return {
       status: "success",
-      message: parsed.data.present
-        ? "Presença confirmada."
-        : "Presença voltou a ficar por confirmar.",
+      message: attendanceSuccessMessage(parsed.data.attendanceStatus, data === false),
     };
   } catch (error) {
     return persistenceState("Erro inesperado ao registar presença.", error);
+  }
+}
+
+export async function cancelLessonAction(
+  _previousState: TeacherManagementActionState,
+  formData: FormData,
+): Promise<TeacherManagementActionState> {
+  void _previousState;
+
+  const extraFields = unexpectedLessonFields(formData, LESSON_CANCEL_FIELDS);
+  if (extraFields.length > 0) return unexpectedFieldsState(extraFields);
+
+  const parsed = lessonCancelSchema.safeParse(readLessonCancelFormData(formData));
+  if (!parsed.success) return validationState(parsed.error);
+
+  const authorization = await authorizeActiveTeacher();
+  if (authorization.state) return authorization.state;
+
+  try {
+    const supabase = await createSupabaseServerClient();
+    const { data, error } = await supabase.rpc("cancel_lesson", {
+      p_lesson_id: parsed.data.lessonId,
+    });
+
+    if (error) {
+      return persistenceState(
+        "Falha ao cancelar aula.",
+        error,
+        lessonMessage(error.message, "Não foi possível cancelar a aula. Tente novamente."),
+      );
+    }
+
+    revalidateLessonOperation(parsed.data.lessonId, true);
+
+    return {
+      status: "success",
+      message:
+        data === false
+          ? "Esta aula já estava cancelada."
+          : "Aula cancelada. Os créditos reservados foram devolvidos.",
+    };
+  } catch (error) {
+    return persistenceState("Erro inesperado ao cancelar aula.", error);
+  }
+}
+
+export async function cancelLessonParticipantAction(
+  _previousState: TeacherManagementActionState,
+  formData: FormData,
+): Promise<TeacherManagementActionState> {
+  void _previousState;
+
+  const extraFields = unexpectedLessonFields(formData, LESSON_PARTICIPANT_CANCEL_FIELDS);
+  if (extraFields.length > 0) return unexpectedFieldsState(extraFields);
+
+  const parsed = lessonParticipantCancelSchema.safeParse(
+    readLessonParticipantCancelFormData(formData),
+  );
+  if (!parsed.success) return validationState(parsed.error);
+
+  const authorization = await authorizeActiveTeacher();
+  if (authorization.state) return authorization.state;
+
+  try {
+    const supabase = await createSupabaseServerClient();
+    const { data, error } = await supabase.rpc("cancel_lesson_participation", {
+      p_lesson_id: parsed.data.lessonId,
+      p_lesson_participant_id: parsed.data.participantId,
+    });
+
+    if (error) {
+      return persistenceState(
+        "Falha ao cancelar participação.",
+        error,
+        lessonMessage(
+          error.message,
+          "Não foi possível cancelar esta participação. Tente novamente.",
+        ),
+      );
+    }
+
+    revalidateLessonOperation(parsed.data.lessonId, true);
+
+    return {
+      status: "success",
+      message:
+        data === false
+          ? "Esta participação já estava cancelada."
+          : "Participação cancelada. O crédito reservado foi devolvido.",
+    };
+  } catch (error) {
+    return persistenceState("Erro inesperado ao cancelar participação.", error);
   }
 }
 
@@ -327,8 +451,8 @@ export async function completeLessonAction(
       status: "success",
       message:
         data === false
-          ? "Esta aula já está concluída."
-          : "Aula concluída. O crédito reservado foi marcado como utilizado.",
+          ? "Esta aula já estava concluída."
+          : "Aula concluída. Os créditos reservados passaram a utilizados.",
     };
   } catch (error) {
     return persistenceState("Erro inesperado ao concluir aula.", error);

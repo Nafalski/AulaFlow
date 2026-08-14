@@ -388,7 +388,20 @@ async function createLesson({ title = "Aula", start = "2026-09-10 17:00+00", cos
   );
 }
 
+async function markLessonParticipantsPresentFixture(id) {
+  await db.query(
+    `insert into public.attendance (lesson_id, student_id, status, marked_by)
+     select participant.lesson_id, participant.student_id, 'present', $2
+       from public.lesson_participants participant
+      where participant.lesson_id = $1
+        and participant.status not in ('removed', 'declined')
+     on conflict (lesson_id, student_id) do nothing`,
+    [id, TEACHER_UID],
+  );
+}
+
 async function completeLesson(id) {
+  await markLessonParticipantsPresentFixture(id);
   await db.query(`update public.lessons set status='completed', completed_at=now() where id=$1`, [id]);
 }
 
@@ -7780,6 +7793,7 @@ check(
   Boolean(exactBreakLesson.id),
   "o limite exato do intervalo mínimo é aceite",
 );
+await markLessonParticipantsPresentFixture(exactBreakLesson.id);
 await db.query(`update public.lessons set status='completed', completed_at=now() where id=$1`, [
   exactBreakLesson.id,
 ]);
@@ -7799,6 +7813,7 @@ check(
   Boolean(overlapsCompletedLesson.id),
   "aula concluída deixa de bloquear novas marcações",
 );
+await markLessonParticipantsPresentFixture(overlapsCompletedLesson.id);
 await db.query(`update public.lessons set status='completed', completed_at=now() where id=$1`, [
   overlapsCompletedLesson.id,
 ]);
@@ -8807,13 +8822,22 @@ await asDatabaseRole("authenticated", TEACHER_UID, () =>
 
 section("Presença e conclusão de aulas (Fase 6A)");
 
-const createOperationalLesson = ({ title, startOffset, endOffset, groupId = null }) =>
+const createOperationalLesson = ({
+  title,
+  startOffset,
+  endOffset,
+  groupId = null,
+  locationId = null,
+  resourceId = null,
+}) =>
   one(
     `insert into public.lessons
-       (organization_id, teacher_id, sport_id, title, starts_at, ends_at, group_id, credit_cost)
-     values ($1,$2,$3,$4, now() + $5::interval, now() + $6::interval, $7::uuid, 1)
+       (organization_id, teacher_id, sport_id, title, starts_at, ends_at,
+        group_id, location_id, location_resource_id, credit_cost)
+     values ($1,$2,$3,$4, now() + $5::interval, now() + $6::interval,
+             $7::uuid, $8::uuid, $9::uuid, 1)
      returning id`,
-    [org, teacher.id, sport, title, startOffset, endOffset, groupId],
+    [org, teacher.id, sport, title, startOffset, endOffset, groupId, locationId, resourceId],
   );
 
 const reserveParticipant = (lessonId, studentId, packageId) =>
@@ -8830,9 +8854,30 @@ const setAttendanceAs = (uid, lessonId, participantId, present = true) =>
     ),
   );
 
+const setAttendanceStatusAs = (uid, lessonId, participantId, status) =>
+  asDatabaseRole("authenticated", uid, () =>
+    one(
+      `select public.set_lesson_attendance_status($1,$2,$3::public.attendance_status) as changed`,
+      [lessonId, participantId, status],
+    ),
+  );
+
 const completeLessonAs = (uid, lessonId) =>
   asDatabaseRole("authenticated", uid, () =>
     one(`select public.complete_lesson($1) as changed`, [lessonId]),
+  );
+
+const cancelLessonRpcAs = (uid, lessonId) =>
+  asDatabaseRole("authenticated", uid, () =>
+    one(`select public.cancel_lesson($1) as changed`, [lessonId]),
+  );
+
+const cancelLessonParticipationAs = (uid, lessonId, participantId) =>
+  asDatabaseRole("authenticated", uid, () =>
+    one(`select public.cancel_lesson_participation($1,$2) as changed`, [
+      lessonId,
+      participantId,
+    ]),
   );
 
 const futureAttendanceLesson = await createOperationalLesson({
@@ -9320,6 +9365,653 @@ await mustReject("cliente não altera presença diretamente", () =>
   ),
 );
 
+// ── Cancelamento, participação cancelada e falta/no-show (Fase 6B) ──────────
+
+section("Cancelamento, participação cancelada e falta/no-show (Fase 6B)");
+
+const phase6bCarla = await one(
+  `insert into public.student_profiles (organization_id, created_by_teacher_id, full_name, email)
+   values ($1,$2,'Carla Fase 6B','carla.6b@exemplo.pt') returning id`,
+  [org, teacher.id],
+);
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select public.add_group_member($1,$2) as id`, [managedGroup.id, phase6bCarla.id]),
+);
+const phase6bAnaPack = await assignPackageAs(TEACHER_UID, {
+  student: ana.id,
+  name: "Pacote Ana 6B",
+  credits: 60,
+  sportId: sport,
+  starts: "2026-01-01",
+  expires: "2028-12-31",
+});
+const phase6bBrunoPack = await assignPackageAs(TEACHER_UID, {
+  student: bruno.id,
+  name: "Pacote Bruno 6B",
+  credits: 60,
+  sportId: sport,
+  starts: "2026-01-01",
+  expires: "2028-12-31",
+});
+const phase6bCarlaPack = await assignPackageAs(TEACHER_UID, {
+  student: phase6bCarla.id,
+  name: "Pacote Carla 6B",
+  credits: 60,
+  sportId: sport,
+  starts: "2026-01-01",
+  expires: "2028-12-31",
+});
+
+const cancelWholeLesson = await createOperationalLesson({
+  title: "Cancelamento aula 6B",
+  startOffset: "30 days",
+  endOffset: "30 days 1 hour",
+  locationId: managedLocation.id,
+  resourceId: court1.id,
+});
+const cancelWholeParticipant = await reserveParticipant(
+  cancelWholeLesson.id,
+  ana.id,
+  phase6bAnaPack.id,
+);
+const cancelWholePackBefore = await pkg(phase6bAnaPack.id);
+const cancelWholeLedgerBefore = await one(
+  `select count(*)::int as total
+     from public.package_credit_transactions
+    where lesson_id=$1 and type='reservation_released'`,
+  [cancelWholeLesson.id],
+);
+const cancelWholeResult = await cancelLessonRpcAs(TEACHER_UID, cancelWholeLesson.id);
+const cancelWholeAgain = await cancelLessonRpcAs(TEACHER_UID, cancelWholeLesson.id);
+const cancelWholePackAfter = await pkg(phase6bAnaPack.id);
+const cancelWholeState = await one(
+  `select lesson.status::text as lesson_status,
+          lesson.cancelled_at is not null as has_cancelled_at,
+          participant.billing_status::text as billing_status,
+          participant.credits_reserved,
+          participant.credits_consumed
+     from public.lessons lesson
+     join public.lesson_participants participant on participant.lesson_id = lesson.id
+    where participant.id=$1`,
+  [cancelWholeParticipant.id],
+);
+const cancelWholeLedgerAfter = await one(
+  `select count(*)::int as total
+     from public.package_credit_transactions
+    where lesson_id=$1 and type='reservation_released'`,
+  [cancelWholeLesson.id],
+);
+check(
+  cancelWholeResult.changed === true &&
+    cancelWholeAgain.changed === false &&
+    cancelWholeState.lesson_status === "cancelled_by_teacher" &&
+    cancelWholeState.has_cancelled_at === true,
+  "cancelar aula muda o estado uma vez e repetir é no-op",
+);
+check(
+  cancelWholeState.billing_status === "released" &&
+    cancelWholeState.credits_reserved === 0 &&
+    cancelWholeState.credits_consumed === 0 &&
+    cancelWholePackAfter.credits_available === cancelWholePackBefore.credits_available + 1 &&
+    cancelWholePackAfter.credits_reserved === cancelWholePackBefore.credits_reserved - 1 &&
+    cancelWholePackAfter.credits_used === cancelWholePackBefore.credits_used &&
+    Number(cancelWholeLedgerAfter.total) === Number(cancelWholeLedgerBefore.total) + 1,
+  "cancelar aula devolve exatamente uma reserva ao disponível",
+);
+const resourceAfterCancel = await createOperationalLesson({
+  title: "Recurso liberado por cancelamento 6B",
+  startOffset: "30 days",
+  endOffset: "30 days 1 hour",
+  locationId: managedLocation.id,
+  resourceId: court1.id,
+});
+check(Boolean(resourceAfterCancel.id), "aula cancelada deixa de bloquear o recurso e o intervalo");
+
+const cancelCompletedLesson = await createOperationalLesson({
+  title: "Cancelamento de concluída 6B",
+  startOffset: "-33 days",
+  endOffset: "-33 days 1 hour",
+});
+const cancelCompletedParticipant = await reserveParticipant(
+  cancelCompletedLesson.id,
+  ana.id,
+  phase6bAnaPack.id,
+);
+await setAttendanceAs(TEACHER_UID, cancelCompletedLesson.id, cancelCompletedParticipant.id, true);
+await completeLessonAs(TEACHER_UID, cancelCompletedLesson.id);
+await mustReject("aula concluída não pode ser cancelada", () =>
+  cancelLessonRpcAs(TEACHER_UID, cancelCompletedLesson.id),
+  "concluída",
+);
+
+const cancelWithAttendanceLesson = await createOperationalLesson({
+  title: "Cancelamento com presença 6B",
+  startOffset: "-34 days",
+  endOffset: "-34 days 1 hour",
+});
+const cancelWithAttendanceParticipant = await reserveParticipant(
+  cancelWithAttendanceLesson.id,
+  ana.id,
+  phase6bAnaPack.id,
+);
+await setAttendanceAs(
+  TEACHER_UID,
+  cancelWithAttendanceLesson.id,
+  cancelWithAttendanceParticipant.id,
+  true,
+);
+await mustReject(
+  "cancelar aula com presença/falta marcada é bloqueado",
+  () => cancelLessonRpcAs(TEACHER_UID, cancelWithAttendanceLesson.id),
+  "presença/falta",
+);
+
+const groupParticipantCancelLesson = await createOperationalLesson({
+  title: "Cancelamento de participante 6B",
+  startOffset: "32 days",
+  endOffset: "32 days 1 hour",
+  groupId: managedGroup.id,
+});
+const groupCancelAnaParticipant = await reserveParticipant(
+  groupParticipantCancelLesson.id,
+  ana.id,
+  phase6bAnaPack.id,
+);
+const groupCancelBrunoParticipant = await reserveParticipant(
+  groupParticipantCancelLesson.id,
+  bruno.id,
+  phase6bBrunoPack.id,
+);
+const groupCancelBrunoBefore = await pkg(phase6bBrunoPack.id);
+const cancelParticipationResult = await cancelLessonParticipationAs(
+  TEACHER_UID,
+  groupParticipantCancelLesson.id,
+  groupCancelBrunoParticipant.id,
+);
+const cancelParticipationAgain = await cancelLessonParticipationAs(
+  TEACHER_UID,
+  groupParticipantCancelLesson.id,
+  groupCancelBrunoParticipant.id,
+);
+const groupCancelBrunoAfter = await pkg(phase6bBrunoPack.id);
+const groupParticipantStates = await rows(
+  `select id, status::text, billing_status::text, credits_reserved, credits_consumed
+     from public.lesson_participants
+    where id = any($1::uuid[])
+    order by id`,
+  [[groupCancelAnaParticipant.id, groupCancelBrunoParticipant.id]],
+);
+const groupParticipantLessonAfter = await one(
+  `select status::text as status from public.lessons where id=$1`,
+  [groupParticipantCancelLesson.id],
+);
+const groupParticipantCountProjection = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(`select participant_count from public.teacher_lesson_schedule_records where id=$1`, [
+    groupParticipantCancelLesson.id,
+  ]),
+);
+check(
+  cancelParticipationResult.changed === true &&
+    cancelParticipationAgain.changed === false &&
+    groupParticipantLessonAfter.status === "scheduled" &&
+    groupParticipantCountProjection.participant_count === 1,
+  "cancelar participante de turma mantém a aula ativa e atualiza a contagem operacional",
+);
+check(
+  groupParticipantStates.some(
+    (row) =>
+      row.id === groupCancelBrunoParticipant.id &&
+      row.status === "declined" &&
+      row.billing_status === "released" &&
+      row.credits_reserved === 0 &&
+      row.credits_consumed === 0,
+  ) &&
+    groupParticipantStates.some(
+      (row) =>
+        row.id === groupCancelAnaParticipant.id &&
+        row.status !== "declined" &&
+        row.billing_status === "reserved" &&
+        row.credits_reserved === 1,
+    ) &&
+    groupCancelBrunoAfter.credits_available === groupCancelBrunoBefore.credits_available + 1 &&
+    groupCancelBrunoAfter.credits_reserved === groupCancelBrunoBefore.credits_reserved - 1,
+  "cancelar participante devolve só o crédito desse aluno",
+);
+await mustReject(
+  "último participante ativo não pode ser cancelado individualmente",
+  () =>
+    cancelLessonParticipationAs(
+      TEACHER_UID,
+      groupParticipantCancelLesson.id,
+      groupCancelAnaParticipant.id,
+    ),
+  "último participante",
+);
+
+const individualParticipantCancelLesson = await createOperationalLesson({
+  title: "Cancelamento individual indevido 6B",
+  startOffset: "33 days",
+  endOffset: "33 days 1 hour",
+});
+const individualParticipantCancelParticipant = await reserveParticipant(
+  individualParticipantCancelLesson.id,
+  ana.id,
+  phase6bAnaPack.id,
+);
+await mustReject(
+  "aula individual exige cancelar a aula inteira",
+  () =>
+    cancelLessonParticipationAs(
+      TEACHER_UID,
+      individualParticipantCancelLesson.id,
+      individualParticipantCancelParticipant.id,
+    ),
+  "aula inteira",
+);
+
+const groupCancelAfterStartLesson = await createOperationalLesson({
+  title: "Cancelamento depois do início 6B",
+  startOffset: "-35 days",
+  endOffset: "-35 days 1 hour",
+  groupId: managedGroup.id,
+});
+const groupCancelAfterStartAna = await reserveParticipant(
+  groupCancelAfterStartLesson.id,
+  ana.id,
+  phase6bAnaPack.id,
+);
+const groupCancelAfterStartBruno = await reserveParticipant(
+  groupCancelAfterStartLesson.id,
+  bruno.id,
+  phase6bBrunoPack.id,
+);
+await mustReject(
+  "participação só cancela antes do início",
+  () =>
+    cancelLessonParticipationAs(
+      TEACHER_UID,
+      groupCancelAfterStartLesson.id,
+      groupCancelAfterStartBruno.id,
+    ),
+  "antes do início",
+);
+
+await mustReject(
+  "falta antes do fim da aula é recusada",
+  () =>
+    setAttendanceStatusAs(
+      TEACHER_UID,
+      runningLesson.id,
+      runningParticipant.id,
+      "absent",
+    ),
+  "horário previsto",
+);
+
+const noShowLesson = await createOperationalLesson({
+  title: "No-show individual 6B",
+  startOffset: "-36 days",
+  endOffset: "-36 days 1 hour",
+});
+const noShowParticipant = await reserveParticipant(noShowLesson.id, ana.id, phase6bAnaPack.id);
+const noShowPackBefore = await pkg(phase6bAnaPack.id);
+const noShowMarked = await setAttendanceStatusAs(
+  TEACHER_UID,
+  noShowLesson.id,
+  noShowParticipant.id,
+  "absent",
+);
+const noShowPackMarked = await pkg(phase6bAnaPack.id);
+const noShowAttendance = await one(
+  `select status::text from public.attendance where lesson_id=$1 and student_id=$2`,
+  [noShowLesson.id, ana.id],
+);
+check(
+  noShowMarked.changed === true &&
+    noShowAttendance.status === "absent" &&
+    noShowPackMarked.credits_available === noShowPackBefore.credits_available &&
+    noShowPackMarked.credits_reserved === noShowPackBefore.credits_reserved,
+  "marcar falta/no-show não movimenta crédito antes da conclusão",
+);
+const noShowCompleted = await completeLessonAs(TEACHER_UID, noShowLesson.id);
+const noShowPackAfter = await pkg(phase6bAnaPack.id);
+const noShowParticipantAfter = await one(
+  `select billing_status::text, credits_reserved, credits_consumed
+     from public.lesson_participants where id=$1`,
+  [noShowParticipant.id],
+);
+check(
+  noShowCompleted.changed === true &&
+    noShowParticipantAfter.billing_status === "consumed" &&
+    noShowParticipantAfter.credits_reserved === 0 &&
+    noShowParticipantAfter.credits_consumed === 1 &&
+    noShowPackAfter.credits_reserved === noShowPackMarked.credits_reserved - 1 &&
+    noShowPackAfter.credits_used === noShowPackMarked.credits_used + 1,
+  "concluir com falta/no-show consome a reserva",
+);
+
+const absenceCorrectionLesson = await createOperationalLesson({
+  title: "Correção de falta 6B",
+  startOffset: "-37 days",
+  endOffset: "-37 days 1 hour",
+});
+const absenceCorrectionParticipant = await reserveParticipant(
+  absenceCorrectionLesson.id,
+  ana.id,
+  phase6bAnaPack.id,
+);
+await setAttendanceStatusAs(
+  TEACHER_UID,
+  absenceCorrectionLesson.id,
+  absenceCorrectionParticipant.id,
+  "absent",
+);
+const absenceCorrectedToPresent = await setAttendanceStatusAs(
+  TEACHER_UID,
+  absenceCorrectionLesson.id,
+  absenceCorrectionParticipant.id,
+  "present",
+);
+const absenceCleared = await setAttendanceStatusAs(
+  TEACHER_UID,
+  absenceCorrectionLesson.id,
+  absenceCorrectionParticipant.id,
+  null,
+);
+const absenceCorrectionRows = await one(
+  `select count(*)::int as total from public.attendance where lesson_id=$1`,
+  [absenceCorrectionLesson.id],
+);
+const absenceCorrectionParticipantAfter = await one(
+  `select billing_status::text, credits_reserved, credits_consumed
+     from public.lesson_participants where id=$1`,
+  [absenceCorrectionParticipant.id],
+);
+check(
+  absenceCorrectedToPresent.changed === true &&
+    absenceCleared.changed === true &&
+    Number(absenceCorrectionRows.total) === 0 &&
+    absenceCorrectionParticipantAfter.billing_status === "reserved" &&
+    absenceCorrectionParticipantAfter.credits_reserved === 1,
+  "falta pode ser corrigida para presente ou não confirmado antes da conclusão sem movimento financeiro",
+);
+
+const mixedGroupLesson = await createOperationalLesson({
+  title: "Turma mista 6B",
+  startOffset: "36 days",
+  endOffset: "36 days 1 hour",
+  groupId: managedGroup.id,
+});
+const mixedAnaParticipant = await reserveParticipant(mixedGroupLesson.id, ana.id, phase6bAnaPack.id);
+const mixedBrunoParticipant = await reserveParticipant(
+  mixedGroupLesson.id,
+  bruno.id,
+  phase6bBrunoPack.id,
+);
+const mixedCarlaParticipant = await reserveParticipant(
+  mixedGroupLesson.id,
+  phase6bCarla.id,
+  phase6bCarlaPack.id,
+);
+await cancelLessonParticipationAs(TEACHER_UID, mixedGroupLesson.id, mixedCarlaParticipant.id);
+await db.query(
+  `update public.lessons
+      set starts_at = now() + '-38 days'::interval,
+          ends_at = now() + '-38 days 1 hour'::interval
+    where id=$1`,
+  [mixedGroupLesson.id],
+);
+await setAttendanceStatusAs(TEACHER_UID, mixedGroupLesson.id, mixedAnaParticipant.id, "present");
+await setAttendanceStatusAs(TEACHER_UID, mixedGroupLesson.id, mixedBrunoParticipant.id, "absent");
+const mixedLedgerBefore = await one(
+  `select count(*)::int as total
+     from public.package_credit_transactions
+    where lesson_id=$1 and type='credit_consumed'`,
+  [mixedGroupLesson.id],
+);
+const mixedCompleted = await completeLessonAs(TEACHER_UID, mixedGroupLesson.id);
+const mixedLedgerAfter = await one(
+  `select count(*)::int as total
+     from public.package_credit_transactions
+    where lesson_id=$1 and type='credit_consumed'`,
+  [mixedGroupLesson.id],
+);
+const mixedStates = await rows(
+  `select id, status::text, billing_status::text, credits_reserved, credits_consumed
+     from public.lesson_participants
+    where id = any($1::uuid[])
+    order by id`,
+  [[mixedAnaParticipant.id, mixedBrunoParticipant.id, mixedCarlaParticipant.id]],
+);
+check(
+  mixedCompleted.changed === true &&
+    Number(mixedLedgerAfter.total) === Number(mixedLedgerBefore.total) + 2 &&
+    mixedStates.some(
+      (row) =>
+        row.id === mixedAnaParticipant.id &&
+        row.billing_status === "consumed" &&
+        row.credits_consumed === 1,
+    ) &&
+    mixedStates.some(
+      (row) =>
+        row.id === mixedBrunoParticipant.id &&
+        row.billing_status === "consumed" &&
+        row.credits_consumed === 1,
+    ) &&
+    mixedStates.some(
+      (row) =>
+        row.id === mixedCarlaParticipant.id &&
+        row.status === "declined" &&
+        row.billing_status === "released" &&
+        row.credits_consumed === 0,
+    ),
+  "turma mista consome presentes e faltas, mantendo cancelado sem novo movimento",
+);
+
+const unresolvedGroupLesson = await createOperationalLesson({
+  title: "Turma por resolver 6B",
+  startOffset: "-39 days",
+  endOffset: "-39 days 1 hour",
+  groupId: managedGroup.id,
+});
+const unresolvedAnaParticipant = await reserveParticipant(
+  unresolvedGroupLesson.id,
+  ana.id,
+  phase6bAnaPack.id,
+);
+await reserveParticipant(
+  unresolvedGroupLesson.id,
+  bruno.id,
+  phase6bBrunoPack.id,
+);
+await setAttendanceStatusAs(
+  TEACHER_UID,
+  unresolvedGroupLesson.id,
+  unresolvedAnaParticipant.id,
+  "present",
+);
+const unresolvedAnaBefore = await pkg(phase6bAnaPack.id);
+const unresolvedBrunoBefore = await pkg(phase6bBrunoPack.id);
+await mustReject(
+  "participante sem desfecho bloqueia conclusão",
+  () => completeLessonAs(TEACHER_UID, unresolvedGroupLesson.id),
+  "presença ou falta",
+);
+const unresolvedAnaAfter = await pkg(phase6bAnaPack.id);
+const unresolvedBrunoAfter = await pkg(phase6bBrunoPack.id);
+check(
+  unresolvedAnaAfter.credits_reserved === unresolvedAnaBefore.credits_reserved &&
+    unresolvedBrunoAfter.credits_reserved === unresolvedBrunoBefore.credits_reserved,
+  "conclusão recusada por participante não resolvido não consome ninguém",
+);
+
+const recurrenceCancelGroup = randomUUID();
+const recurringCancelLessons = await rows(
+  `insert into public.lessons
+     (organization_id, teacher_id, sport_id, title, starts_at, ends_at,
+      is_recurring, recurrence_group_id, recurrence_rule, credit_cost)
+   values
+     ($1,$2,$3,'Recorrente 6B 1', now() + '70 days'::interval,
+      now() + '70 days 1 hour'::interval, true, $4,
+      jsonb_build_object('frequency','weekly','interval_weeks',1,'occurrence_index',1,'occurrence_count',3), 1),
+     ($1,$2,$3,'Recorrente 6B 2', now() + '77 days'::interval,
+      now() + '77 days 1 hour'::interval, true, $4,
+      jsonb_build_object('frequency','weekly','interval_weeks',1,'occurrence_index',2,'occurrence_count',3), 1),
+     ($1,$2,$3,'Recorrente 6B 3', now() + '84 days'::interval,
+      now() + '84 days 1 hour'::interval, true, $4,
+      jsonb_build_object('frequency','weekly','interval_weeks',1,'occurrence_index',3,'occurrence_count',3), 1)
+   returning id, starts_at`,
+  [org, teacher.id, sport, recurrenceCancelGroup],
+);
+const recurringCancelIds = recurringCancelLessons
+  .sort((a, b) => new Date(a.starts_at).getTime() - new Date(b.starts_at).getTime())
+  .map((row) => row.id);
+for (const recurringCancelId of recurringCancelIds) {
+  await reserveParticipant(recurringCancelId, ana.id, phase6bAnaPack.id);
+}
+const recurringCancelPackBefore = await pkg(phase6bAnaPack.id);
+const recurringSecondParticipant = await one(
+  `select id from public.lesson_participants where lesson_id=$1`,
+  [recurringCancelIds[1]],
+);
+await cancelLessonRpcAs(TEACHER_UID, recurringCancelIds[1]);
+const recurringCancelPackAfter = await pkg(phase6bAnaPack.id);
+const recurringCancelStates = await rows(
+  `select lesson.id, lesson.status::text as lesson_status,
+          participant.billing_status::text as billing_status,
+          participant.credits_reserved
+     from public.lessons lesson
+     join public.lesson_participants participant on participant.lesson_id = lesson.id
+    where lesson.id = any($1::uuid[])
+    order by lesson.starts_at`,
+  [recurringCancelIds],
+);
+check(
+  recurringCancelStates[1].lesson_status === "cancelled_by_teacher" &&
+    recurringCancelStates[1].billing_status === "released" &&
+    recurringCancelStates[1].credits_reserved === 0 &&
+    recurringCancelStates[0].lesson_status === "scheduled" &&
+    recurringCancelStates[0].billing_status === "reserved" &&
+    recurringCancelStates[2].lesson_status === "scheduled" &&
+    recurringCancelStates[2].billing_status === "reserved" &&
+    recurringCancelPackAfter.credits_reserved === recurringCancelPackBefore.credits_reserved - 1,
+  "cancelar uma ocorrência recorrente devolve só essa reserva e não toca nas restantes",
+);
+check(Boolean(recurringSecondParticipant.id), "ocorrência recorrente cancelada mantém participante histórico");
+
+await mustReject("outro professor não cancela aula alheia", () =>
+  cancelLessonRpcAs(OTHER_TEACHER_UID, missingAttendanceLesson.id),
+);
+await mustReject("aluno não cancela aula por RPC", () =>
+  cancelLessonRpcAs(ANA_UID, missingAttendanceLesson.id),
+);
+await mustReject("admin não cancela aula operacional", () =>
+  cancelLessonRpcAs(ADMIN_UID, missingAttendanceLesson.id),
+);
+await mustReject("anónimo não cancela aula", () =>
+  asDatabaseRole("anon", null, () => db.query(`select public.cancel_lesson($1)`, [
+    missingAttendanceLesson.id,
+  ])),
+);
+await mustReject("outro professor não cancela participação alheia", () =>
+  cancelLessonParticipationAs(
+    OTHER_TEACHER_UID,
+    groupCancelAfterStartLesson.id,
+    groupCancelAfterStartAna.id,
+  ),
+);
+await mustReject("aluno não cancela participação por RPC", () =>
+  cancelLessonParticipationAs(
+    ANA_UID,
+    groupCancelAfterStartLesson.id,
+    groupCancelAfterStartAna.id,
+  ),
+);
+await mustReject("admin não cancela participação operacional", () =>
+  cancelLessonParticipationAs(
+    ADMIN_UID,
+    groupCancelAfterStartLesson.id,
+    groupCancelAfterStartAna.id,
+  ),
+);
+await mustReject("anónimo não cancela participação", () =>
+  asDatabaseRole("anon", null, () =>
+    db.query(`select public.cancel_lesson_participation($1,$2)`, [
+      groupCancelAfterStartLesson.id,
+      groupCancelAfterStartAna.id,
+    ]),
+  ),
+);
+await mustReject("outro professor não marca falta em aula alheia", () =>
+  setAttendanceStatusAs(
+    OTHER_TEACHER_UID,
+    missingAttendanceLesson.id,
+    missingAttendanceParticipant.id,
+    "absent",
+  ),
+);
+await mustReject("aluno não marca falta", () =>
+  setAttendanceStatusAs(ANA_UID, missingAttendanceLesson.id, missingAttendanceParticipant.id, "absent"),
+);
+await mustReject("admin não marca falta operacional", () =>
+  setAttendanceStatusAs(
+    ADMIN_UID,
+    missingAttendanceLesson.id,
+    missingAttendanceParticipant.id,
+    "absent",
+  ),
+);
+await mustReject("anónimo não marca falta", () =>
+  asDatabaseRole("anon", null, () =>
+    db.query(`select public.set_lesson_attendance_status($1,$2,'absent')`, [
+      missingAttendanceLesson.id,
+      missingAttendanceParticipant.id,
+    ]),
+  ),
+);
+
+const blockedParticipantLesson = await createOperationalLesson({
+  title: "Bloqueado cancela participação 6B",
+  startOffset: "34 days",
+  endOffset: "34 days 1 hour",
+  groupId: managedGroup.id,
+});
+const blockedParticipantAna = await reserveParticipant(
+  blockedParticipantLesson.id,
+  ana.id,
+  phase6bAnaPack.id,
+);
+const blockedParticipantBruno = await reserveParticipant(
+  blockedParticipantLesson.id,
+  bruno.id,
+  phase6bBrunoPack.id,
+);
+await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  db.query(`select public.admin_set_account_status($1,'blocked','Teste 6B')`, [TEACHER_UID]),
+);
+await mustReject("conta bloqueada não cancela aula", () =>
+  cancelLessonRpcAs(TEACHER_UID, missingAttendanceLesson.id),
+);
+await mustReject("conta bloqueada não cancela participação", () =>
+  cancelLessonParticipationAs(
+    TEACHER_UID,
+    blockedParticipantLesson.id,
+    blockedParticipantBruno.id,
+  ),
+);
+await mustReject("conta bloqueada não marca falta", () =>
+  setAttendanceStatusAs(
+    TEACHER_UID,
+    missingAttendanceLesson.id,
+    missingAttendanceParticipant.id,
+    "absent",
+  ),
+);
+await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  db.query(`select public.admin_set_account_status($1,'active',null)`, [TEACHER_UID]),
+);
+check(Boolean(blockedParticipantAna.id), "fixture de bloqueio preserva participantes sem operar a aula");
+
 // ── Aluno, turma e modalidade ───────────────────────────────────────────────
 
 await mustReject("aluno de outra organização", () =>
@@ -9521,6 +10213,7 @@ await mustReject("editar com recurso de outro local", () =>
   editLesson(TEACHER_UID, { resourceId: clubCourt1.id }),
 );
 
+await markLessonParticipantsPresentFixture(contiguousLesson.id);
 await db.query(
   `update public.lessons set status='completed', completed_at=now() where id=$1`,
   [contiguousLesson.id],
@@ -9756,12 +10449,14 @@ const lessonFunctionAnon = await rows(
      join pg_namespace ns on ns.oid = proc.pronamespace
     where ns.nspname='public'
       and proc.proname in ('create_lesson','create_recurring_lessons','update_lesson',
-                           'set_lesson_attendance','complete_lesson',
+                           'set_lesson_attendance','set_lesson_attendance_status',
+                           'cancel_lesson','cancel_lesson_participation','complete_lesson',
                            'can_schedule_at_location','stable_uuid_from_text',
                            'lock_lesson_creation_intention','create_lesson_occurrence',
                            'lesson_fits_teacher_availability','validate_lesson_scope',
                            'lesson_blocks_conflicts','lock_lesson_conflict_scopes',
-                           'ensure_lesson_has_no_conflict')
+                           'ensure_lesson_has_no_conflict',
+                           'ensure_attendance_matches_active_participant')
       and has_function_privilege('anon', proc.oid, 'EXECUTE')`,
 );
 check(lessonFunctionAnon.length === 0, "anon não executa nenhuma função de aulas");
@@ -9771,12 +10466,13 @@ const lessonAuthenticatedPublicFunctions = await rows(
      join pg_namespace ns on ns.oid = proc.pronamespace
     where ns.nspname='public'
       and proc.proname in ('create_lesson','create_recurring_lessons','update_lesson',
-                           'set_lesson_attendance','complete_lesson')
+                           'set_lesson_attendance','set_lesson_attendance_status',
+                           'cancel_lesson','cancel_lesson_participation','complete_lesson')
       and has_function_privilege('authenticated', proc.oid, 'EXECUTE')`,
 );
 check(
-  new Set(lessonAuthenticatedPublicFunctions.map((row) => row.proname)).size === 5,
-  "authenticated executa as RPCs públicas de aula única, série, edição, presença e conclusão",
+  new Set(lessonAuthenticatedPublicFunctions.map((row) => row.proname)).size === 8,
+  "authenticated executa as RPCs públicas de aula única, série, edição, presença, cancelamento e conclusão",
 );
 
 const lessonInternalFunctions = await rows(
@@ -9787,7 +10483,8 @@ const lessonInternalFunctions = await rows(
                            'stable_uuid_from_text','lock_lesson_creation_intention',
                            'create_lesson_occurrence',
                            'lesson_blocks_conflicts','lock_lesson_conflict_scopes',
-                           'ensure_lesson_has_no_conflict')
+                           'ensure_lesson_has_no_conflict',
+                           'ensure_attendance_matches_active_participant')
       and has_function_privilege('authenticated', proc.oid, 'EXECUTE')`,
 );
 check(
@@ -9800,12 +10497,14 @@ const lessonSearchPath = await rows(
      join pg_namespace ns on ns.oid = proc.pronamespace
     where ns.nspname='public'
       and proc.proname in ('create_lesson','create_recurring_lessons','update_lesson',
-                           'set_lesson_attendance','complete_lesson',
+                           'set_lesson_attendance','set_lesson_attendance_status',
+                           'cancel_lesson','cancel_lesson_participation','complete_lesson',
                            'can_schedule_at_location','stable_uuid_from_text',
                            'lock_lesson_creation_intention','create_lesson_occurrence',
                            'lesson_fits_teacher_availability','validate_lesson_scope',
                            'lesson_blocks_conflicts','lock_lesson_conflict_scopes',
-                           'ensure_lesson_has_no_conflict')
+                           'ensure_lesson_has_no_conflict',
+                           'ensure_attendance_matches_active_participant')
       and not exists (
         select 1 from unnest(coalesce(proc.proconfig, array[]::text[])) as config
         where config like 'search_path=%'
@@ -9947,6 +10646,38 @@ check(
   `participações concluídas ainda reservadas: ${completedReservedParticipants.map((row) => row.id).join(", ")}`,
 );
 
+const cancelledLessonReservations = await rows(
+  `select participant.id
+     from public.lesson_participants participant
+     join public.lessons lesson on lesson.id = participant.lesson_id
+    where lesson.status in ('cancelled_by_teacher', 'cancelled_by_student')
+      and participant.billing_status = 'reserved'`,
+);
+check(
+  cancelledLessonReservations.length === 0,
+  "aula cancelada não mantém participantes com crédito reservado",
+  `participações em aula cancelada ainda reservadas: ${cancelledLessonReservations
+    .map((row) => row.id)
+    .join(", ")}`,
+);
+
+const declinedParticipantReservations = await rows(
+  `select participant.id
+     from public.lesson_participants participant
+    where participant.status = 'declined'
+      and (
+        participant.billing_status = 'reserved'
+        or participant.credits_reserved <> 0
+      )`,
+);
+check(
+  declinedParticipantReservations.length === 0,
+  "participação cancelada não mantém reserva ativa",
+  `participações canceladas ainda reservadas: ${declinedParticipantReservations
+    .map((row) => row.id)
+    .join(", ")}`,
+);
+
 const consumedWithoutLedger = await rows(
   `select participant.id
      from public.lesson_participants participant
@@ -9981,6 +10712,41 @@ check(
   attendanceWithoutParticipant.length === 0,
   "presença só existe para participantes materializados da aula",
   `presenças sem participante: ${attendanceWithoutParticipant.map((row) => row.id).join(", ")}`,
+);
+
+const attendanceForCancelledParticipants = await rows(
+  `select attendance.id
+     from public.attendance attendance
+     join public.lesson_participants participant
+       on participant.lesson_id = attendance.lesson_id
+      and participant.student_id = attendance.student_id
+    where participant.status in ('declined', 'removed')`,
+);
+check(
+  attendanceForCancelledParticipants.length === 0,
+  "participação cancelada/removida não tem presença nem falta registada",
+  `presenças ligadas a participação cancelada: ${attendanceForCancelledParticipants
+    .map((row) => row.id)
+    .join(", ")}`,
+);
+
+const completedUnresolvedParticipants = await rows(
+  `select participant.id
+     from public.lesson_participants participant
+     join public.lessons lesson on lesson.id = participant.lesson_id
+     left join public.attendance attendance
+       on attendance.lesson_id = participant.lesson_id
+      and attendance.student_id = participant.student_id
+    where lesson.status = 'completed'
+      and participant.status not in ('removed', 'declined')
+      and coalesce(attendance.status::text, '') not in ('present', 'absent')`,
+);
+check(
+  completedUnresolvedParticipants.length === 0,
+  "aula concluída não mantém participante operacional sem presença ou falta",
+  `participantes concluídos sem desfecho: ${completedUnresolvedParticipants
+    .map((row) => row.id)
+    .join(", ")}`,
 );
 
 const createdLessonParticipantDrift = await rows(

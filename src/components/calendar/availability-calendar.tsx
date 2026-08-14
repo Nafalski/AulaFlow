@@ -30,7 +30,7 @@ import {
   type CalendarWindow,
 } from "@/lib/domain/calendar";
 import { categoryLabel, timeRangeLabel, type TimeSlot } from "@/lib/domain/availability";
-import { LESSON_STATUS_META } from "@/lib/domain/lesson-status";
+import { LESSON_STATUS_META, isCancelledStatus } from "@/lib/domain/lesson-status";
 import {
   formatDayMonth,
   formatFullDate,
@@ -261,6 +261,10 @@ function itemClasses(item: AvailabilityCalendarItem, audience: CalendarAudience)
   // Preenchimento sólido: uma aula é um compromisso, e tem de se distinguir à
   // primeira vista dos tons suaves que descrevem apenas disponibilidade.
   if (kind === "lesson") {
+    if (item.lesson && isCancelledStatus(item.lesson.status)) {
+      return "border-state-danger/30 bg-state-danger-soft text-state-danger";
+    }
+
     if (item.lesson?.status === "completed") {
       return "border-state-success/35 bg-state-success-soft text-state-success";
     }
@@ -290,6 +294,10 @@ function ItemIcon({ item, audience }: { item: AvailabilityCalendarItem; audience
       : "availability";
 
   if (kind === "lesson") {
+    if (item.lesson && isCancelledStatus(item.lesson.status)) {
+      return <Ban className="size-4 shrink-0" aria-hidden="true" />;
+    }
+
     if (item.lesson?.status === "completed") {
       return <Flag className="size-4 shrink-0" aria-hidden="true" />;
     }

@@ -16,6 +16,7 @@
     "db:verify:remote": "node scripts/verify-remote-supabase.mjs",
     "db:setup:e2e": "node scripts/setup-remote-test-users.mjs",
     "db:verify:auth": "node scripts/verify-remote-auth.mjs",
+    "e2e:browser": "node scripts/browser-e2e.mjs",
     "icons": "node scripts/generate-icons.mjs",
     "check": "npm run lint && npm run typecheck && npm run test && npm run db:verify && npm run build",
     "db:types": "npx --yes supabase gen types typescript --linked > src/types/database.ts",
@@ -44,6 +45,7 @@
     "@types/react-dom": "^19.2.0",
     "eslint": "^9.39.0",
     "eslint-config-next": "16.2.12",
+    "playwright-core": "^1.62.1",
     "tailwindcss": "^4.3.3",
     "typescript": "^5.9.3",
     "vitest": "^4.1.10"

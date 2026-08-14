@@ -5,8 +5,9 @@ Professores configuram alunos, pacotes, disponibilidade, locais e aulas; os alun
 
 A começar pelo **beach tennis**, com arquitetura preparada para outras modalidades.
 
-> **Estado:** Fases 1, 1.5, 2, 3, 4 e 5 concluídas. A Fase 6A acrescenta presença e conclusão segura da aula: o professor confirma presenças, conclui a aula terminada e os créditos reservados passam a utilizados de forma atómica.
-> Cancelamento, falta/no-show, libertação de créditos, reagendamento operacional, notificações, pagamentos e transferência/fusão de pacotes continuam nas etapas seguintes.
+> **Estado:** Fases 1, 1.5, 2, 3, 4 e 5 concluídas. A Fase 6A acrescentou presença e conclusão segura da aula; a Fase 6B acrescenta cancelamento de aula, cancelamento de participação em turma e falta/no-show com destino financeiro seguro.
+> A 6B está funcionalmente completa e validada, mas **ainda não fechada**: na build de produção a primeira Server Action a seguir a um carregamento de página pode ficar em pending, embora a mutação seja gravada. Ver `implementation_plan.md`.
+> Reagendamento operacional, self-service de cancelamento do aluno, política configurável de janelas, notificações, pagamentos e transferência/fusão de pacotes continuam nas etapas seguintes.
 
 ---
 
@@ -43,8 +44,9 @@ Instruções completas — incluindo a configuração do Supabase — em [`AGENT
 - Ao criar uma aula, o Supabase seleciona um pacote válido e reserva créditos na mesma transação; em turma, se algum aluno não tiver saldo, a criação inteira é desfeita
 - Criação de séries semanais de 2 a 12 aulas, sempre por hora civil `Europe/Lisbon`: a hora local é preservada ao atravessar mudança de horário, cada ocorrência é uma aula real, e qualquer falha de disponibilidade, conflito ou crédito desfaz a série inteira
 - Aulas de turma fixam os alunos no momento da criação: alterar a turma depois não altera quem estava previsto
-- Presença e conclusão em `/professor/aulas/[id]`: só o professor responsável marca participantes como presentes depois do início, conclui depois do fim e converte reservas válidas em créditos utilizados; turma é tudo-ou-nada
-- Aulas concluídas continuam no calendário do professor e do aluno, com estado próprio; o aluno vê hora, professor, modalidade, local, campo, a própria presença e o próprio estado de crédito, nunca os colegas, a turma, o custo, o ID do pacote ou saldos internos
+- Presença, falta/no-show, conclusão e cancelamento em `/professor/aulas/[id]`: só o professor responsável opera a aula, marca presença depois do início, marca falta depois do fim, cancela a aula inteira, cancela participação de turma antes do início e conclui depois do fim; turma é tudo-ou-nada
+- Aula cancelada pelo professor e participação de turma cancelada devolvem reservas (`reserved -> available`); presença e falta/no-show consomem na conclusão (`reserved -> used`); participante não confirmado bloqueia conclusão
+- Aulas concluídas e canceladas continuam no calendário do professor e do aluno, com estado próprio; o aluno vê hora, professor, modalidade, local, campo, a própria presença/falta/participação e o próprio estado de crédito, nunca os colegas, a turma, o custo, o ID do pacote ou saldos internos
 - Política de cancelamento do professor com fallback da organização
 - Gestão de modelos reutilizáveis de pacotes pelo professor, com pesquisa, filtros, criação, edição, ativação/desativação e duplicação
 - Atribuição de pacotes a alunos ativos pelo professor, a partir de modelo ou pacote personalizado, com snapshot, origem administrativa e idempotência
@@ -61,24 +63,24 @@ Instruções completas — incluindo a configuração do Supabase — em [`AGENT
 - RPCs seguras de disponibilidade: professor vê detalhes dos próprios bloqueios; aluno não recebe motivo, categoria, fonte interna, organização nem `teacher_id`
 - Diretório administrativo com pesquisa, filtros, detalhe e bloqueio/reativação auditados
 - Proteção de rotas por tipo de conta e revogação de acesso para contas bloqueadas
-- Esquema atual da base de dados: 29 tabelas, Row Level Security em todas; aulas, participantes, presença e conclusão escritos apenas por RPC, com trigger de conflitos na tabela `lessons`, reserva de créditos na criação e consumo de créditos na conclusão
+- Esquema atual da base de dados: 29 tabelas, Row Level Security em todas; aulas, participantes, presença, falta, cancelamento e conclusão escritos apenas por RPC, com trigger de conflitos na tabela `lessons`, reserva de créditos na criação, devolução no cancelamento e consumo na conclusão
 - Pacotes, saldos disponíveis/reservados/utilizados e livro-razão append-only
 - RPCs PostgreSQL para atribuir, reservar, consumir, libertar, reagendar, ajustar e corrigir créditos
 - RPCs PostgreSQL para guardar preferências, horários semanais, exceções, bloqueios e resolução segura de disponibilidade
 - Regras e validação com testes de unidade/regressão para domínio, Zod, interface e mensagens
-- Verificações PostgreSQL sobre migrações, permissões, RLS, gestão, claim, modelos, atribuição, consulta, ajustes administrativos, disponibilidade, calendário seguro, clubes, memberships, locais, recursos, criação/edição de aulas, conflitos, reserva, recorrência, presença, conclusão, ledger, grants e saldos
-- Verificações Auth/PostgREST reais no Supabase de desenvolvimento, incluindo concorrência de conclusão e privacidade das projeções
+- Verificações PostgreSQL sobre migrações, permissões, RLS, gestão, claim, modelos, atribuição, consulta, ajustes administrativos, disponibilidade, calendário seguro, clubes, memberships, locais, recursos, criação/edição de aulas, conflitos, reserva, recorrência, presença, falta/no-show, cancelamento, conclusão, ledger, grants e saldos
+- Verificações Auth/PostgREST reais no Supabase de desenvolvimento, incluindo concorrência de conclusão/cancelamento e privacidade das projeções
 - Estrutura responsiva das áreas de professor, aluno e administração, com manifesto e ícones PWA
 
 `/professor/clubes` gere contextos, clubes e membros; `/professor/clubes/[id]/calendario` mostra a disponibilidade partilhada do clube; `/professor/convites` mostra os convites recebidos. `/professor/pacotes` gere modelos reutilizáveis, atribuição, consulta e ajustes administrativos dos pacotes atribuídos. `/professor/pacotes/historico` mostra a auditoria global. `/professor/definicoes/disponibilidade` guarda a fonte de verdade da agenda do professor. `/professor/calendario` e `/aluno/calendario` mostram disponibilidade e aulas em Dia/Semana/Mês. `/aluno/pacotes` mostra apenas os próprios pacotes e movimentos básicos.
 
-O próximo passo planeado é a Fase 6B: cancelamento, ausência/no-show e destino seguro dos créditos. O professor independente continua totalmente suportado, com workspace pessoal privado e agenda própria, e não precisa criar clube nenhum.
+O próximo passo planeado é a Fase 6C: reagendamento operacional seguro. O professor independente continua totalmente suportado, com workspace pessoal privado e agenda própria, e não precisa criar clube nenhum.
 
 Entrar num clube **não** partilha a agenda: `calendar_sharing_enabled` nasce desativado e só o próprio membro o altera — proprietários, gestores e a administração da plataforma não têm caminho para forçar a partilha de outra pessoa. Os locais e os seus campos já são partilhados com o clube; alunos, pacotes, turmas e disponibilidade continuam ligados ao workspace pessoal, e a interface diz isso explicitamente em vez de o esconder.
 
-Criar ou editar uma aula impede sobreposição de aulas ativas do professor, respeita o intervalo mínimo e impede duas aulas no mesmo campo/sala ao mesmo horário. Ao criar, os créditos ficam reservados; ao editar horário/local/recurso, a reserva é mantida e a validade do pacote é revalidada quando a data muda. Depois do início, o professor pode confirmar presença; depois do fim, pode concluir a aula se todos os participantes estiverem presentes e com reserva válida, movendo `reserved` para `used` exatamente uma vez. Numa série semanal, editar ou concluir a página de uma aula altera apenas aquela ocorrência; não existe ainda edição/cancelamento de série inteira.
+Criar ou editar uma aula impede sobreposição de aulas ativas do professor, respeita o intervalo mínimo e impede duas aulas no mesmo campo/sala ao mesmo horário. Ao criar, os créditos ficam reservados; ao editar horário/local/recurso, a reserva é mantida e a validade do pacote é revalidada quando a data muda. Depois do início, o professor pode confirmar presença; depois do fim, pode marcar falta/no-show e concluir a aula quando todos os participantes ativos tiverem desfecho. Cancelar aula ou participação de turma devolve reservas; concluir presença ou falta consome reservas exatamente uma vez. Numa série semanal, editar, concluir ou cancelar a página de uma aula altera apenas aquela ocorrência; não existe ainda edição/cancelamento de série inteira.
 
-Na 6A não há decisão financeira para ausência: um participante sem presença confirmada bloqueia a conclusão. Não existe ainda cancelamento operacional, no-show, libertação de crédito, reagendamento semântico, notificações nem pagamentos.
+Ainda não existe política configurável de cancelamento, janela de 12h/24h, cancelamento self-service do aluno, reativação de participação cancelada, reagendamento semântico, notificações nem pagamentos.
 
 Sem um bucket de Storage configurado, os avatares usam iniciais. Preparar a ligação de um aluno ainda não envia email sem um Supabase remoto; a interface identifica essa limitação. As preferências de email ficam guardadas, mas a entrega automática e os lembretes agendados pertencem à Fase 8.
 

@@ -286,6 +286,7 @@ const expectedFunctions = [
   "lesson_blocks_conflicts",
   "lock_lesson_conflict_scopes",
   "ensure_lesson_has_no_conflict",
+  "ensure_attendance_matches_active_participant",
   "stable_uuid_from_text",
   "lock_lesson_creation_intention",
   "create_lesson_occurrence",
@@ -293,6 +294,9 @@ const expectedFunctions = [
   "create_recurring_lessons",
   "update_lesson",
   "set_lesson_attendance",
+  "set_lesson_attendance_status",
+  "cancel_lesson",
+  "cancel_lesson_participation",
   "complete_lesson",
 ];
 
@@ -348,6 +352,9 @@ const authenticatedRpc = [
   "create_recurring_lessons",
   "update_lesson",
   "set_lesson_attendance",
+  "set_lesson_attendance_status",
+  "cancel_lesson",
+  "cancel_lesson_participation",
   "complete_lesson",
 ];
 
@@ -374,6 +381,7 @@ const internalFunctions = [
   "lesson_blocks_conflicts",
   "lock_lesson_conflict_scopes",
   "ensure_lesson_has_no_conflict",
+  "ensure_attendance_matches_active_participant",
   "stable_uuid_from_text",
   "lock_lesson_creation_intention",
   "create_lesson_occurrence",
@@ -1071,6 +1079,13 @@ checks as (
       from information_schema.columns
       where table_schema = 'public'
         and table_name = 'student_lesson_records'
+        and column_name = 'participation_status'
+    )
+    and exists (
+      select 1
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'student_lesson_records'
         and column_name = 'attendance_status'
     )
     and exists (
@@ -1147,7 +1162,7 @@ checks as (
   union all
   select
     'estrutura',
-    'a projecao financeira do professor inclui presenca e credito por participante',
+    'a projecao financeira do professor inclui presenca, cancelamento e credito por participante',
     exists (
       select 1
       from information_schema.columns
@@ -1175,6 +1190,13 @@ checks as (
       where table_schema = 'public'
         and table_name = 'teacher_lesson_participant_credit_records'
         and column_name = 'lesson_participant_id'
+    )
+    and exists (
+      select 1
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'teacher_lesson_participant_credit_records'
+        and column_name = 'declined_at'
     )
     and exists (
       select 1

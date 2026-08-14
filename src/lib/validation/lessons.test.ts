@@ -3,15 +3,21 @@ import { describe, expect, it } from "vitest";
 import {
   LESSON_CREATE_FIELDS,
   LESSON_ATTENDANCE_FIELDS,
+  LESSON_CANCEL_FIELDS,
   LESSON_COMPLETE_FIELDS,
+  LESSON_PARTICIPANT_CANCEL_FIELDS,
+  lessonCancelSchema,
   lessonCreateSchema,
   lessonAttendanceSchema,
   lessonCompleteSchema,
   lessonIdSchema,
+  lessonParticipantCancelSchema,
   lessonUpdateSchema,
   readLessonAttendanceFormData,
+  readLessonCancelFormData,
   readLessonCompleteFormData,
   readLessonCreateFormData,
+  readLessonParticipantCancelFormData,
   unexpectedLessonFields,
 } from "./lessons";
 
@@ -268,36 +274,43 @@ describe("lessonIdSchema", () => {
 });
 
 describe("lessonAttendanceSchema", () => {
-  it("aceita marcar e retirar presença", () => {
+  it("aceita presente, falta e não confirmado", () => {
     expect(
       lessonAttendanceSchema.parse({
         lessonId: LESSON,
         participantId: PARTICIPANT,
-        present: "true",
+        attendanceStatus: "present",
       }),
-    ).toEqual({ lessonId: LESSON, participantId: PARTICIPANT, present: true });
+    ).toEqual({ lessonId: LESSON, participantId: PARTICIPANT, attendanceStatus: "present" });
     expect(
       lessonAttendanceSchema.parse({
         lessonId: LESSON,
         participantId: PARTICIPANT,
-        present: "false",
+        attendanceStatus: "absent",
       }),
-    ).toEqual({ lessonId: LESSON, participantId: PARTICIPANT, present: false });
+    ).toEqual({ lessonId: LESSON, participantId: PARTICIPANT, attendanceStatus: "absent" });
+    expect(
+      lessonAttendanceSchema.parse({
+        lessonId: LESSON,
+        participantId: PARTICIPANT,
+        attendanceStatus: "unconfirmed",
+      }),
+    ).toEqual({ lessonId: LESSON, participantId: PARTICIPANT, attendanceStatus: null });
   });
 
-  it("recusa participantes e booleanos forjados", () => {
+  it("recusa participantes e estados forjados", () => {
     expect(
       lessonAttendanceSchema.safeParse({
         lessonId: LESSON,
         participantId: "participante",
-        present: "true",
+        attendanceStatus: "present",
       }).success,
     ).toBe(false);
     expect(
       lessonAttendanceSchema.safeParse({
         lessonId: LESSON,
         participantId: PARTICIPANT,
-        present: "sim",
+        attendanceStatus: "late",
       }).success,
     ).toBe(false);
   });
@@ -307,6 +320,28 @@ describe("lessonCompleteSchema", () => {
   it("aceita apenas o identificador da aula", () => {
     expect(lessonCompleteSchema.parse({ lessonId: LESSON })).toEqual({ lessonId: LESSON });
     expect(lessonCompleteSchema.safeParse({ lessonId: "aula-1" }).success).toBe(false);
+  });
+});
+
+describe("lessonCancelSchema", () => {
+  it("aceita apenas o identificador da aula", () => {
+    expect(lessonCancelSchema.parse({ lessonId: LESSON })).toEqual({ lessonId: LESSON });
+    expect(lessonCancelSchema.safeParse({ lessonId: "aula-1" }).success).toBe(false);
+  });
+});
+
+describe("lessonParticipantCancelSchema", () => {
+  it("aceita apenas aula e participante", () => {
+    expect(
+      lessonParticipantCancelSchema.parse({ lessonId: LESSON, participantId: PARTICIPANT }),
+    ).toEqual({ lessonId: LESSON, participantId: PARTICIPANT });
+    expect(
+      lessonParticipantCancelSchema.safeParse({
+        lessonId: LESSON,
+        participantId: PARTICIPANT,
+        credits: "10",
+      }).success,
+    ).toBe(false);
   });
 });
 
@@ -335,13 +370,13 @@ describe("leitura do FormData", () => {
     const formData = new FormData();
     formData.set("lessonId", LESSON);
     formData.set("participantId", PARTICIPANT);
-    formData.set("present", "true");
+    formData.set("attendanceStatus", "absent");
     formData.set("studentPackageId", "forjado");
 
     expect(readLessonAttendanceFormData(formData)).toEqual({
       lessonId: LESSON,
       participantId: PARTICIPANT,
-      present: "true",
+      attendanceStatus: "absent",
     });
     expect(unexpectedLessonFields(formData, LESSON_ATTENDANCE_FIELDS)).toEqual([
       "studentPackageId",
@@ -358,6 +393,36 @@ describe("leitura do FormData", () => {
     expect(unexpectedLessonFields(formData, LESSON_COMPLETE_FIELDS)).toEqual([
       "studentPackageId",
       "creditsConsumed",
+    ]);
+  });
+
+  it("lê cancelamento de aula sem aceitar estado ou créditos do browser", () => {
+    const formData = new FormData();
+    formData.set("lessonId", LESSON);
+    formData.set("status", "cancelled_by_teacher");
+    formData.set("creditsReleased", "99");
+
+    expect(readLessonCancelFormData(formData)).toEqual({ lessonId: LESSON });
+    expect(unexpectedLessonFields(formData, LESSON_CANCEL_FIELDS)).toEqual([
+      "status",
+      "creditsReleased",
+    ]);
+  });
+
+  it("lê cancelamento de participação sem aceitar pacote ou quantidade", () => {
+    const formData = new FormData();
+    formData.set("lessonId", LESSON);
+    formData.set("participantId", PARTICIPANT);
+    formData.set("studentPackageId", "forjado");
+    formData.set("credits", "99");
+
+    expect(readLessonParticipantCancelFormData(formData)).toEqual({
+      lessonId: LESSON,
+      participantId: PARTICIPANT,
+    });
+    expect(unexpectedLessonFields(formData, LESSON_PARTICIPANT_CANCEL_FIELDS)).toEqual([
+      "studentPackageId",
+      "credits",
     ]);
   });
 });

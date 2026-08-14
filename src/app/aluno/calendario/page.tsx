@@ -10,6 +10,7 @@ import { Card } from "@/components/ui/card";
 import { requireRole } from "@/lib/auth/session";
 import { lisbonDateKey, lisbonDayRange } from "@/lib/datetime";
 import { lessonCalendarSlot, recurringLessonLabel } from "@/lib/domain/lesson-scheduling";
+import { PARTICIPANT_STATUS_META } from "@/lib/domain/lesson-status";
 import { BILLING_STATUS_META } from "@/lib/domain/packages";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import {
@@ -105,7 +106,7 @@ export default async function StudentCalendarPage({
     // aula de outro, e não tem colegas, turma, IDs de pacote nem custo.
     supabase
       .from("student_lesson_records")
-      .select("id, title, starts_at, ends_at, status, billing_status, package_name, sport_name, location_name, is_group_lesson, is_recurring, recurrence_frequency, recurrence_occurrence_index, recurrence_occurrence_count")
+      .select("id, title, starts_at, ends_at, status, participation_status, attendance_status, billing_status, package_name, sport_name, location_name, is_group_lesson, is_recurring, recurrence_frequency, recurrence_occurrence_index, recurrence_occurrence_count")
       .gte("starts_at", windowStart.toISOString())
       .lt("starts_at", windowEnd.toISOString())
       .order("starts_at"),
@@ -118,6 +119,16 @@ export default async function StudentCalendarPage({
   const lessonItems: AvailabilityCalendarItem[] = (lessonsResult.data ?? []).map((lesson) => {
     const slot = lessonCalendarSlot(lesson.starts_at, lesson.ends_at);
     const billingLabel = BILLING_STATUS_META[lesson.billing_status].label;
+    const participationLabel =
+      lesson.participation_status === "declined"
+        ? PARTICIPANT_STATUS_META[lesson.participation_status].label
+        : null;
+    const attendanceLabel =
+      lesson.attendance_status === "absent"
+        ? "Falta"
+        : lesson.attendance_status === "present"
+          ? "Presente"
+          : null;
     const recurrenceLabel = recurringLessonLabel({
       isRecurring: lesson.is_recurring,
       frequency: lesson.recurrence_frequency,
@@ -135,7 +146,15 @@ export default async function StudentCalendarPage({
         status: lesson.status,
         // Modalidade, local e o próprio estado de crédito — nunca colegas nem IDs internos.
         subtitle:
-          [lesson.sport_name, lesson.location_name, billingLabel, lesson.package_name, recurrenceLabel]
+          [
+            lesson.sport_name,
+            lesson.location_name,
+            participationLabel,
+            attendanceLabel,
+            billingLabel,
+            lesson.package_name,
+            recurrenceLabel,
+          ]
             .filter(Boolean)
             .join(" · ") || null,
         href: null,

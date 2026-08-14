@@ -46,12 +46,12 @@ export default async function LessonDetailPage({ params }: { params: Promise<{ i
     await Promise.all([
       supabase
         .from("teacher_lesson_schedule_records")
-        .select("id, title, starts_at, ends_at, duration_minutes, status, context_kind, club_organization_id, club_name, sport_name, location_id, location_name, location_resource_id, location_resource_name, group_name, notes_for_students, private_notes, participant_count, credit_cost, is_recurring, recurrence_frequency, recurrence_occurrence_index, recurrence_occurrence_count")
+        .select("id, title, starts_at, ends_at, duration_minutes, status, context_kind, club_organization_id, club_name, sport_name, location_id, location_name, location_resource_id, location_resource_name, group_id, group_name, notes_for_students, private_notes, participant_count, credit_cost, is_recurring, recurrence_frequency, recurrence_occurrence_index, recurrence_occurrence_count")
         .eq("id", parsed.data.lessonId)
         .maybeSingle(),
       supabase
         .from("teacher_lesson_participant_credit_records")
-        .select("lesson_participant_id, student_id, full_name, status, attendance_status, attendance_marked_at, billing_status, credits_reserved, credits_consumed, package_name, package_sport_name, is_exception")
+        .select("lesson_participant_id, student_id, full_name, status, declined_at, attendance_status, attendance_marked_at, billing_status, credits_reserved, credits_consumed, package_name, package_sport_name, is_exception")
         .eq("lesson_id", parsed.data.lessonId),
       supabase
         .from("teacher_location_records")
@@ -197,11 +197,14 @@ export default async function LessonDetailPage({ params }: { params: Promise<{ i
             startsAt={lesson.starts_at}
             endsAt={lesson.ends_at}
             now={new Date().toISOString()}
+            isGroupLesson={Boolean(lesson.group_id)}
+            isRecurring={lesson.is_recurring}
             participants={participants.map((participant) => ({
               lessonParticipantId: participant.lesson_participant_id,
               studentId: participant.student_id,
               fullName: participant.full_name,
               status: participant.status,
+              declinedAt: participant.declined_at,
               attendanceStatus: participant.attendance_status,
               attendanceMarkedAt: participant.attendance_marked_at,
               billingStatus: participant.billing_status,

@@ -162,7 +162,8 @@ update public.profiles set role = 'admin' where email = 'voce@exemplo.pt';
 │   ├── ..._phase5d1_lesson_conflicts.sql Etapa 5D.1: conflitos atómicos de professor e recurso
 │   ├── ..._phase5d2_lesson_credit_reservation.sql Etapa 5D.2: reserva atómica de créditos da aula
 │   ├── ..._phase5d3_weekly_lesson_recurrence.sql Etapa 5D.3: recorrência semanal segura
-│   └── ..._phase6a_lesson_completion.sql Fase 6A: presença e conclusão segura
+│   ├── ..._phase6a_lesson_completion.sql Fase 6A: presença e conclusão segura
+│   └── ..._phase6b_lesson_cancellations.sql Fase 6B: cancelamentos, faltas e créditos
 │
 └── src/
     ├── proxy.ts             Renova a sessão e protege rotas (era middleware.ts)
@@ -360,9 +361,9 @@ View: `teacher_location_resource_records` — é o contrato que a Etapa 5C vai c
 
 **Não implementado nesta camada de inventário:** disponibilidade/horário/reserva visual de recurso, créditos e notificações. Aulas existem na 5C, e a colisão real de recurso é validada só ao criar/editar aulas na 5D.1.
 
-### Criação, edição, conflitos, créditos, recorrência e conclusão de aulas (Etapas 5C, 5D.1, 5D.2, 5D.3 e 6A)
+### Criação, edição, conflitos, créditos, recorrência, conclusão e cancelamento de aulas (Etapas 5C, 5D.1, 5D.2, 5D.3, 6A e 6B)
 
-As aulas existem no esquema desde a Fase 1, mas só a 5C lhes deu um caminho de escrita real. A 5D.1 acrescenta a garantia transacional de conflitos de professor e recurso. A 5D.2 liga a aula ao ciclo financeiro: `create_lesson()` materializa participantes, seleciona pacote válido e reserva créditos na mesma transação. A 5D.3 acrescenta séries semanais seguras através de `create_recurring_lessons()`. A 6A permite operar a aula que aconteceu: `set_lesson_attendance()` confirma presença e `complete_lesson()` conclui a ocorrência, consumindo créditos reservados.
+As aulas existem no esquema desde a Fase 1, mas só a 5C lhes deu um caminho de escrita real. A 5D.1 acrescenta a garantia transacional de conflitos de professor e recurso. A 5D.2 liga a aula ao ciclo financeiro: `create_lesson()` materializa participantes, seleciona pacote válido e reserva créditos na mesma transação. A 5D.3 acrescenta séries semanais seguras através de `create_recurring_lessons()`. A 6A permite operar a aula que aconteceu: `set_lesson_attendance()` confirma presença e `complete_lesson()` conclui a ocorrência. A 6B acrescenta `cancel_lesson()`, `cancel_lesson_participation()` e `set_lesson_attendance_status()` para cancelamento, falta/no-show e devolução ou consumo seguro dos créditos.
 
 **Nunca escrever "campo livre", "vaga garantida" ou "crédito garantido" antes da submissão.** O banco impede sobreposição e reserva créditos no momento de gravar, mas a interface não deve apresentar disponibilidade futura como garantia absoluta antes da submissão. `LESSON_CONFLICT_PROTECTION_NOTICE` em `lib/domain/lesson-scheduling.ts` é o texto de limite do produto e está sob teste.
 
@@ -382,8 +383,11 @@ As aulas existem no esquema desde a Fase 1, mas só a 5C lhes deu um caminho de 
 | Clube ativo e membership | `create_lesson()` |
 | Seleção de pacote, saldo e validade | `select_package_for_student()` + `reserve_participation_credits()` |
 | Recorrência semanal segura | `create_recurring_lessons()` + `create_lesson_occurrence()` interna |
-| Presença depois do início | `set_lesson_attendance()` |
-| Conclusão depois do fim e consumo atómico | `complete_lesson()` + `consume_participation_credits()` |
+| Presença depois do início | `set_lesson_attendance_status(..., 'present')` (`set_lesson_attendance()` é wrapper legado) |
+| Falta/no-show depois do fim | `set_lesson_attendance_status(..., 'absent')` |
+| Cancelamento da aula inteira | `cancel_lesson()` + `release_participation_credits()` |
+| Cancelamento de participação em turma antes do início | `cancel_lesson_participation()` + `release_participation_credits()` |
+| Conclusão depois do fim e consumo atómico de presentes/faltas | `complete_lesson()` + `consume_participation_credits()` |
 
 `lesson_fits_teacher_availability()` reutiliza `resolve_teacher_availability_windows()` e `resolve_teacher_block_segments()` da 5B.2B — não duplicar a precedência nem a conversão de fuso. Funde períodos contíguos: uma aula das 12:30 às 13:30 cabe em `09:00–12:00` + `12:00–15:00`. Um intervalo real (o espaço entre `09:00–13:00` e `15:00–20:00`) continua a recusar. É **interna**: expô-la deixaria um professor sondar a agenda de outro por tentativa e erro.
 
@@ -405,19 +409,23 @@ As aulas existem no esquema desde a Fase 1, mas só a 5C lhes deu um caminho de 
 
 Cada ocorrência é editada como aula individual. Alterar a turma depois de criar uma série não muda os participantes já materializados, e cada ocorrência pode escolher um pacote diferente se a validade/saldo assim exigir.
 
-**Presença 6A: apenas presença confirmada.** `attendance` já existia e continua a responder só a "quem veio?". Nesta fase a interface usa apenas `present` e `NULL`/sem linha como "não confirmada"; não usar `absent`, `late` ou `excused` para decidir crédito, porque falta/no-show pertencem à 6B. A tabela ganhou FK composta para `lesson_participants(lesson_id, student_id)`, não tem escrita direta por cliente, e só `set_lesson_attendance()` marca ou retira presença. A operação exige professor ativo responsável pela aula, estado `scheduled`/`confirmed`, `now() >= starts_at` e aula ainda não concluída. Marcar presença não mexe em créditos.
+**Presença e falta 6A/6B.** `attendance` responde a "quem veio?". A aplicação usa apenas `present`, `absent` e ausência de linha/`NULL` como "não confirmada"; `late` e `excused` continuam sem semântica financeira. A tabela tem FK composta para `lesson_participants(lesson_id, student_id)`, não tem escrita direta por cliente e recusa presença/falta em participação `declined`/`removed`. `present` só pode ser marcado depois do início; `absent`/no-show só depois do fim. Marcar presença ou falta não mexe em créditos antes da conclusão.
 
-**Conclusão 6A: tudo ou nada.** `complete_lesson()` exige professor ativo responsável, estado `scheduled`/`confirmed`, `now() >= ends_at`, pelo menos um participante ativo, todos com presença `present` e cada participação com reserva válida (`billing_status='reserved'`, pacote presente, `credits_reserved > 0`, `credits_consumed = 0`) ou exceção explícita `exempt` sem créditos. A transição é:
+**Conclusão 6A/6B: tudo ou nada.** `complete_lesson()` exige professor ativo responsável, estado `scheduled`/`confirmed`, `now() >= ends_at`, pelo menos um participante operacional, todos os participantes ativos com desfecho final (`present` ou `absent`) e cada participação cobrada com reserva válida (`billing_status='reserved'`, pacote presente, `credits_reserved > 0`, `credits_consumed = 0`) ou exceção explícita `exempt` sem créditos. Participações `declined` são saltadas se a reserva já foi libertada. A transição é:
 
 ```text
 scheduled/confirmed -> completed
 ```
 
-Depois da conclusão, cada participação reservada passa `reserved -> consumed`, o pacote move `credits_reserved -> credits_used`, `available` não é descontado de novo, e o livro-razão recebe `credit_consumed`. A mesma aula concluída de novo devolve no-op e não duplica consumo. Aulas legacy sem reserva válida são bloqueadas; não criar reserva retroativa, não adivinhar pacote e não fazer backfill silencioso.
+Depois da conclusão, cada participação presente ou em falta/no-show passa `reserved -> consumed`, o pacote move `credits_reserved -> credits_used`, `available` não é descontado de novo, e o livro-razão recebe `credit_consumed`. A mesma aula concluída de novo devolve no-op e não duplica consumo. Aulas legacy sem reserva válida são bloqueadas; não criar reserva retroativa, não adivinhar pacote e não fazer backfill silencioso.
+
+**Cancelamento 6B.** `cancel_lesson()` cancela apenas aulas `scheduled`/`confirmed` do professor responsável, exige que não exista presença/falta registada e liberta todas as reservas ainda ativas com `release_participation_credits()`: `reserved -> available`, sem alterar `used`. `cancel_lesson_participation()` só existe para aulas de turma antes do início, não remove o último participante operacional, marca a participação como `declined` e liberta só aquele crédito. Em aula individual, usa-se cancelamento da aula inteira. As duas operações são idempotentes e não usam `DELETE`.
+
+**Fonte de verdade dos estados.** Cancelamento da aula vive em `lessons.status = 'cancelled_by_teacher'`; cancelamento individual vive em `lesson_participants.status = 'declined'`; presença vive em `attendance.status = 'present'`; falta/no-show vive em `attendance.status = 'absent'`; não confirmado é ausência de linha/valor na `attendance`. O enum de `lesson_status` ainda contém estados legados como `no_show_student`, mas a falta operacional da 6B é por participante, não por aula inteira.
 
 **Autorização operacional não vem do clube.** Mesmo em aula de clube, owner/manager/teacher de outro professor não marca presença nem conclui aula. Admin global, aluno, conta bloqueada e anónimo também não operam presença, conclusão, consumo ou participantes.
 
-**Depois de `completed`, a aula é histórica.** `update_lesson()` já recusa estados fora de `scheduled`/`confirmed`; não permitir mover horário/local/recurso, trocar participante, alterar presença ou reabrir a aula concluída nesta fase. Cada ocorrência recorrente é concluída isoladamente; não concluir a série inteira.
+**Depois de `completed` ou cancelada, a aula é histórica.** `update_lesson()` já recusa estados fora de `scheduled`/`confirmed`; não permitir mover horário/local/recurso, trocar participante, alterar presença, reabrir ou converter terminal nesta fase. Cada ocorrência recorrente é operada isoladamente: cancelar uma ocorrência não cancela a série inteira.
 
 **Projeções, e o que cada uma não tem:**
 
@@ -435,7 +443,7 @@ Depois da conclusão, cada participação reservada passa `reserved -> consumed`
 
 **Edição:** só horário, local, recurso, título e observações, e só em `scheduled`/`confirmed`. Participante, modalidade e contexto não se editam — trocar o aluno é criar outra aula. As reservas já feitas são mantidas; ao mover a data, `update_lesson()` confirma que os pacotes reservados continuam válidos nessa nova data. O histórico é escrito pelo trigger `log_lesson_change()` da Fase 1, que também trata o caso "nada mudou": um `update_lesson()` sem alterações devolve `false` e não gera entrada.
 
-**Não implementado:** cancelamento, ausência/no-show com decisão financeira, libertação de créditos, reagendamento operacional, edição/cancelamento de série inteira, confirmação pelo aluno, lista de espera, notificações e pagamentos. A 6A implementa apenas presença confirmada e conclusão normal com consumo de crédito reservado.
+**Não implementado:** política configurável de janela/percentagem/tolerância, cancelamento self-service do aluno, reagendamento operacional, reativação de participação cancelada, edição/cancelamento de série inteira, confirmação pelo aluno, lista de espera, notificações e pagamentos.
 
 ### Ao criar uma tabela nova
 
@@ -517,6 +525,34 @@ E2E_BLOCKED_PASSWORD=...
 ```
 
 `E2E_RUN_ID` é opcional. O valor `default` reutiliza o mesmo pacote E2E; outro valor cria um fluxo identificado por esse sufixo. Não usar dados pessoais reais nem senhas reais.
+
+### Validação de browser automatizada
+
+```bash
+npm run dev                                   # noutro terminal
+npm run e2e:browser -- --confirm-development
+```
+
+Faz login pelo formulário **real** `/entrar` com as contas E2E do `.env.local`, usando `playwright-core` sobre o Microsoft Edge já instalado — sem descarregar browsers e sem service role a fingir sessão. A sessão é GoTrue verdadeira, e o RLS aplica-se como em produção.
+
+`--headed` mostra a janela; `--base-url` aponta para outro servidor (por exemplo o `npm start` de produção).
+
+**A pirâmide de validação, e o que pertence a cada camada:**
+
+| Camada | O que prova | Custo |
+|---|---|---|
+| `npm run test` | regras puras, schemas, normalização | segundos |
+| `npm run db:verify` | esquema, RLS e créditos em PostgreSQL local | segundos |
+| `db:verify:remote` | catálogo, grants e assinaturas no remoto | rápido |
+| `db:verify:auth` | **RLS, privacidade e concorrência com JWTs reais** | minutos |
+| `e2e:browser` | **apenas golden paths de UI** | minutos |
+| Pessoa a validar à mão | só quando a automação não consegue | caro |
+
+Não duplicar no browser aquilo que `db:verify:auth` já prova. RLS, isolamento entre professores, recusa de admin/bloqueado/anónimo e concorrência são mais baratos e mais fiáveis com JWTs reais. O browser existe para o que só o browser vê: o formulário submeter, o *pending* terminar, o ecrã passar a mostrar o estado persistido, ausência de overflow, alvos de toque e erros de consola/hidratação.
+
+**Não pedir login manual como primeira opção.** Se a sessão do painel visual se perder, correr este script. Um pedido de login manual só se justifica quando a automação estiver comprovadamente impedida, e nesse caso diz-se qual o papel e qual o único cenário em falta.
+
+**As execuções consomem fixtures.** Concluir e cancelar são irreversíveis nesta fase, por isso a agenda de desenvolvimento vai ficando sem aulas ativas. Quando isso acontece o script **di-lo** em vez de saltar o cenário em silêncio; correr `npm run db:verify:auth -- --confirm-development` repõe as fixtures 6B.
 
 ### Checklist manual do Auth no Supabase
 
@@ -630,7 +666,7 @@ Estas regras vivem em `lib/domain/package-display.ts` e são partilhadas entre p
 
 - Reserva: apenas aula `scheduled` ou `confirmed`.
 - Consumo: aula `completed`, ou desfecho do aluno cuja política determine cobrança (`cancelled_by_student`/`no_show_student`).
-- Libertação: cancelamento ou falta com decisão de devolução.
+- Libertação: cancelamento da aula pelo professor ou participação de turma cancelada antes do início.
 - Reagendamento: a aula original está `rescheduled`, as referências nos dois sentidos coincidem e o destino não tem outra cobrança ativa para o aluno.
 
 `resolveCreditOutcome()` em `lib/domain/packages.ts` decide cobrar/devolver conforme prazo e política; a Server Action futura aplica essa decisão chamando a RPC correspondente. As interfaces e essas orquestrações ainda pertencem às Fases 4–7.
@@ -757,7 +793,7 @@ Interface em `/professor/clubes/[id]/calendario`, com filtro por professor no UR
 
 **Não implementado:** aulas, participantes, locais, campos, recursos, conflitos, reservas e créditos. Os únicos estados são disponível e indisponível — não escrever "ocupado", "reservado", "lotado", "vagas" ou "conflito", porque nada disso existe ainda para ser verdade.
 
-Ordem atual: Fase 6A fechada → 6B cancelamento, ausência/no-show e destino seguro dos créditos.
+Ordem atual: Fase 6B fechada no código local → próxima etapa é a 6C de reagendamento operacional seguro.
 
 ### `src/types/database.ts`
 
@@ -769,7 +805,7 @@ As linhas são declaradas com `type`, **nunca com `interface`**. Um `interface` 
 
 Vitest, ambiente Node, `TZ=Europe/Lisbon` fixo para que um teste que passa localmente passe também no CI (que corre em UTC).
 
-Cobertura atual: testes de domínio, regressões de respostas/autenticação do proxy, formulários da Fase 2, validação/normalização da gestão da Fase 3, modelos, atribuição, apresentação, navegação, ajustes administrativos de pacotes, disponibilidade do professor, calendário, permissões de clube, validação de workspaces, regras do calendário partilhado, domínio de locais, recursos de locais, agendamento de aulas com reserva/recorrência e operações 6A de presença/conclusão.
+Cobertura atual: testes de domínio, regressões de respostas/autenticação do proxy, formulários da Fase 2, validação/normalização da gestão da Fase 3, modelos, atribuição, apresentação, navegação, ajustes administrativos de pacotes, disponibilidade do professor, calendário, permissões de clube, validação de workspaces, regras do calendário partilhado, domínio de locais, recursos de locais, agendamento de aulas com reserva/recorrência e operações 6A/6B de presença, falta/no-show, conclusão e cancelamento.
 
 Os testes de domínio exercem funções puras, sem base de dados nem mocks. Os testes de validação garantem normalização, limites, identificadores, estados, valores monetários em cêntimos, datas civis e rejeição de campos extra/protegidos. A integração SQL fica separada em `db:verify`.
 
@@ -793,10 +829,10 @@ Não existe um comando de formatação separado. Use `npm run lint:fix` apenas p
 | 3 | Alunos, turmas, locais, política de cancelamento | **Concluído** |
 | 4 | Interfaces de modelos, atribuição, ajustes e saldos | **Concluído** — Etapas 1A, 1B, 1C, 1D e 1E validadas com Auth/PostgREST reais e browser desktop/mobile |
 | 5 | Calendário e criação de aulas com reserva | **Concluído** — disponibilidade, projeção segura, refinamento visual, clubes/membros, calendário partilhado, locais com moradas manuais, campos/salas/áreas, criação/edição de aulas, conflitos atómicos, reserva atómica de créditos, recorrência semanal segura e revisão integrada |
-| 6 | Cancelamento, reagendamento, presenças e histórico | **Parcialmente concluído** — 6A: presença confirmada e conclusão normal com consumo de créditos reservados. Falta cancelamento, ausência/no-show, libertação de créditos e reagendamento operacional |
+| 6 | Cancelamento, reagendamento, presenças e histórico | **Parcialmente concluído** — 6A/6B: presença, falta/no-show, conclusão normal/mista, cancelamento de aula e cancelamento de participação com `reserved -> available` ou `reserved -> used` seguros. Falta reagendamento operacional da 6C |
 | 7 | Área do aluno: aulas, créditos e confirmação | **Planeado** |
 | 8 | Notificações, lembretes e expiração agendada | **Planeado** |
-| 9 | Supabase real, concorrência, acessibilidade e deployment | **Parcialmente concluído** — RLS em PGlite e validação real da Fase 4/Fase 5/Fase 6A feitos; concorrência real de aulas/créditos/recorrência/conclusão coberta, acessibilidade completa e deployment pendentes |
+| 9 | Supabase real, concorrência, acessibilidade e deployment | **Parcialmente concluído** — RLS em PGlite e validação real da Fase 4/Fase 5/Fase 6A feitos; concorrência real de aulas/créditos/recorrência/conclusão coberta, validação real da 6B em curso nesta entrega, deployment pendente |
 
 **Ao concluir uma fase ou etapa:** `npm run check`, corrigir tudo o que falhe, atualizar `implementation_plan.md`, e resumir o que foi criado e como testar manualmente.
 

@@ -2,6 +2,7 @@ import { ATTENDANCE_STATUS_META } from "@/lib/domain/lesson-status";
 import type {
   AttendanceStatus,
   LessonStatus,
+  ParticipantStatus,
   ParticipationBillingStatus,
 } from "@/types/database";
 
@@ -12,11 +13,17 @@ export const ATTENDANCE_UNCONFIRMED_LABEL = "Não confirmada";
 export const LESSON_ATTENDANCE_NOT_STARTED_MESSAGE =
   "A presença ainda não pode ser registada porque a aula ainda não começou.";
 
+export const LESSON_ATTENDANCE_NOT_ENDED_MESSAGE =
+  "A falta só pode ser registada depois do horário previsto da aula.";
+
+export const LESSON_ABSENCE_CREDIT_WARNING =
+  "Se concluir a aula com este aluno marcado como falta, o crédito reservado será utilizado.";
+
 export const LESSON_COMPLETION_AFTER_END_MESSAGE =
   "A aula poderá ser concluída depois do horário previsto.";
 
 export const LESSON_COMPLETION_INCOMPLETE_ATTENDANCE_MESSAGE =
-  "Confirme a presença de todos os participantes antes de concluir.";
+  "Resolva a presença ou falta de todos os participantes antes de concluir.";
 
 export const LESSON_COMPLETION_NO_PARTICIPANTS_MESSAGE =
   "A aula não tem participantes ativos.";
@@ -28,12 +35,36 @@ export const LESSON_COMPLETION_DONE_MESSAGE = "Aula concluída.";
 
 export const LESSON_COMPLETION_NOT_ACTIVE_MESSAGE = "Esta aula já não pode ser concluída.";
 
+export const LESSON_CANCEL_CONFIRMATION_MESSAGE = [
+  "Cancelar esta aula?",
+  "",
+  "Os créditos ainda reservados dos participantes serão devolvidos.",
+  "",
+  "Esta ação não pode ser desfeita nesta etapa.",
+].join("\n");
+
+export const RECURRING_LESSON_CANCEL_NOTICE =
+  "Isto cancela apenas esta ocorrência.";
+
+export const LESSON_PARTICIPATION_CANCEL_LAST_MESSAGE =
+  "Cancele a aula para remover o último participante.";
+
+export const LESSON_PARTICIPATION_CANCEL_INDIVIDUAL_MESSAGE =
+  "Numa aula individual, cancele a aula inteira.";
+
+export const LESSON_PARTICIPATION_CANCEL_STARTED_MESSAGE =
+  "A participação só pode ser cancelada antes do início da aula.";
+
+export const LESSON_PARTICIPATION_CANCEL_NOT_ACTIVE_MESSAGE =
+  "Esta aula já não permite cancelar participações.";
+
 export type AttendanceDisplayMeta = {
   label: string;
   tone: "neutral" | "success" | "brand" | "danger" | "warning" | "alert";
 };
 
 export type LessonOperationParticipant = {
+  status: ParticipantStatus;
   attendanceStatus: AttendanceStatus | null;
   billingStatus: ParticipationBillingStatus;
   creditsReserved: number;
@@ -49,7 +80,12 @@ export type LessonCompletionAvailability =
   | { state: "invalid-reservation"; canComplete: false; message: string }
   | { state: "ready"; canComplete: true; message: null };
 
+export type LessonParticipationCancellationAvailability =
+  | { canCancel: true; message: null }
+  | { canCancel: false; message: string };
+
 const ACTIVE_OPERATIONAL_STATUSES: readonly LessonStatus[] = ["scheduled", "confirmed"];
+const ACTIVE_PARTICIPANT_STATUSES: readonly ParticipantStatus[] = ["invited", "confirmed"];
 
 function instant(value: Timestamp): number {
   return new Date(value).getTime();
@@ -74,7 +110,71 @@ export function canEditLessonAttendance({
   return ACTIVE_OPERATIONAL_STATUSES.includes(lessonStatus) && instant(now) >= instant(startsAt);
 }
 
+export function canMarkLessonAbsence({
+  lessonStatus,
+  endsAt,
+  now,
+}: {
+  lessonStatus: LessonStatus;
+  endsAt: Timestamp;
+  now: Timestamp;
+}): boolean {
+  return ACTIVE_OPERATIONAL_STATUSES.includes(lessonStatus) && instant(now) >= instant(endsAt);
+}
+
+export function canCancelLesson(lessonStatus: LessonStatus): boolean {
+  return ACTIVE_OPERATIONAL_STATUSES.includes(lessonStatus);
+}
+
+export function lessonParticipationCancellationAvailability({
+  lessonStatus,
+  startsAt,
+  now,
+  isGroupLesson,
+  activeParticipantCount,
+  participantStatus,
+}: {
+  lessonStatus: LessonStatus;
+  startsAt: Timestamp;
+  now: Timestamp;
+  isGroupLesson: boolean;
+  activeParticipantCount: number;
+  participantStatus: ParticipantStatus;
+}): LessonParticipationCancellationAvailability {
+  if (!ACTIVE_OPERATIONAL_STATUSES.includes(lessonStatus)) {
+    return { canCancel: false, message: LESSON_PARTICIPATION_CANCEL_NOT_ACTIVE_MESSAGE };
+  }
+
+  if (instant(now) >= instant(startsAt)) {
+    return { canCancel: false, message: LESSON_PARTICIPATION_CANCEL_STARTED_MESSAGE };
+  }
+
+  if (!ACTIVE_PARTICIPANT_STATUSES.includes(participantStatus)) {
+    return { canCancel: false, message: "Esta participação já não está ativa." };
+  }
+
+  if (!isGroupLesson) {
+    return { canCancel: false, message: LESSON_PARTICIPATION_CANCEL_INDIVIDUAL_MESSAGE };
+  }
+
+  if (activeParticipantCount <= 1) {
+    return { canCancel: false, message: LESSON_PARTICIPATION_CANCEL_LAST_MESSAGE };
+  }
+
+  return { canCancel: true, message: null };
+}
+
 function hasValidCompletionBilling(participant: LessonOperationParticipant): boolean {
+  if (participant.status === "declined") {
+    return (
+      participant.creditsReserved === 0 &&
+      participant.creditsConsumed === 0 &&
+      (participant.billingStatus === "released" ||
+        participant.billingStatus === "exempt" ||
+        participant.billingStatus === "pending")
+    );
+  }
+
   if (
     participant.billingStatus === "reserved" &&
     participant.creditsReserved > 0 &&
@@ -129,7 +229,25 @@ export function lessonCompletionAvailability({
     };
   }
 
-  if (participants.some((participant) => participant.attendanceStatus !== "present")) {
+  const activeParticipants = participants.filter((participant) =>
+    ACTIVE_PARTICIPANT_STATUSES.includes(participant.status),
+  );
+
+  if (activeParticipants.length === 0) {
+    return {
+      state: "no-participants",
+      canComplete: false,
+      message: LESSON_COMPLETION_NO_PARTICIPANTS_MESSAGE,
+    };
+  }
+
+  if (
+    activeParticipants.some(
+      (participant) =>
+        participant.attendanceStatus !== "present" &&
+        participant.attendanceStatus !== "absent",
+    )
+  ) {
     return {
       state: "missing-attendance",
       canComplete: false,
@@ -137,7 +255,11 @@ export function lessonCompletionAvailability({
     };
   }
 
-  if (participants.some((participant) => !hasValidCompletionBilling(participant))) {
+  if (
+    participants
+      .filter((participant) => participant.status !== "removed")
+      .some((participant) => !hasValidCompletionBilling(participant))
+  ) {
     return {
       state: "invalid-reservation",
       canComplete: false,

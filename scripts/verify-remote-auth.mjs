@@ -2170,6 +2170,45 @@ try {
   };
   const dateOnlyFromNow = (days) =>
     new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const pickUnusedAvailabilityOffset = async (startOffset, endOffset) => {
+    const rangeStart = Math.min(startOffset, endOffset);
+    const rangeEnd = Math.max(startOffset, endOffset);
+    const existing = await teacherClient
+      .from("teacher_availability_exception_records")
+      .select("exception_date")
+      .eq("is_active", true)
+      .gte("exception_date", dateOnlyFromNow(rangeStart))
+      .lte("exception_date", dateOnlyFromNow(rangeEnd));
+    if (existing.error) {
+      throw new Error(`Escolher data E2E livre: ${summarizeError(existing.error)}`);
+    }
+
+    const usedDates = new Set((existing.data ?? []).map((row) => row.exception_date));
+    for (let offset = rangeStart; offset <= rangeEnd; offset += 1) {
+      if (!usedDates.has(dateOnlyFromNow(offset))) return offset;
+    }
+    throw new Error(`Sem data E2E livre entre ${rangeStart} e ${rangeEnd} dias.`);
+  };
+  const pickUnusedWeeklyAvailabilityOffset = async (startOffset, endOffset, count) => {
+    const rangeStart = Math.min(startOffset, endOffset);
+    const rangeEnd = Math.max(startOffset, endOffset);
+    const existing = await teacherClient
+      .from("teacher_availability_exception_records")
+      .select("exception_date")
+      .eq("is_active", true)
+      .gte("exception_date", dateOnlyFromNow(rangeStart))
+      .lte("exception_date", dateOnlyFromNow(rangeEnd + (count - 1) * 7));
+    if (existing.error) {
+      throw new Error(`Escolher datas semanais E2E livres: ${summarizeError(existing.error)}`);
+    }
+
+    const usedDates = new Set((existing.data ?? []).map((row) => row.exception_date));
+    for (let offset = rangeStart; offset <= rangeEnd; offset += 1) {
+      const dates = Array.from({ length: count }, (_, index) => dateOnlyFromNow(offset + index * 7));
+      if (dates.every((dateOnly) => !usedDates.has(dateOnly))) return offset;
+    }
+    throw new Error(`Sem serie E2E livre entre ${rangeStart} e ${rangeEnd} dias.`);
+  };
   const timeFromMinutes = (value) => {
     const hours = String(Math.floor(value / 60)).padStart(2, "0");
     const minutes = String(value % 60).padStart(2, "0");
@@ -2525,6 +2564,21 @@ try {
     startsAt = "10:00",
     endsAt = "12:00",
   ) => {
+    const existing = await maybeSingle(
+      `${label} existente`,
+      supabase
+        .from("teacher_availability_exception_records")
+        .select("id")
+        .eq("exception_date", dateOnly)
+        .eq("mode", "replace")
+        .eq("is_active", true)
+        .lte("starts_at", startsAt)
+        .gte("ends_at", endsAt)
+        .order("starts_at", { ascending: true })
+        .limit(1),
+    );
+    if (existing?.id) return existing.id;
+
     const { error } = await supabase.rpc("upsert_teacher_availability_exception", {
       p_exception_date: dateOnly,
       p_starts_at: startsAt,
@@ -2535,9 +2589,9 @@ try {
     if (error) throw new Error(`${label}: ${summarizeError(error)}`);
   };
 
-  const prepareExceptions = async (supabase, label, dates, keyPrefix) => {
+  const prepareExceptions = async (supabase, label, dates, keyPrefix, startsAt = "10:00", endsAt = "12:00") => {
     for (const [index, dateOnly] of dates.entries()) {
-      await prepareException(supabase, `${label} ${index + 1}`, dateOnly, `${keyPrefix}-${index + 1}`);
+      await prepareException(supabase, `${label} ${index + 1}`, dateOnly, `${keyPrefix}-${index + 1}`, startsAt, endsAt);
     }
   };
 
@@ -3349,13 +3403,17 @@ try {
   await ensureGroupMember(teacherClient, group.id, groupStudent.id, "Aluno da turma para 6A");
 
   const phase6RunSuffix = `${runId}-${Date.now().toString(36)}`;
-  const phase6PastDate = dateOnlyFromNow(-1);
-  const phase6EditRaceDate = dateOnlyFromNow(-2);
-  const phase6RecurringSecondDate = dateOnlyFromNow(6);
-  const phase6FutureDate = dateOnlyFromNow(30);
+  const phase6RunSeed = Number(Date.now() % 1_000);
+  const phase6PastOffset = 1 + (phase6RunSeed % 3);
+  const phase6EditRaceOffset = 4 + (phase6RunSeed % 3);
+  const phase6FutureOffset = 32 + (phase6RunSeed % 8);
+  const phase6PastDate = dateOnlyFromNow(-phase6PastOffset);
+  const phase6EditRaceDate = dateOnlyFromNow(-phase6EditRaceOffset);
+  const phase6RecurringSecondDate = dateOnlyFromNow(7 - phase6PastOffset);
+  const phase6FutureDate = dateOnlyFromNow(phase6FutureOffset);
   const phase6PastPackageExpiresOn = dateOnlyFromNow(10);
   const phase6FuturePackageExpiresOn = dateOnlyFromNow(45);
-  const phase6BaseMinute = 360 + (Math.floor(Date.now() / 60000) % 90);
+  const phase6BaseMinute = 360 + (phase6RunSeed % 12);
   const phase6Slot = (index) => {
     const startsAt = phase6BaseMinute + index * 80;
     return {
@@ -3437,8 +3495,67 @@ try {
       p_lesson_participant_id: participantId,
       p_present: present,
     });
+  const setAttendanceStatus = (client, lessonIdValue, participantId, attendanceStatus) =>
+    client.rpc("set_lesson_attendance_status", {
+      p_lesson_id: lessonIdValue,
+      p_lesson_participant_id: participantId,
+      p_attendance_status: attendanceStatus,
+    });
+  const cancelLessonRpc = (client, lessonIdValue) =>
+    client.rpc("cancel_lesson", { p_lesson_id: lessonIdValue });
+  const cancelLessonParticipationRpc = (client, lessonIdValue, participantId) =>
+    client.rpc("cancel_lesson_participation", {
+      p_lesson_id: lessonIdValue,
+      p_lesson_participant_id: participantId,
+    });
   const completeLessonRpc = (client, lessonIdValue) =>
     client.rpc("complete_lesson", { p_lesson_id: lessonIdValue });
+
+  const retireStalePhase6OperationalLessons = async () => {
+    const staleLessons = await teacherClient
+      .from("teacher_lesson_schedule_records")
+      .select("id, title, status")
+      .in("status", ["scheduled", "confirmed"])
+      .or("title.ilike.Aula E2E 6A%,title.ilike.Serie E2E 6A%,title.ilike.Aula E2E 6B%,title.ilike.Serie E2E 6B%");
+    if (staleLessons.error) {
+      throw new Error(`Limpar fixtures 6A/6B: ${summarizeError(staleLessons.error)}`);
+    }
+
+    for (const staleLesson of staleLessons.data ?? []) {
+      const staleParticipants = await teacherClient
+        .from("teacher_lesson_participant_credit_records")
+        .select("lesson_participant_id, attendance_status")
+        .eq("lesson_id", staleLesson.id);
+      if (staleParticipants.error) {
+        throw new Error(`Participantes fixture antiga ${staleLesson.id}: ${summarizeError(staleParticipants.error)}`);
+      }
+
+      for (const participant of staleParticipants.data ?? []) {
+        if (participant.attendance_status !== null) {
+          const clearAttendance = await setAttendanceStatus(
+            teacherClient,
+            staleLesson.id,
+            participant.lesson_participant_id,
+            null,
+          );
+          if (clearAttendance.error) {
+            throw new Error(`Limpar presenca fixture antiga ${staleLesson.id}: ${summarizeError(clearAttendance.error)}`);
+          }
+        }
+      }
+
+      const cancelStale = await cancelLessonRpc(teacherClient, staleLesson.id);
+      if (cancelStale.error) {
+        throw new Error(`Cancelar fixture antiga ${staleLesson.id}: ${summarizeError(cancelStale.error)}`);
+      }
+    }
+
+    if ((staleLessons.data ?? []).length > 0) {
+      ok(`Fixtures operacionais antigas 6A/6B canceladas (${staleLessons.data.length})`);
+    }
+  };
+
+  await retireStalePhase6OperationalLessons();
 
   const createPhase6Lesson = async ({ index, title, date = phase6PastDate, studentId = studentsA.id, groupId = null }) => {
     const slot = phase6Slot(index);
@@ -3461,7 +3578,7 @@ try {
       "participante 6A",
       teacherClient
         .from("teacher_lesson_participant_credit_records")
-        .select("lesson_participant_id, student_id, attendance_status, attendance_marked_at, billing_status, credits_reserved, credits_consumed, package_name")
+        .select("lesson_participant_id, student_id, full_name, status, declined_at, attendance_status, attendance_marked_at, billing_status, credits_reserved, credits_consumed, package_name")
         .eq("lesson_id", lessonIdValue)
         .eq("student_id", studentIdValue),
     );
@@ -3908,6 +4025,805 @@ try {
   );
   await mustReject("Professor nao altera presenca diretamente", async () =>
     teacherClient.from("attendance").update({ status: "absent" }).eq("lesson_id", completeLessonId),
+  );
+
+  // ── Cancelamento, participacao cancelada e falta/no-show (Fase 6B) ───────
+
+  section("Cancelamento, participacao cancelada e falta/no-show");
+
+  const phase6bPastOffset = 7;
+  const phase6bRaceOffset = 8;
+  const phase6bFutureOffset = await pickUnusedAvailabilityOffset(180, 220);
+  const phase6bRecurringStartOffset = await pickUnusedWeeklyAvailabilityOffset(230, 260, 3);
+  const phase6bPastDate = dateOnlyFromNow(-phase6bPastOffset);
+  const phase6bFutureDate = dateOnlyFromNow(phase6bFutureOffset);
+  const phase6bRaceDate = dateOnlyFromNow(-phase6bRaceOffset);
+  const phase6bRecurringDates = [0, 7, 14].map((days) => dateOnlyFromNow(phase6bRecurringStartOffset + days));
+  await prepareException(
+    teacherClient,
+    "Disponibilidade passada para 6B",
+    phase6bPastDate,
+    `lesson-6b-past-${phase6RunSuffix}`,
+    "06:00",
+    "22:00",
+  );
+  await prepareException(
+    teacherClient,
+    "Disponibilidade futura para 6B",
+    phase6bFutureDate,
+    `lesson-6b-future-${phase6RunSuffix}`,
+    "06:00",
+    "22:00",
+  );
+  await prepareException(
+    teacherClient,
+    "Disponibilidade de corrida para 6B",
+    phase6bRaceDate,
+    `lesson-6b-races-${phase6RunSuffix}`,
+    "06:00",
+    "22:00",
+  );
+  await prepareExceptions(
+    teacherClient,
+    "Disponibilidade recorrente para 6B",
+    phase6bRecurringDates,
+    `lesson-6b-recurring-${phase6RunSuffix}`,
+    "10:00",
+    "12:00",
+  );
+
+  const groupStudentB = await ensureTeacherStudent(
+    teacherClient,
+    teacherRecord,
+    `e2e.group.student.b.${phase6RunSuffix}@aulaflow.example.com`,
+    `Aluno turma B ${phase6RunSuffix}`,
+  );
+  const phase6bGroup = await ensureGroup(
+    teacherClient,
+    teacherRecord,
+    `Turma E2E 6B ${phase6RunSuffix}`,
+  );
+  await ensureGroupMember(teacherClient, phase6bGroup.id, studentsA.id, "Aluno A da turma para 6B");
+  await ensureGroupMember(teacherClient, phase6bGroup.id, groupStudent.id, "Aluno da turma para 6B");
+  await ensureGroupMember(teacherClient, phase6bGroup.id, groupStudentB.id, "Aluno B da turma para 6B");
+
+  await assignLessonPackage(
+    teacherClient,
+    studentsA.id,
+    `Pacote cancelamento A ${phase6RunSuffix}`,
+    40,
+    deterministicUuid(`lesson-6b-package-a:${phase6RunSuffix}`),
+    sportRow.id,
+    { startsOn: dateOnlyFromNow(-10), expiresOn: dateOnlyFromNow(320) },
+  );
+  await assignLessonPackage(
+    teacherClient,
+    groupStudent.id,
+    `Pacote cancelamento turma ${phase6RunSuffix}`,
+    20,
+    deterministicUuid(`lesson-6b-package-group:${phase6RunSuffix}`),
+    sportRow.id,
+    { startsOn: dateOnlyFromNow(-10), expiresOn: dateOnlyFromNow(320) },
+  );
+  await assignLessonPackage(
+    teacherClient,
+    groupStudentB.id,
+    `Pacote cancelamento turma B ${phase6RunSuffix}`,
+    20,
+    deterministicUuid(`lesson-6b-package-group-b:${phase6RunSuffix}`),
+    sportRow.id,
+    { startsOn: dateOnlyFromNow(-10), expiresOn: dateOnlyFromNow(320) },
+  );
+
+  const cancelLessonId = await createPhase6Lesson({
+    index: 0,
+    title: "Aula E2E 6B cancelar",
+    date: phase6bFutureDate,
+  });
+  const cancelParticipant = await readParticipant(cancelLessonId, studentsA.id);
+  const cancelPackageBefore = await getSingle(
+    "pacote antes de cancelar aula 6B",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_available, credits_reserved, credits_used")
+      .eq("name", cancelParticipant.package_name),
+  );
+  const cancelResult = await cancelLessonRpc(teacherClient, cancelLessonId);
+  if (cancelResult.error) throw new Error(`Cancelar aula 6B: ${summarizeError(cancelResult.error)}`);
+  const cancelAgain = await cancelLessonRpc(teacherClient, cancelLessonId);
+  if (cancelAgain.error) throw new Error(`Repetir cancelamento 6B: ${summarizeError(cancelAgain.error)}`);
+  const cancelLessonAfter = await getSingle(
+    "aula cancelada 6B",
+    teacherClient
+      .from("teacher_lesson_schedule_records")
+      .select("id, status")
+      .eq("id", cancelLessonId),
+  );
+  const cancelParticipantAfter = await readParticipant(cancelLessonId, studentsA.id);
+  const cancelPackageAfter = await getSingle(
+    "pacote depois de cancelar aula 6B",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_available, credits_reserved, credits_used")
+      .eq("id", cancelPackageBefore.id),
+  );
+  const cancelReleaseLedger = await teacherClient
+    .from("package_credit_transactions")
+    .select("id, type")
+    .eq("lesson_id", cancelLessonId)
+    .eq("type", "reservation_released");
+  check(
+    !cancelReleaseLedger.error &&
+      cancelResult.data === true &&
+      cancelAgain.data === false &&
+      cancelLessonAfter.status === "cancelled_by_teacher" &&
+      cancelParticipantAfter.billing_status === "released" &&
+      cancelParticipantAfter.credits_reserved === 0 &&
+      cancelPackageAfter.credits_available === cancelPackageBefore.credits_available + 1 &&
+      cancelPackageAfter.credits_reserved === cancelPackageBefore.credits_reserved - 1 &&
+      cancelPackageAfter.credits_used === cancelPackageBefore.credits_used &&
+      (cancelReleaseLedger.data ?? []).length === 1,
+    "Cancelar aula devolve uma reserva e repetir nao duplica ledger",
+  );
+
+  const studentCancelledLesson = await getSingle(
+    "aluno ve aula cancelada 6B",
+    studentClient
+      .from("student_lesson_records")
+      .select("id, status, participation_status, billing_status, credits_reserved, credits_consumed, attendance_status")
+      .eq("id", cancelLessonId),
+  );
+  check(
+    studentCancelledLesson.status === "cancelled_by_teacher" &&
+      studentCancelledLesson.participation_status !== "declined" &&
+      studentCancelledLesson.billing_status === "released" &&
+      studentCancelledLesson.credits_reserved === 0 &&
+      studentCancelledLesson.credits_consumed === 0 &&
+      studentCancelledLesson.attendance_status === null,
+    "Aluno ve a propria aula cancelada com credito devolvido e sem dados de colegas",
+  );
+  await mustReturnNoRows("Aula cancelada nao aparece como proxima ativa do aluno", () =>
+    studentClient
+      .from("student_lesson_records")
+      .select("id")
+      .eq("id", cancelLessonId)
+      .in("status", ["scheduled", "confirmed"]),
+  );
+
+  const cancelWithAttendanceId = await createPhase6Lesson({
+    index: 0,
+    title: "Aula E2E 6B cancelar com presenca",
+    date: phase6bPastDate,
+  });
+  const cancelWithAttendanceParticipant = await readParticipant(cancelWithAttendanceId, studentsA.id);
+  await setAttendanceStatus(
+    teacherClient,
+    cancelWithAttendanceId,
+    cancelWithAttendanceParticipant.lesson_participant_id,
+    "present",
+  );
+  await mustReject("Cancelar aula com presenca marcada e recusado", async () =>
+    cancelLessonRpc(teacherClient, cancelWithAttendanceId),
+  );
+
+  await mustReject("Professor B nao cancela aula A", async () =>
+    cancelLessonRpc(teacherBClient, noAttendanceLessonId),
+  );
+  await mustReject("Aluno nao cancela aula por RPC", async () =>
+    cancelLessonRpc(studentClient, noAttendanceLessonId),
+  );
+  await mustReject("Admin nao cancela aula operacional", async () =>
+    cancelLessonRpc(adminClient, noAttendanceLessonId),
+  );
+  await mustReject("Anonimo nao cancela aula", async () =>
+    cancelLessonRpc(anonClient, noAttendanceLessonId),
+  );
+  await mustReject("Conta bloqueada nao cancela aula", async () =>
+    cancelLessonRpc(blockedClient, noAttendanceLessonId),
+  );
+
+  const participantCancelLessonId = await createPhase6Lesson({
+    index: 1,
+    title: "Aula E2E 6B cancelar participante",
+    date: phase6bFutureDate,
+    studentId: null,
+    groupId: phase6bGroup.id,
+  });
+  const participantCancelRows = await teacherClient
+    .from("teacher_lesson_participant_credit_records")
+    .select("lesson_participant_id, student_id, status, billing_status, credits_reserved, package_name")
+    .eq("lesson_id", participantCancelLessonId);
+  if (participantCancelRows.error) {
+    throw new Error(`Participantes cancelamento 6B: ${summarizeError(participantCancelRows.error)}`);
+  }
+  const cancelStudentARow = participantCancelRows.data?.find((row) => row.student_id === studentsA.id);
+  const cancelGroupRow = participantCancelRows.data?.find((row) => row.student_id === groupStudent.id);
+  if (!cancelStudentARow || !cancelGroupRow?.package_name) {
+    throw new Error("Fixture de cancelamento de participacao 6B incompleta");
+  }
+  const cancelGroupPackageBefore = await getSingle(
+    "pacote antes de cancelar participacao 6B",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_available, credits_reserved, credits_used")
+      .eq("name", cancelGroupRow.package_name),
+  );
+  const cancelParticipation = await cancelLessonParticipationRpc(
+    teacherClient,
+    participantCancelLessonId,
+    cancelGroupRow.lesson_participant_id,
+  );
+  if (cancelParticipation.error) {
+    throw new Error(`Cancelar participacao 6B: ${summarizeError(cancelParticipation.error)}`);
+  }
+  const cancelParticipationAgain = await cancelLessonParticipationRpc(
+    teacherClient,
+    participantCancelLessonId,
+    cancelGroupRow.lesson_participant_id,
+  );
+  if (cancelParticipationAgain.error) {
+    throw new Error(`Repetir cancelamento de participacao 6B: ${summarizeError(cancelParticipationAgain.error)}`);
+  }
+  const cancelGroupPackageAfter = await getSingle(
+    "pacote depois de cancelar participacao 6B",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_available, credits_reserved, credits_used")
+      .eq("id", cancelGroupPackageBefore.id),
+  );
+  const participantCancelAfter = await teacherClient
+    .from("teacher_lesson_participant_credit_records")
+    .select("lesson_participant_id, student_id, status, billing_status, credits_reserved, credits_consumed, attendance_status")
+    .eq("lesson_id", participantCancelLessonId);
+  if (participantCancelAfter.error) {
+    throw new Error(`Ler cancelamento de participacao 6B: ${summarizeError(participantCancelAfter.error)}`);
+  }
+  const cancelledParticipantAfter = participantCancelAfter.data?.find(
+    (row) => row.student_id === groupStudent.id,
+  );
+  const activeParticipantAfter = participantCancelAfter.data?.find((row) => row.student_id === studentsA.id);
+  check(
+    cancelParticipation.data === true &&
+      cancelParticipationAgain.data === false &&
+      cancelledParticipantAfter?.status === "declined" &&
+      cancelledParticipantAfter.billing_status === "released" &&
+      cancelledParticipantAfter.credits_reserved === 0 &&
+      cancelledParticipantAfter.attendance_status === null &&
+      activeParticipantAfter?.billing_status === "reserved" &&
+      cancelGroupPackageAfter.credits_available === cancelGroupPackageBefore.credits_available + 1 &&
+      cancelGroupPackageAfter.credits_reserved === cancelGroupPackageBefore.credits_reserved - 1,
+    "Cancelar participante devolve so esse credito e preserva os restantes",
+  );
+  const lastParticipantGroup = await ensureGroup(
+    teacherClient,
+    teacherRecord,
+    `Turma E2E 6B ultimo ${phase6RunSuffix}`,
+  );
+  await ensureGroupMember(teacherClient, lastParticipantGroup.id, studentsA.id, "Aluno A para ultimo participante 6B");
+  await ensureGroupMember(teacherClient, lastParticipantGroup.id, groupStudent.id, "Aluno turma para ultimo participante 6B");
+  const lastParticipantLessonId = await createPhase6Lesson({
+    index: 5,
+    title: "Aula E2E 6B ultimo participante",
+    date: phase6bFutureDate,
+    studentId: null,
+    groupId: lastParticipantGroup.id,
+  });
+  const lastParticipantRows = await teacherClient
+    .from("teacher_lesson_participant_credit_records")
+    .select("lesson_participant_id, student_id")
+    .eq("lesson_id", lastParticipantLessonId);
+  if (lastParticipantRows.error) {
+    throw new Error(`Participantes ultimo 6B: ${summarizeError(lastParticipantRows.error)}`);
+  }
+  const lastGroupRow = lastParticipantRows.data?.find((row) => row.student_id === groupStudent.id);
+  const lastStudentARow = lastParticipantRows.data?.find((row) => row.student_id === studentsA.id);
+  if (!lastGroupRow || !lastStudentARow) throw new Error("Fixture ultimo participante 6B incompleta");
+  const firstLastCancel = await cancelLessonParticipationRpc(
+    teacherClient,
+    lastParticipantLessonId,
+    lastGroupRow.lesson_participant_id,
+  );
+  if (firstLastCancel.error) {
+    throw new Error(`Preparar ultimo participante 6B: ${summarizeError(firstLastCancel.error)}`);
+  }
+  await mustReject("Ultimo participante ativo exige cancelar a aula", async () =>
+    cancelLessonParticipationRpc(
+      teacherClient,
+      lastParticipantLessonId,
+      lastStudentARow.lesson_participant_id,
+    ),
+  );
+
+  await mustReject("Professor B nao cancela participacao alheia", async () =>
+    cancelLessonParticipationRpc(
+      teacherBClient,
+      participantCancelLessonId,
+      cancelStudentARow.lesson_participant_id,
+    ),
+  );
+  await mustReject("Aluno nao cancela participacao por RPC", async () =>
+    cancelLessonParticipationRpc(
+      studentClient,
+      participantCancelLessonId,
+      cancelStudentARow.lesson_participant_id,
+    ),
+  );
+  await mustReject("Admin nao cancela participacao operacional", async () =>
+    cancelLessonParticipationRpc(
+      adminClient,
+      participantCancelLessonId,
+      cancelStudentARow.lesson_participant_id,
+    ),
+  );
+  await mustReject("Anonimo nao cancela participacao", async () =>
+    cancelLessonParticipationRpc(
+      anonClient,
+      participantCancelLessonId,
+      cancelStudentARow.lesson_participant_id,
+    ),
+  );
+  await mustReject("Conta bloqueada nao cancela participacao", async () =>
+    cancelLessonParticipationRpc(
+      blockedClient,
+      participantCancelLessonId,
+      cancelStudentARow.lesson_participant_id,
+    ),
+  );
+
+  const noShowFutureId = await createPhase6Lesson({
+    index: 2,
+    title: "Aula E2E 6B falta futura",
+    date: phase6bFutureDate,
+  });
+  const noShowFutureParticipant = await readParticipant(noShowFutureId, studentsA.id);
+  await mustReject("Falta antes do fim e recusada", async () =>
+    setAttendanceStatus(
+      teacherClient,
+      noShowFutureId,
+      noShowFutureParticipant.lesson_participant_id,
+      "absent",
+    ),
+  );
+
+  const noShowLessonId = await createPhase6Lesson({
+    index: 1,
+    title: "Aula E2E 6B falta",
+    date: phase6bPastDate,
+  });
+  const noShowLessonParticipant = await readParticipant(noShowLessonId, studentsA.id);
+  const noShowPackageBefore = await getSingle(
+    "pacote antes de falta 6B",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_available, credits_reserved, credits_used")
+      .eq("name", noShowLessonParticipant.package_name),
+  );
+  const markAbsent = await setAttendanceStatus(
+    teacherClient,
+    noShowLessonId,
+    noShowLessonParticipant.lesson_participant_id,
+    "absent",
+  );
+  if (markAbsent.error) throw new Error(`Marcar falta 6B: ${summarizeError(markAbsent.error)}`);
+  const noShowPackageMarked = await getSingle(
+    "pacote apos marcar falta 6B",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_available, credits_reserved, credits_used")
+      .eq("id", noShowPackageBefore.id),
+  );
+  const noShowParticipantMarked = await readParticipant(noShowLessonId, studentsA.id);
+  check(
+    markAbsent.data === true &&
+      noShowParticipantMarked.attendance_status === "absent" &&
+      noShowPackageMarked.credits_available === noShowPackageBefore.credits_available &&
+      noShowPackageMarked.credits_reserved === noShowPackageBefore.credits_reserved &&
+      noShowPackageMarked.credits_used === noShowPackageBefore.credits_used,
+    "Marcar falta/no-show nao movimenta credito imediatamente",
+  );
+  const completeNoShow = await completeLessonRpc(teacherClient, noShowLessonId);
+  if (completeNoShow.error) throw new Error(`Concluir falta 6B: ${summarizeError(completeNoShow.error)}`);
+  const noShowAfter = await readParticipant(noShowLessonId, studentsA.id);
+  const noShowPackageAfter = await getSingle(
+    "pacote depois de concluir falta 6B",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_available, credits_reserved, credits_used")
+      .eq("id", noShowPackageBefore.id),
+  );
+  check(
+    completeNoShow.data === true &&
+      noShowAfter.attendance_status === "absent" &&
+      noShowAfter.billing_status === "consumed" &&
+      noShowAfter.credits_reserved === 0 &&
+      noShowAfter.credits_consumed === 1 &&
+      noShowPackageAfter.credits_reserved === noShowPackageMarked.credits_reserved - 1 &&
+      noShowPackageAfter.credits_used === noShowPackageMarked.credits_used + 1,
+    "Concluir com falta/no-show consome credito",
+  );
+  await mustReject("Attendance bloqueado depois da conclusao", async () =>
+    setAttendanceStatus(
+      teacherClient,
+      noShowLessonId,
+      noShowLessonParticipant.lesson_participant_id,
+      "present",
+    ),
+  );
+  await mustReject("Professor B nao marca falta A", async () =>
+    setAttendanceStatus(
+      teacherBClient,
+      noAttendanceLessonId,
+      noAttendanceParticipant.lesson_participant_id,
+      "absent",
+    ),
+  );
+  await mustReject("Aluno nao marca falta", async () =>
+    setAttendanceStatus(
+      studentClient,
+      noAttendanceLessonId,
+      noAttendanceParticipant.lesson_participant_id,
+      "absent",
+    ),
+  );
+  await mustReject("Admin nao marca falta operacional", async () =>
+    setAttendanceStatus(
+      adminClient,
+      noAttendanceLessonId,
+      noAttendanceParticipant.lesson_participant_id,
+      "absent",
+    ),
+  );
+  await mustReject("Anonimo nao marca falta", async () =>
+    setAttendanceStatus(
+      anonClient,
+      noAttendanceLessonId,
+      noAttendanceParticipant.lesson_participant_id,
+      "absent",
+    ),
+  );
+  await mustReject("Conta bloqueada nao marca falta", async () =>
+    setAttendanceStatus(
+      blockedClient,
+      noAttendanceLessonId,
+      noAttendanceParticipant.lesson_participant_id,
+      "absent",
+    ),
+  );
+
+  const mixedGroupLessonId = await createPhase6Lesson({
+    index: 3,
+    title: "Aula E2E 6B turma mista",
+    date: phase6bFutureDate,
+    studentId: null,
+    groupId: phase6bGroup.id,
+  });
+  const mixedGroupRows = await teacherClient
+    .from("teacher_lesson_participant_credit_records")
+    .select("lesson_participant_id, student_id, status, billing_status, credits_reserved, credits_consumed, package_name")
+    .eq("lesson_id", mixedGroupLessonId);
+  if (mixedGroupRows.error) throw new Error(`Participantes turma mista 6B: ${summarizeError(mixedGroupRows.error)}`);
+  const mixedStudentA = mixedGroupRows.data?.find((row) => row.student_id === studentsA.id);
+  const mixedStudentGroup = mixedGroupRows.data?.find((row) => row.student_id === groupStudent.id);
+  const mixedStudentGroupB = mixedGroupRows.data?.find((row) => row.student_id === groupStudentB.id);
+  if (!mixedStudentA || !mixedStudentGroup || !mixedStudentGroupB) {
+    throw new Error("Turma mista 6B sem tres participantes");
+  }
+  await cancelLessonParticipationRpc(
+    teacherClient,
+    mixedGroupLessonId,
+    mixedStudentGroupB.lesson_participant_id,
+  );
+  const moveMixedToPast = phase6Slot(2);
+  const moveMixed = await teacherClient.rpc("update_lesson", {
+    p_lesson_id: mixedGroupLessonId,
+    p_starts_at: lisbonInstant(phase6bPastDate, moveMixedToPast.startsAt),
+    p_ends_at: lisbonInstant(phase6bPastDate, moveMixedToPast.endsAt),
+    p_title: `Aula E2E 6B turma mista passada ${phase6RunSuffix}`,
+    p_location_id: null,
+    p_location_resource_id: null,
+    p_notes_for_students: "e2e_6b_mista",
+    p_private_notes: "e2e_6b_mista_privada",
+  });
+  if (moveMixed.error) throw new Error(`Mover turma mista 6B: ${summarizeError(moveMixed.error)}`);
+  await setAttendanceStatus(
+    teacherClient,
+    mixedGroupLessonId,
+    mixedStudentA.lesson_participant_id,
+    "present",
+  );
+  await setAttendanceStatus(
+    teacherClient,
+    mixedGroupLessonId,
+    mixedStudentGroup.lesson_participant_id,
+    "absent",
+  );
+  const mixedComplete = await completeLessonRpc(teacherClient, mixedGroupLessonId);
+  if (mixedComplete.error) throw new Error(`Concluir turma mista 6B: ${summarizeError(mixedComplete.error)}`);
+  const mixedAfter = await teacherClient
+    .from("teacher_lesson_participant_credit_records")
+    .select("student_id, status, attendance_status, billing_status, credits_reserved, credits_consumed")
+    .eq("lesson_id", mixedGroupLessonId);
+  if (mixedAfter.error) throw new Error(`Ler turma mista 6B: ${summarizeError(mixedAfter.error)}`);
+  check(
+    mixedComplete.data === true &&
+      mixedAfter.data?.some(
+        (row) =>
+          row.student_id === studentsA.id &&
+          row.attendance_status === "present" &&
+          row.billing_status === "consumed",
+      ) &&
+      mixedAfter.data?.some(
+        (row) =>
+          row.student_id === groupStudent.id &&
+          row.attendance_status === "absent" &&
+          row.billing_status === "consumed",
+      ) &&
+      mixedAfter.data?.some(
+        (row) =>
+          row.student_id === groupStudentB.id &&
+          row.status === "declined" &&
+          row.attendance_status === null &&
+          row.billing_status === "released",
+      ),
+    "Turma mista conclui presente/falta e preserva participante cancelado como devolvido",
+  );
+  const mixedStudentProjection = await getSingle(
+    "aluno ve apenas o proprio resultado da turma mista",
+    studentClient
+      .from("student_lesson_records")
+      .select("id, participation_status, attendance_status, billing_status, credits_reserved, credits_consumed")
+      .eq("id", mixedGroupLessonId),
+  );
+  check(
+    mixedStudentProjection.attendance_status === "present" &&
+      mixedStudentProjection.billing_status === "consumed" &&
+      forbiddenColumns(mixedStudentProjection, ["student_id", "participant_count", "group_id"]).length === 0,
+    "Aluno da turma mista ve apenas o proprio desfecho",
+  );
+
+  const unresolved6bLessonId = await createPhase6Lesson({
+    index: 4,
+    title: "Aula E2E 6B turma por resolver",
+    date: phase6bPastDate,
+    studentId: null,
+    groupId: phase6bGroup.id,
+  });
+  const unresolved6bRows = await teacherClient
+    .from("teacher_lesson_participant_credit_records")
+    .select("lesson_participant_id, student_id, billing_status, credits_reserved")
+    .eq("lesson_id", unresolved6bLessonId);
+  if (unresolved6bRows.error) throw new Error(`Participantes unresolved 6B: ${summarizeError(unresolved6bRows.error)}`);
+  const unresolved6bStudentA = unresolved6bRows.data?.find((row) => row.student_id === studentsA.id);
+  if (!unresolved6bStudentA) throw new Error("Unresolved 6B sem aluno A");
+  await setAttendanceStatus(
+    teacherClient,
+    unresolved6bLessonId,
+    unresolved6bStudentA.lesson_participant_id,
+    "present",
+  );
+  await mustReject("Participante sem desfecho bloqueia conclusao 6B", async () =>
+    completeLessonRpc(teacherClient, unresolved6bLessonId),
+  );
+  const unresolved6bAfter = await teacherClient
+    .from("teacher_lesson_participant_credit_records")
+    .select("billing_status, credits_reserved, credits_consumed")
+    .eq("lesson_id", unresolved6bLessonId);
+  check(
+    !unresolved6bAfter.error &&
+      (unresolved6bAfter.data ?? []).every(
+        (row) => row.billing_status === "reserved" && row.credits_reserved === 1,
+      ),
+    "Conclusao bloqueada por unresolved conserva reservas de todos",
+  );
+
+  const recurring6BData = await createRecurringLessons(teacherClient, {
+    p_starts_at: lisbonInstant(phase6bRecurringDates[0], "10:00"),
+    p_ends_at: lisbonInstant(phase6bRecurringDates[0], "11:00"),
+    p_title: `Serie E2E 6B ${phase6RunSuffix}`,
+    p_occurrence_count: 3,
+    p_location_id: null,
+    p_location_resource_id: null,
+    p_student_id: studentsA.id,
+    p_group_id: null,
+    p_idempotency_key: deterministicUuid(`lesson-6b-series:${phase6RunSuffix}`),
+  });
+  if (recurring6BData.error || !recurring6BData.data) {
+    throw new Error(`Criar serie 6B: ${summarizeError(recurring6BData.error)}`);
+  }
+  const recurring6B = readRecurringResult(recurring6BData.data, "serie 6B");
+  const recurring6BSecond = await readParticipant(recurring6B.lesson_ids[1], studentsA.id);
+  const recurring6BPackageBefore = await getSingle(
+    "pacote antes de cancelar ocorrencia 6B",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_reserved, credits_used")
+      .eq("name", recurring6BSecond.package_name),
+  );
+  await cancelLessonRpc(teacherClient, recurring6B.lesson_ids[1]);
+  const recurring6BPackageAfter = await getSingle(
+    "pacote depois de cancelar ocorrencia 6B",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_reserved, credits_used")
+      .eq("id", recurring6BPackageBefore.id),
+  );
+  const recurring6BStatuses = await teacherClient
+    .from("teacher_lesson_schedule_records")
+    .select("id, status")
+    .in("id", recurring6B.lesson_ids);
+  const recurring6BParticipants = await teacherClient
+    .from("teacher_lesson_participant_credit_records")
+    .select("lesson_id, billing_status, credits_reserved")
+    .in("lesson_id", recurring6B.lesson_ids);
+  check(
+    !recurring6BStatuses.error &&
+      !recurring6BParticipants.error &&
+      recurring6BStatuses.data?.filter((row) => row.status === "cancelled_by_teacher").length === 1 &&
+      recurring6BStatuses.data?.filter((row) => row.status === "scheduled").length === 2 &&
+      recurring6BParticipants.data?.find((row) => row.lesson_id === recurring6B.lesson_ids[1])
+        ?.billing_status === "released" &&
+      recurring6BPackageAfter.credits_reserved === recurring6BPackageBefore.credits_reserved - 1,
+    "Cancelar ocorrencia recorrente 6B nao toca nas irmas",
+  );
+
+  const doubleCancelLessonId = await createPhase6Lesson({
+    index: 0,
+    title: "Aula E2E 6B corrida double cancel",
+    date: phase6bRaceDate,
+  });
+  const doubleCancelRace = await Promise.all([
+    rpcOutcome(() => cancelLessonRpc(raceClientA, doubleCancelLessonId)),
+    rpcOutcome(() => cancelLessonRpc(raceClientB, doubleCancelLessonId)),
+  ]);
+  const doubleCancelLedger = await teacherClient
+    .from("package_credit_transactions")
+    .select("id")
+    .eq("lesson_id", doubleCancelLessonId)
+    .eq("type", "reservation_released");
+  check(
+    !doubleCancelLedger.error &&
+      doubleCancelRace.filter((outcome) => outcome.ok && outcome.data === true).length === 1 &&
+      doubleCancelRace.filter((outcome) => outcome.ok && outcome.data === false).length === 1 &&
+      (doubleCancelLedger.data ?? []).length === 1,
+    "Double cancel real devolve uma vez e a segunda chamada vira no-op",
+  );
+
+  const cancelCompleteRaceId = await createPhase6Lesson({
+    index: 1,
+    title: "Aula E2E 6B corrida cancel complete",
+    date: phase6bRaceDate,
+  });
+  const cancelCompleteParticipant = await readParticipant(cancelCompleteRaceId, studentsA.id);
+  await setAttendanceStatus(
+    teacherClient,
+    cancelCompleteRaceId,
+    cancelCompleteParticipant.lesson_participant_id,
+    "present",
+  );
+  const cancelCompleteRace = await Promise.all([
+    rpcOutcome(() => cancelLessonRpc(raceClientA, cancelCompleteRaceId)),
+    rpcOutcome(() => completeLessonRpc(raceClientB, cancelCompleteRaceId)),
+  ]);
+  const cancelCompleteAfter = await getSingle(
+    "estado apos corrida cancel complete 6B",
+    teacherClient
+      .from("teacher_lesson_schedule_records")
+      .select("id, status")
+      .eq("id", cancelCompleteRaceId),
+  );
+  const cancelCompleteParticipantAfter = await readParticipant(cancelCompleteRaceId, studentsA.id);
+  const cancelCompleteReleaseLedger = await teacherClient
+    .from("package_credit_transactions")
+    .select("id")
+    .eq("lesson_id", cancelCompleteRaceId)
+    .eq("type", "reservation_released");
+  const cancelCompleteConsumeLedger = await teacherClient
+    .from("package_credit_transactions")
+    .select("id")
+    .eq("lesson_id", cancelCompleteRaceId)
+    .eq("type", "credit_consumed");
+  check(
+    !cancelCompleteReleaseLedger.error &&
+      !cancelCompleteConsumeLedger.error &&
+      cancelCompleteRace.filter((outcome) => outcome.ok && outcome.data === true).length === 1 &&
+      (
+        (cancelCompleteAfter.status === "completed" &&
+          cancelCompleteParticipantAfter.billing_status === "consumed" &&
+          (cancelCompleteConsumeLedger.data ?? []).length === 1 &&
+          (cancelCompleteReleaseLedger.data ?? []).length === 0) ||
+        (cancelCompleteAfter.status === "cancelled_by_teacher" &&
+          cancelCompleteParticipantAfter.billing_status === "released" &&
+          (cancelCompleteReleaseLedger.data ?? []).length === 1 &&
+          (cancelCompleteConsumeLedger.data ?? []).length === 0)
+      ),
+    "Cancel x complete real termina em estado financeiro coerente",
+  );
+
+  const cancelParticipantLessonRaceId = await createPhase6Lesson({
+    index: 2,
+    title: "Aula E2E 6B corrida cancel participant",
+    date: phase6bRaceDate,
+    studentId: null,
+    groupId: group.id,
+  });
+  const cancelParticipantRaceRows = await teacherClient
+    .from("teacher_lesson_participant_credit_records")
+    .select("lesson_participant_id, student_id")
+    .eq("lesson_id", cancelParticipantLessonRaceId);
+  if (cancelParticipantRaceRows.error) {
+    throw new Error(`Participantes corrida cancel participant 6B: ${summarizeError(cancelParticipantRaceRows.error)}`);
+  }
+  const cancelParticipantRaceTarget = cancelParticipantRaceRows.data?.find(
+    (row) => row.student_id === groupStudent.id,
+  );
+  if (!cancelParticipantRaceTarget) throw new Error("Corrida cancel participant 6B sem alvo");
+  const cancelParticipantRace = await Promise.all([
+    rpcOutcome(() =>
+      cancelLessonParticipationRpc(
+        raceClientA,
+        cancelParticipantLessonRaceId,
+        cancelParticipantRaceTarget.lesson_participant_id,
+      ),
+    ),
+    rpcOutcome(() => cancelLessonRpc(raceClientB, cancelParticipantLessonRaceId)),
+  ]);
+  const cancelParticipantRaceTargetAfter = await readParticipant(
+    cancelParticipantLessonRaceId,
+    groupStudent.id,
+  );
+  const cancelParticipantRaceLedger = await teacherClient
+    .from("package_credit_transactions")
+    .select("id")
+    .eq("lesson_id", cancelParticipantLessonRaceId)
+    .eq("lesson_participant_id", cancelParticipantRaceTarget.lesson_participant_id)
+    .eq("type", "reservation_released");
+  check(
+    !cancelParticipantRaceLedger.error &&
+      cancelParticipantRace.some((outcome) => outcome.ok && outcome.data === true) &&
+      cancelParticipantRaceTargetAfter.billing_status === "released" &&
+      (cancelParticipantRaceLedger.data ?? []).length === 1,
+    "Cancel participation x lesson cancel real nao duplica release do participante",
+  );
+
+  const noShowCompleteRaceId = await createPhase6Lesson({
+    index: 3,
+    title: "Aula E2E 6B corrida no-show complete",
+    date: phase6bRaceDate,
+  });
+  const noShowCompleteRaceParticipant = await readParticipant(noShowCompleteRaceId, studentsA.id);
+  const noShowCompleteRace = await Promise.all([
+    rpcOutcome(() =>
+      setAttendanceStatus(
+        raceClientA,
+        noShowCompleteRaceId,
+        noShowCompleteRaceParticipant.lesson_participant_id,
+        "absent",
+      ),
+    ),
+    rpcOutcome(() => completeLessonRpc(raceClientB, noShowCompleteRaceId)),
+  ]);
+  const noShowCompleteRaceAfter = await getSingle(
+    "aula apos corrida no-show complete 6B",
+    teacherClient
+      .from("teacher_lesson_schedule_records")
+      .select("id, status")
+      .eq("id", noShowCompleteRaceId),
+  );
+  const noShowCompleteRaceParticipantAfter = await readParticipant(noShowCompleteRaceId, studentsA.id);
+  check(
+    noShowCompleteRace.some((outcome) => outcome.ok && outcome.data === true) &&
+      (
+        (noShowCompleteRaceAfter.status === "completed" &&
+          noShowCompleteRaceParticipantAfter.attendance_status === "absent" &&
+          noShowCompleteRaceParticipantAfter.billing_status === "consumed") ||
+        (noShowCompleteRaceAfter.status === "scheduled" &&
+          noShowCompleteRaceParticipantAfter.attendance_status === "absent" &&
+          noShowCompleteRaceParticipantAfter.billing_status === "reserved") ||
+        (noShowCompleteRaceAfter.status === "scheduled" &&
+          noShowCompleteRaceParticipantAfter.attendance_status === null &&
+          noShowCompleteRaceParticipantAfter.billing_status === "reserved")
+      ),
+    "No-show x completion real termina serializado sem consumir participante indefinido",
   );
 
   // ── Escrita direta ────────────────────────────────────────────────────────

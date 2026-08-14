@@ -797,6 +797,7 @@ export type TeacherLessonParticipantCreditRecord = {
   student_id: UUID;
   status: ParticipantStatus;
   confirmed_at: Timestamp | null;
+  declined_at: Timestamp | null;
   attendance_status: AttendanceStatus | null;
   attendance_marked_at: Timestamp | null;
   full_name: string;
@@ -1526,9 +1527,10 @@ export type Database = {
       };
       lesson_participants: {
         Row: LessonParticipant;
-        // Materializados por `create_lesson()`. Sem INSERT direto desde a 5C.
+        // Materializados por `create_lesson()`. Sem escrita direta desde a 5C/6B:
+        // participação cancelada e créditos passam exclusivamente por RPC.
         Insert: never;
-        Update: Partial<LessonParticipant>;
+        Update: never;
         Relationships: [];
       };
       package_templates: {
@@ -1892,6 +1894,25 @@ export type Database = {
           p_lesson_id: UUID;
           p_lesson_participant_id: UUID;
           p_present: boolean;
+        };
+        Returns: boolean;
+      };
+      set_lesson_attendance_status: {
+        Args: {
+          p_lesson_id: UUID;
+          p_lesson_participant_id: UUID;
+          p_attendance_status?: AttendanceStatus | null;
+        };
+        Returns: boolean;
+      };
+      cancel_lesson: {
+        Args: { p_lesson_id: UUID };
+        Returns: boolean;
+      };
+      cancel_lesson_participation: {
+        Args: {
+          p_lesson_id: UUID;
+          p_lesson_participant_id: UUID;
         };
         Returns: boolean;
       };
