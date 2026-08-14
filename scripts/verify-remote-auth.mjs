@@ -4033,6 +4033,38 @@ try {
 
   const phase6bPastOffset = 7;
   const phase6bRaceOffset = 8;
+  // As fixtures são datadas a partir de HOJE, por isso o conjunto de ontem fica
+  // para trás e a banda de datas de teste enche-se ao fim de alguns dias — até
+  // deixar de haver três semanas seguidas livres e a suite passar a falhar por
+  // acumulação, não por defeito. Antes de escolher datas, arruma-se o que ficou:
+  // só exceções DESTE professor E2E, só na banda longínqua que os testes usam, e
+  // sempre pela RPC oficial. As que esta execução precisar são recriadas a
+  // seguir por `prepareException`, que é idempotente.
+  const staleExceptions = await teacherClient
+    .from("teacher_availability_exception_records")
+    .select("id")
+    .eq("is_active", true)
+    .gte("exception_date", dateOnlyFromNow(150))
+    .lte("exception_date", dateOnlyFromNow(400));
+  if (staleExceptions.error) {
+    throw new Error(`Arrumar excecoes E2E antigas: ${summarizeError(staleExceptions.error)}`);
+  }
+  let cleanedExceptions = 0;
+  for (const row of staleExceptions.data ?? []) {
+    const { error: deactivateError } = await teacherClient.rpc(
+      "deactivate_teacher_availability_exception",
+      {
+        p_exception_id: row.id,
+        p_idempotency_key: deterministicUuid(`e2e-exception-cleanup:${row.id}`),
+      },
+    );
+    if (!deactivateError) cleanedExceptions += 1;
+  }
+  check(
+    cleanedExceptions === (staleExceptions.data ?? []).length,
+    `Excecoes E2E antigas arrumadas (${cleanedExceptions}/${(staleExceptions.data ?? []).length})`,
+  );
+
   const phase6bFutureOffset = await pickUnusedAvailabilityOffset(180, 220);
   const phase6bRecurringStartOffset = await pickUnusedWeeklyAvailabilityOffset(230, 260, 3);
   const phase6bPastDate = dateOnlyFromNow(-phase6bPastOffset);
@@ -4972,6 +5004,248 @@ try {
   await mustReturnNoRows("Admin nao le a projecao de aulas do professor", () =>
     adminClient.from("teacher_lesson_schedule_records").select("id").limit(1),
   );
+
+  section("Reagendamento operacional (6C.1)");
+
+  // Janelas próprias, longe das já usadas pela 6A/6B: reagendar valida a
+  // disponibilidade da data NOVA, e reutilizar uma janela ocupada faria a
+  // suite falhar por um conflito legítimo em vez de por um defeito.
+  // Ambas as datas dentro da validade dos pacotes E2E (que expiram a +320):
+  // `create_lesson` escolhe o pacote que expira mais cedo, e reagendar exige
+  // que esse mesmo pacote continue a cobrir a data nova.
+  // A serie recorrente da 6B arranca entre +230 e +260 e estende-se 14 dias,
+  // portanto ocupa ate ~+274. A 6C.1 fica acima disso e abaixo de +320, que e
+  // onde a validade dos pacotes E2E termina.
+  const phase6cOriginOffset = await pickUnusedAvailabilityOffset(280, 296);
+  const phase6cTargetOffset = await pickUnusedAvailabilityOffset(298, 316);
+  const phase6cOriginDate = dateOnlyFromNow(phase6cOriginOffset);
+  const phase6cTargetDate = dateOnlyFromNow(phase6cTargetOffset);
+
+  await prepareException(
+    teacherClient,
+    "Disponibilidade de origem 6C.1",
+    phase6cOriginDate,
+    `lesson-6c-origin-${phase6RunSuffix}`,
+    "06:00",
+    "22:00",
+  );
+  await prepareException(
+    teacherClient,
+    "Disponibilidade de destino 6C.1",
+    phase6cTargetDate,
+    `lesson-6c-target-${phase6RunSuffix}`,
+    "06:00",
+    "22:00",
+  );
+
+  await assignLessonPackage(
+    teacherClient,
+    studentsA.id,
+    `Pacote reagendamento ${phase6RunSuffix}`,
+    40,
+    deterministicUuid(`lesson-6c-package:${phase6RunSuffix}`),
+    sportRow.id,
+    { startsOn: dateOnlyFromNow(-10), expiresOn: dateOnlyFromNow(400) },
+  );
+
+  const rescheduleRpc = (client, lessonIdValue, overrides = {}) =>
+    client.rpc("reschedule_lesson", {
+      p_lesson_id: lessonIdValue,
+      p_starts_at: lisbonInstant(phase6cTargetDate, "10:00"),
+      p_ends_at: lisbonInstant(phase6cTargetDate, "11:00"),
+      p_reason: "Aluno pediu para trocar de dia",
+      p_location_id: null,
+      p_location_resource_id: null,
+      p_idempotency_key: deterministicUuid(`lesson-6c-reschedule:${phase6RunSuffix}`),
+      ...overrides,
+    });
+
+  const rescheduleLessonId = await createPhase6Lesson({
+    index: 0,
+    title: "Aula E2E 6C reagendar",
+    date: phase6cOriginDate,
+  });
+  const rescheduleParticipant = await readParticipant(rescheduleLessonId, studentsA.id);
+  const reschedulePackageBefore = await getSingle(
+    "pacote antes de reagendar",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_available, credits_reserved, credits_used")
+      .eq("name", rescheduleParticipant.package_name),
+  );
+
+  const { data: replacementId, error: rescheduleError } = await rescheduleRpc(
+    teacherClient,
+    rescheduleLessonId,
+  );
+  if (rescheduleError) throw new Error(`Reagendar: ${summarizeError(rescheduleError)}`);
+  ok(`Professor A reagendou a aula E2E (${maskId(replacementId)})`);
+
+  const originalAfter = await getSingle(
+    "aula original depois de reagendar",
+    teacherClient
+      .from("teacher_lesson_schedule_records")
+      .select("id, status, starts_at, context_kind")
+      .eq("id", rescheduleLessonId),
+  );
+  const replacementAfter = await getSingle(
+    "aula substituta",
+    teacherClient
+      .from("teacher_lesson_schedule_records")
+      .select("id, status, starts_at, sport_name, context_kind, participant_count")
+      .eq("id", replacementId),
+  );
+  check(
+    originalAfter.status === "rescheduled" && replacementAfter.status === "scheduled",
+    "A original fica historica e a substituta fica agendada",
+  );
+  check(
+    replacementAfter.participant_count === 1 &&
+      replacementAfter.context_kind === originalAfter.context_kind,
+    "A substituta herda contexto e participantes da original",
+  );
+
+  // ── Creditos: a reserva muda de aula, os saldos nao mudam ──
+  const reschedulePackageAfter = await getSingle(
+    "pacote depois de reagendar",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_available, credits_reserved, credits_used")
+      .eq("id", reschedulePackageBefore.id),
+  );
+  check(
+    reschedulePackageAfter.credits_available === reschedulePackageBefore.credits_available &&
+      reschedulePackageAfter.credits_reserved === reschedulePackageBefore.credits_reserved &&
+      reschedulePackageAfter.credits_used === reschedulePackageBefore.credits_used,
+    "Reagendar nao move disponivel, reservado nem utilizado",
+  );
+
+  const replacementParticipant = await readParticipant(replacementId, studentsA.id);
+  check(
+    replacementParticipant.billing_status === "reserved" &&
+      replacementParticipant.credits_reserved === rescheduleParticipant.credits_reserved &&
+      replacementParticipant.package_name === rescheduleParticipant.package_name,
+    "A reserva chega a substituta com o mesmo pacote e a mesma quantidade",
+  );
+
+  const originalParticipantAfter = await readParticipant(rescheduleLessonId, studentsA.id);
+  check(
+    originalParticipantAfter.billing_status === "released" &&
+      originalParticipantAfter.credits_reserved === 0,
+    "A participacao original fica libertada, sem creditos pendurados",
+  );
+
+  // ── Idempotencia ──
+  const { data: repeatReplacement, error: repeatError } = await rescheduleRpc(
+    teacherClient,
+    rescheduleLessonId,
+  );
+  if (repeatError) throw new Error(`Repetir reagendamento: ${summarizeError(repeatError)}`);
+  const packageAfterRepeat = await getSingle(
+    "pacote depois de repetir",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_reserved")
+      .eq("id", reschedulePackageBefore.id),
+  );
+  check(
+    repeatReplacement === replacementId &&
+      packageAfterRepeat.credits_reserved === reschedulePackageAfter.credits_reserved,
+    "Repetir com a mesma chave devolve a mesma substituta e nao transfere duas vezes",
+  );
+
+  // ── Recusas com JWT real ──
+  await mustReject("Aula ja reagendada nao volta a ser reagendada", async () =>
+    rescheduleRpc(teacherClient, rescheduleLessonId, {
+      p_idempotency_key: deterministicUuid(`lesson-6c-again:${phase6RunSuffix}`),
+    }),
+  );
+  await mustReject("Professor B nao reagenda a aula do Professor A", async () =>
+    rescheduleRpc(teacherBClient, replacementId, {
+      p_idempotency_key: deterministicUuid(`lesson-6c-teacher-b:${phase6RunSuffix}`),
+    }),
+  );
+  await mustReject("Aluno nao reagenda", async () =>
+    rescheduleRpc(studentClient, replacementId, {
+      p_idempotency_key: deterministicUuid(`lesson-6c-student:${phase6RunSuffix}`),
+    }),
+  );
+  await mustReject("Admin nao reagenda aula de professor", async () =>
+    rescheduleRpc(adminClient, replacementId, {
+      p_idempotency_key: deterministicUuid(`lesson-6c-admin:${phase6RunSuffix}`),
+    }),
+  );
+  await mustReject("Motivo demasiado curto e recusado", async () =>
+    rescheduleRpc(teacherClient, replacementId, {
+      p_reason: "x",
+      p_idempotency_key: deterministicUuid(`lesson-6c-reason:${phase6RunSuffix}`),
+    }),
+  );
+  await mustReject("Horario fora da disponibilidade e recusado", async () =>
+    rescheduleRpc(teacherClient, replacementId, {
+      p_starts_at: lisbonInstant(phase6cTargetDate, "23:10"),
+      p_ends_at: lisbonInstant(phase6cTargetDate, "23:50"),
+      p_idempotency_key: deterministicUuid(`lesson-6c-outside:${phase6RunSuffix}`),
+    }),
+  );
+  await mustReject("Reagendar para o mesmo horario e recusado", async () =>
+    rescheduleRpc(teacherClient, replacementId, {
+      p_idempotency_key: deterministicUuid(`lesson-6c-same:${phase6RunSuffix}`),
+    }),
+  );
+
+  // ── Nada ficou a meio depois das recusas ──
+  const replacementAfterRefusals = await getSingle(
+    "substituta depois das recusas",
+    teacherClient
+      .from("teacher_lesson_schedule_records")
+      .select("id, status")
+      .eq("id", replacementId),
+  );
+  const packageAfterRefusals = await getSingle(
+    "pacote depois das recusas",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_available, credits_reserved, credits_used")
+      .eq("id", reschedulePackageBefore.id),
+  );
+  check(
+    replacementAfterRefusals.status === "scheduled" &&
+      packageAfterRefusals.credits_reserved === reschedulePackageAfter.credits_reserved &&
+      packageAfterRefusals.credits_available === reschedulePackageAfter.credits_available,
+    "Uma recusa deixa a aula e os saldos exatamente como estavam",
+  );
+
+  // ── Escrita direta continua fechada ──
+  await mustReject("Professor nao marca uma aula como reagendada diretamente", async () =>
+    teacherClient.from("lessons").update({ status: "rescheduled" }).eq("id", replacementId),
+  );
+
+  // ── Privacidade: o aluno ve a aula nova, sem detalhes administrativos ──
+  const studentSeesReplacement = await maybeSingle(
+    "aula reagendada vista pelo aluno",
+    studentClient
+      .from("student_lesson_records")
+      .select("id, status, starts_at, teacher_name")
+      .eq("id", replacementId),
+  );
+  check(
+    studentSeesReplacement !== null && studentSeesReplacement.status === "scheduled",
+    "O aluno ve a aula substituta na sua projecao",
+  );
+  if (studentSeesReplacement) {
+    check(
+      forbiddenColumns(studentSeesReplacement, [
+        "private_notes",
+        "rescheduled_from_id",
+        "rescheduled_to_id",
+        "reschedule_reason",
+        "teacher_id",
+        "organization_id",
+      ]).length === 0,
+      "A projecao do aluno nao expoe a mecanica interna do reagendamento",
+    );
+  }
 
   section("Conta bloqueada e anonimo");
   await signIn(blockedClient, credentials.blocked.email, credentials.blocked.password, "Conta bloqueada");

@@ -445,6 +445,29 @@ Depois da conclusão, cada participação presente ou em falta/no-show passa `re
 
 **Não implementado:** política configurável de janela/percentagem/tolerância, cancelamento self-service do aluno, reagendamento operacional, reativação de participação cancelada, edição/cancelamento de série inteira, confirmação pelo aluno, lista de espera, notificações e pagamentos.
 
+### Reagendamento de aulas (Etapa 6C.1)
+
+Reagendar **não** é editar. `update_lesson()` altera campos da mesma aula; `reschedule_lesson()` cria um facto novo e preserva o antigo:
+
+```text
+original   → rescheduled, com motivo, a apontar para a substituta
+substituta → scheduled, a apontar de volta
+```
+
+A original nunca é apagada. O mecanismo já vinha desenhado da Fase 1 — estado, colunas, constraints e `transfer_participation_reservation()` — e a 6C.1 apenas os ligou numa transação. **Não criar uma segunda arquitetura de reagendamento.**
+
+**Créditos: a reserva muda de aula, os saldos não.** `transfer_participation_reservation()` move a reserva entre participações sem tocar em `student_packages`. Como nenhum valor muda, **não há linha no livro-razão** — o rasto operacional é `lesson_change_history`. Nunca fazer `reserved → available → reserved`.
+
+**Validade do pacote.** `package_covers_lesson_date()` confirma que o pacote reservado ainda cobre a data nova; se não cobrir, a operação inteira é recusada. Não trocar de pacote automaticamente: isso é decidir por quem paga.
+
+**Uma aula não colide com a que veio substituir.** `ensure_lesson_has_no_conflict()` ignora a antecessora indicada em `rescheduled_from_id`, e só quando é do mesmo professor. Sem isso, mover uma aula meia hora para a frente era recusado por sobreposição consigo própria.
+
+**Snapshot e recorrência.** Quem estava previsto continua previsto — a composição atual da turma não é reconsultada. De uma série, só esta ocorrência muda.
+
+**Autorização.** Só o professor responsável: nem owner/manager de clube, nem admin, nem aluno. A RPC não aceita professor, organização, participante nem pacote — deriva tudo da aula original.
+
+**Ainda não existe interface** (6C.2), nem reagendamento de série inteira, "esta e futuras" ou self-reschedule do aluno.
+
 ### Ao criar uma tabela nova
 
 ```sql
@@ -793,7 +816,7 @@ Interface em `/professor/clubes/[id]/calendario`, com filtro por professor no UR
 
 **Não implementado:** aulas, participantes, locais, campos, recursos, conflitos, reservas e créditos. Os únicos estados são disponível e indisponível — não escrever "ocupado", "reservado", "lotado", "vagas" ou "conflito", porque nada disso existe ainda para ser verdade.
 
-Ordem atual: Fase 6B fechada no código local → próxima etapa é a 6C de reagendamento operacional seguro.
+Ordem atual: 6A, 6B e 6C.1 fechadas → próxima etapa é a 6C.2, a interface de reagendamento.
 
 ### `src/types/database.ts`
 
@@ -832,7 +855,7 @@ Não existe um comando de formatação separado. Use `npm run lint:fix` apenas p
 | 6 | Cancelamento, reagendamento, presenças e histórico | **Parcialmente concluído** — 6A/6B: presença, falta/no-show, conclusão normal/mista, cancelamento de aula e cancelamento de participação com `reserved -> available` ou `reserved -> used` seguros. Falta reagendamento operacional da 6C |
 | 7 | Área do aluno: aulas, créditos e confirmação | **Planeado** |
 | 8 | Notificações, lembretes e expiração agendada | **Planeado** |
-| 9 | Supabase real, concorrência, acessibilidade e deployment | **Parcialmente concluído** — RLS em PGlite e validação real da Fase 4/Fase 5/Fase 6A feitos; concorrência real de aulas/créditos/recorrência/conclusão coberta, validação real da 6B em curso nesta entrega, deployment pendente |
+| 9 | Supabase real, concorrência, acessibilidade e deployment | **Parcialmente concluído** — RLS em PGlite e validação real das Fases 4, 5, 6A e 6B feitas; concorrência real de aulas/créditos/recorrência/conclusão coberta; deployment pendente |
 
 **Ao concluir uma fase ou etapa:** `npm run check`, corrigir tudo o que falhe, atualizar `implementation_plan.md`, e resumir o que foi criado e como testar manualmente.
 

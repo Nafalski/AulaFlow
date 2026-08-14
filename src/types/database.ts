@@ -1897,6 +1897,19 @@ export type Database = {
         };
         Returns: boolean;
       };
+      reschedule_lesson: {
+        Args: {
+          p_lesson_id: UUID;
+          p_starts_at: Timestamp;
+          p_ends_at: Timestamp;
+          p_reason: string;
+          p_location_id?: UUID | null;
+          p_location_resource_id?: UUID | null;
+          p_idempotency_key?: UUID | null;
+        };
+        /** Identificador da aula substituta. */
+        Returns: UUID;
+      };
       set_lesson_attendance_status: {
         Args: {
           p_lesson_id: UUID;

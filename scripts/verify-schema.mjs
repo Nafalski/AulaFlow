@@ -10844,6 +10844,544 @@ check(
   `grupos recorrentes incoerentes: ${invalidRecurringGroups.map((row) => row.recurrence_group_id).join(", ")}`,
 );
 
+// ── Reagendamento operacional (Etapa 6C.1) ───────────────────────────────────
+
+section("Reagendamento de aulas");
+
+// Segundas-feiras livres, longe das aulas criadas nas secções anteriores. A
+// rotina do professor tem 09:00–13:00 e 15:00–20:00 à segunda; em setembro
+// Lisboa está em WEST (UTC+1), por isso 10:00 locais são 09:00 UTC.
+const RESCHED_MON_A_10H = "2026-09-07 09:00+00"; // 10:00 Lisboa
+const RESCHED_MON_A_11H = "2026-09-07 10:00+00";
+const RESCHED_MON_A_16H = "2026-09-07 15:00+00"; // 16:00 Lisboa
+const RESCHED_MON_A_17H = "2026-09-07 16:00+00";
+const RESCHED_MON_B_10H = "2026-09-14 09:00+00";
+const RESCHED_MON_B_11H = "2026-09-14 10:00+00";
+
+// Pacotes com validade larga: o reagendamento verifica que o pacote reservado
+// ainda cobre a DATA NOVA, e os pacotes das etapas anteriores expiram em agosto.
+const reschedAnaPack = await assignPackageAs(TEACHER_UID, {
+  student: ana.id,
+  name: "Pacote 6C.1 Ana",
+  credits: 40,
+  sportId: sport,
+  starts: "2026-08-01",
+  expires: "2026-12-31",
+});
+const reschedBrunoPack = await assignPackageAs(TEACHER_UID, {
+  student: bruno.id,
+  name: "Pacote 6C.1 Bruno",
+  credits: 40,
+  sportId: sport,
+  starts: "2026-08-01",
+  expires: "2026-12-31",
+});
+
+/** Aula criada diretamente, com a reserva feita a partir de um pacote escolhido. */
+async function reschedulableLesson({ title, start, end, students }) {
+  const lesson = await one(
+    `insert into public.lessons
+       (organization_id, teacher_id, sport_id, title, starts_at, ends_at, credit_cost)
+     values ($1,$2,$3,$4,$5::timestamptz,$6::timestamptz,1) returning id`,
+    [org, teacher.id, sport, title, start, end],
+  );
+  for (const [studentId, packageId] of students) {
+    await reserveParticipant(lesson.id, studentId, packageId);
+  }
+  return lesson;
+}
+
+const rescheduleAs = (uid, args) =>
+  asDatabaseRole("authenticated", uid, () =>
+    one(
+      `select public.reschedule_lesson(
+         p_lesson_id => $1::uuid,
+         p_starts_at => $2::timestamptz,
+         p_ends_at => $3::timestamptz,
+         p_reason => $4::text,
+         p_location_id => $5::uuid,
+         p_location_resource_id => $6::uuid,
+         p_idempotency_key => $7::uuid
+       ) as id`,
+      [
+        args.lessonId,
+        args.start ?? RESCHED_MON_A_16H,
+        args.end ?? RESCHED_MON_A_17H,
+        args.reason ?? "Aluno pediu para trocar de dia",
+        args.locationId ?? null,
+        args.resourceId ?? null,
+        args.idempotencyKey ?? randomUUID(),
+      ],
+    ),
+  );
+
+const ledgerRows = async () =>
+  Number((await one(`select count(*)::int as total from public.package_credit_transactions`)).total);
+
+const participationsOf = (lessonId) =>
+  rows(
+    `select student_id, status::text, billing_status::text, credits_reserved,
+            credits_consumed, student_package_id, is_exception
+       from public.lesson_participants where lesson_id=$1 order by student_id`,
+    [lessonId],
+  );
+
+// ── Reagendamento individual ────────────────────────────────────────────────
+
+const reschedLesson = await reschedulableLesson({
+  title: "Aula a reagendar 6C.1",
+  start: RESCHED_MON_A_10H,
+  end: RESCHED_MON_A_11H,
+  students: [[ana.id, reschedAnaPack.id]],
+});
+
+const reschedPackBefore = await pkg(reschedAnaPack.id);
+const reschedLedgerBefore = await ledgerRows();
+const reschedOriginalParts = await participationsOf(reschedLesson.id);
+
+const reschedKey = randomUUID();
+const replacement = await rescheduleAs(TEACHER_UID, {
+  lessonId: reschedLesson.id,
+  idempotencyKey: reschedKey,
+});
+
+const originalRow = await one(
+  `select status::text, rescheduled_to_id, reschedule_reason, starts_at
+     from public.lessons where id=$1`,
+  [reschedLesson.id],
+);
+const replacementRow = await one(
+  `select status::text, rescheduled_from_id, teacher_id, organization_id, sport_id,
+          context_kind::text, club_organization_id, group_id, credit_cost,
+          max_participants, created_by, starts_at, ends_at
+     from public.lessons where id=$1`,
+  [replacement.id],
+);
+
+check(
+  originalRow.status === "rescheduled" &&
+    originalRow.rescheduled_to_id === replacement.id &&
+    originalRow.reschedule_reason === "Aluno pediu para trocar de dia",
+  "a aula original passa a histórica, guarda o motivo e aponta para a substituta",
+);
+check(
+  replacementRow.status === "scheduled" &&
+    replacementRow.rescheduled_from_id === reschedLesson.id &&
+    replacementRow.teacher_id === teacher.id &&
+    replacementRow.organization_id === org &&
+    replacementRow.sport_id === sport &&
+    replacementRow.context_kind === "personal" &&
+    replacementRow.created_by === TEACHER_UID,
+  "a substituta herda professor, organização, modalidade e contexto da original",
+);
+
+// ── Créditos: a reserva move-se, os saldos não ──────────────────────────────
+
+const reschedPackAfter = await pkg(reschedAnaPack.id);
+check(
+  reschedPackAfter.credits_available === reschedPackBefore.credits_available &&
+    reschedPackAfter.credits_reserved === reschedPackBefore.credits_reserved &&
+    reschedPackAfter.credits_used === reschedPackBefore.credits_used,
+  "reagendar não move disponível, reservado nem utilizado",
+);
+check(
+  (await ledgerRows()) === reschedLedgerBefore,
+  "reagendar não escreve no livro-razão: nenhum valor mudou",
+);
+
+const originalPartsAfter = await participationsOf(reschedLesson.id);
+const replacementParts = await participationsOf(replacement.id);
+check(
+  originalPartsAfter.length === 1 &&
+    originalPartsAfter[0].billing_status === "released" &&
+    originalPartsAfter[0].credits_reserved === 0 &&
+    originalPartsAfter[0].credits_consumed === 0,
+  "a participação original fica libertada, sem créditos pendurados",
+);
+check(
+  replacementParts.length === 1 &&
+    replacementParts[0].student_id === ana.id &&
+    replacementParts[0].billing_status === "reserved" &&
+    replacementParts[0].credits_reserved === reschedOriginalParts[0].credits_reserved &&
+    replacementParts[0].student_package_id === reschedOriginalParts[0].student_package_id,
+  "a reserva chega à substituta com o mesmo pacote e a mesma quantidade",
+);
+
+check(
+  Number(
+    (
+      await one(
+        `select count(*)::int as total from public.lesson_change_history where lesson_id=$1`,
+        [reschedLesson.id],
+      )
+    ).total,
+  ) >= 2,
+  "o reagendamento deixa rasto no histórico da aula original",
+);
+
+// ── Idempotência ────────────────────────────────────────────────────────────
+
+const lessonsBeforeRepeat = Number(
+  (await one(`select count(*)::int as total from public.lessons`)).total,
+);
+const repeatReschedule = await rescheduleAs(TEACHER_UID, {
+  lessonId: reschedLesson.id,
+  idempotencyKey: reschedKey,
+});
+const packAfterRepeat = await pkg(reschedAnaPack.id);
+check(
+  repeatReschedule.id === replacement.id &&
+    Number((await one(`select count(*)::int as total from public.lessons`)).total) ===
+      lessonsBeforeRepeat &&
+    packAfterRepeat.credits_reserved === reschedPackAfter.credits_reserved,
+  "repetir com a mesma chave devolve a mesma substituta e não transfere duas vezes",
+);
+
+// ── Uma aula não colide com aquela que veio substituir ──────────────────────
+
+const overlapKey = randomUUID();
+const overlapReplacement = await rescheduleAs(TEACHER_UID, {
+  lessonId: replacement.id,
+  // Meia hora depois: sobrepõe-se à própria aula que está a substituir.
+  start: "2026-09-07 15:30+00",
+  end: "2026-09-07 16:30+00",
+  reason: "Atrasar meia hora",
+  idempotencyKey: overlapKey,
+});
+check(
+  Boolean(overlapReplacement.id),
+  "mover uma aula para dentro do seu próprio horário é aceite",
+);
+
+// ── Recusas ─────────────────────────────────────────────────────────────────
+
+await mustReject("aula já reagendada não volta a ser reagendada", () =>
+  rescheduleAs(TEACHER_UID, { lessonId: reschedLesson.id }),
+);
+await mustReject("professor de outra organização não reagenda", () =>
+  rescheduleAs(OTHER_TEACHER_UID, { lessonId: overlapReplacement.id }),
+);
+await mustReject("aluno não reagenda", () =>
+  rescheduleAs(ANA_UID, { lessonId: overlapReplacement.id }),
+);
+await mustReject("administrador da plataforma não reagenda", () =>
+  rescheduleAs(ADMIN_UID, { lessonId: overlapReplacement.id }),
+);
+await mustReject("anónimo não reagenda", () =>
+  asDatabaseRole("anon", null, () =>
+    db.query(
+      `select public.reschedule_lesson($1,$2::timestamptz,$3::timestamptz,'Sem sessão')`,
+      [overlapReplacement.id, RESCHED_MON_B_10H, RESCHED_MON_B_11H],
+    ),
+  ),
+);
+
+await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  db.query(`select public.admin_set_account_status($1,'blocked','Teste 6C.1')`, [TEACHER_UID]),
+);
+await mustReject("conta bloqueada não reagenda", () =>
+  rescheduleAs(TEACHER_UID, { lessonId: overlapReplacement.id }),
+);
+await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  db.query(`select public.admin_set_account_status($1,'active',null)`, [TEACHER_UID]),
+);
+
+await mustReject("motivo demasiado curto", () =>
+  rescheduleAs(TEACHER_UID, { lessonId: overlapReplacement.id, reason: "x" }),
+);
+await mustReject("horário que termina antes de começar", () =>
+  rescheduleAs(TEACHER_UID, {
+    lessonId: overlapReplacement.id,
+    start: RESCHED_MON_B_11H,
+    end: RESCHED_MON_B_10H,
+  }),
+);
+await mustReject("reagendar para o mesmo horário, local e campo", () =>
+  rescheduleAs(TEACHER_UID, {
+    lessonId: overlapReplacement.id,
+    start: "2026-09-07 15:30+00",
+    end: "2026-09-07 16:30+00",
+  }),
+);
+await mustReject("horário fora da disponibilidade do professor", () =>
+  rescheduleAs(TEACHER_UID, {
+    lessonId: overlapReplacement.id,
+    start: "2026-09-07 20:00+00",
+    end: "2026-09-07 21:00+00",
+  }),
+);
+await mustReject("dia sem rotina nem exceção", () =>
+  rescheduleAs(TEACHER_UID, {
+    lessonId: overlapReplacement.id,
+    start: "2026-09-13 09:00+00",
+    end: "2026-09-13 10:00+00",
+  }),
+);
+await mustReject("campo sem local", () =>
+  rescheduleAs(TEACHER_UID, {
+    lessonId: overlapReplacement.id,
+    start: RESCHED_MON_B_10H,
+    end: RESCHED_MON_B_11H,
+    resourceId: court1.id,
+  }),
+);
+await mustReject("campo que pertence a outro local", () =>
+  rescheduleAs(TEACHER_UID, {
+    lessonId: overlapReplacement.id,
+    start: RESCHED_MON_B_10H,
+    end: RESCHED_MON_B_11H,
+    locationId: managedLocation.id,
+    resourceId: clubCourt1.id,
+  }),
+);
+
+// Conflito com outra aula ativa do mesmo professor.
+const blockerLesson = await reschedulableLesson({
+  title: "Aula que ocupa o horário 6C.1",
+  start: RESCHED_MON_B_10H,
+  end: RESCHED_MON_B_11H,
+  students: [[bruno.id, reschedBrunoPack.id]],
+});
+void blockerLesson;
+await mustReject("reagendar para cima de outra aula do professor", () =>
+  rescheduleAs(TEACHER_UID, {
+    lessonId: overlapReplacement.id,
+    start: RESCHED_MON_B_10H,
+    end: RESCHED_MON_B_11H,
+  }),
+);
+
+// ── Nada fica a meio depois de uma recusa ───────────────────────────────────
+
+const stateAfterRefusals = await one(
+  `select status::text, rescheduled_to_id from public.lessons where id=$1`,
+  [overlapReplacement.id],
+);
+const partsAfterRefusals = await participationsOf(overlapReplacement.id);
+check(
+  stateAfterRefusals.status === "scheduled" &&
+    stateAfterRefusals.rescheduled_to_id === null &&
+    partsAfterRefusals.length === 1 &&
+    partsAfterRefusals[0].billing_status === "reserved",
+  "uma recusa deixa a aula e a reserva exatamente como estavam",
+);
+
+// ── Estados terminais ───────────────────────────────────────────────────────
+
+const cancelledForReschedule = await reschedulableLesson({
+  title: "Cancelada antes de reagendar 6C.1",
+  start: "2026-09-21 09:00+00",
+  end: "2026-09-21 10:00+00",
+  students: [[ana.id, reschedAnaPack.id]],
+});
+await cancelLessonRpcAs(TEACHER_UID, cancelledForReschedule.id);
+await mustReject("aula cancelada não é reagendada", () =>
+  rescheduleAs(TEACHER_UID, { lessonId: cancelledForReschedule.id }),
+);
+
+// Presença registada trava o reagendamento, tal como trava o cancelamento.
+const attendedForReschedule = await one(
+  `insert into public.lessons
+     (organization_id, teacher_id, sport_id, title, starts_at, ends_at, credit_cost)
+   values ($1,$2,$3,'Com presença 6C.1',
+           now() - '5 days'::interval + '37 minutes'::interval,
+           now() - '5 days'::interval + '97 minutes'::interval, 1)
+   returning id`,
+  [org, teacher.id, sport],
+);
+const attendedPart = await reserveParticipant(
+  attendedForReschedule.id,
+  ana.id,
+  reschedAnaPack.id,
+);
+await setAttendanceStatusAs(TEACHER_UID, attendedForReschedule.id, attendedPart.id, "present");
+await mustReject("aula com presença registada não é reagendada", () =>
+  rescheduleAs(TEACHER_UID, {
+    lessonId: attendedForReschedule.id,
+    start: "2026-09-21 09:00+00",
+    end: "2026-09-21 10:00+00",
+  }),
+);
+
+// ── Validade do pacote na data nova ─────────────────────────────────────────
+
+const shortPack = await assignPackageAs(TEACHER_UID, {
+  student: ana.id,
+  name: "Pacote que expira cedo 6C.1",
+  credits: 4,
+  expires: "2026-09-10",
+});
+const shortPackLesson = await reschedulableLesson({
+  title: "Aula com pacote curto 6C.1",
+  start: "2026-09-07 11:00+00",
+  end: "2026-09-07 12:00+00",
+  students: [[ana.id, shortPack.id]],
+});
+const shortPackBefore = await pkg(shortPack.id);
+await mustReject("pacote fora da validade na data nova recusa o reagendamento", () =>
+  rescheduleAs(TEACHER_UID, {
+    lessonId: shortPackLesson.id,
+    start: "2026-09-28 09:00+00",
+    end: "2026-09-28 10:00+00",
+  }),
+);
+const shortPackAfter = await pkg(shortPack.id);
+check(
+  shortPackAfter.credits_reserved === shortPackBefore.credits_reserved &&
+    shortPackAfter.credits_available === shortPackBefore.credits_available,
+  "pacote recusado por validade mantém os saldos intactos",
+);
+
+// ── Turma: o snapshot viaja inteiro ─────────────────────────────────────────
+
+const groupReschedLesson = await reschedulableLesson({
+  title: "Turma a reagendar 6C.1",
+  start: "2026-09-14 15:00+00",
+  end: "2026-09-14 16:00+00",
+  students: [
+    [ana.id, reschedAnaPack.id],
+    [bruno.id, reschedBrunoPack.id],
+  ],
+});
+const groupPartsBefore = await participationsOf(groupReschedLesson.id);
+const groupLedgerBefore = await ledgerRows();
+const groupReplacement = await rescheduleAs(TEACHER_UID, {
+  lessonId: groupReschedLesson.id,
+  start: "2026-09-14 16:00+00",
+  end: "2026-09-14 17:00+00",
+  reason: "Turma pediu mais tarde",
+});
+const groupPartsAfter = await participationsOf(groupReplacement.id);
+check(
+  groupPartsBefore.length > 1 &&
+    groupPartsAfter.length === groupPartsBefore.length &&
+    groupPartsAfter.every((part) =>
+      groupPartsBefore.some((before) => before.student_id === part.student_id),
+    ),
+  "uma aula de turma leva todos os participantes para a substituta",
+);
+check(
+  groupPartsAfter.every((part) => part.billing_status === "reserved") &&
+    (await ledgerRows()) === groupLedgerBefore,
+  "cada reserva da turma é transferida sem tocar no livro-razão",
+);
+
+// ── Recorrência: só esta ocorrência ─────────────────────────────────────────
+
+const reschedSeries = randomUUID();
+const seriesLessons = await rows(
+  `insert into public.lessons
+     (organization_id, teacher_id, sport_id, title, starts_at, ends_at,
+      is_recurring, recurrence_group_id, recurrence_rule, credit_cost)
+   values
+     ($1,$2,$3,'Série 6C.1 A', '2026-09-28 09:00+00','2026-09-28 10:00+00', true, $4,
+      jsonb_build_object('frequency','weekly','interval_weeks',1,'occurrence_index',1,'occurrence_count',3), 1),
+     ($1,$2,$3,'Série 6C.1 B', '2026-10-05 08:00+00','2026-10-05 09:00+00', true, $4,
+      jsonb_build_object('frequency','weekly','interval_weeks',1,'occurrence_index',2,'occurrence_count',3), 1),
+     ($1,$2,$3,'Série 6C.1 C', '2026-10-12 08:00+00','2026-10-12 09:00+00', true, $4,
+      jsonb_build_object('frequency','weekly','interval_weeks',1,'occurrence_index',3,'occurrence_count',3), 1)
+   returning id, starts_at`,
+  [org, teacher.id, sport, reschedSeries],
+);
+const seriesIds = seriesLessons
+  .sort((a, b) => new Date(a.starts_at).getTime() - new Date(b.starts_at).getTime())
+  .map((row) => row.id);
+for (const seriesId of seriesIds) {
+  await reserveParticipant(seriesId, ana.id, reschedAnaPack.id);
+}
+const seriesPackBefore = await pkg(reschedAnaPack.id);
+const seriesReplacement = await rescheduleAs(TEACHER_UID, {
+  lessonId: seriesIds[1],
+  start: "2026-10-05 15:00+00",
+  end: "2026-10-05 16:00+00",
+  reason: "Só esta semana muda",
+});
+const seriesAfter = await rows(
+  `select id, status::text as lesson_status, starts_at, recurrence_group_id
+     from public.lessons where id = any($1::uuid[]) order by starts_at`,
+  [[seriesIds[0], seriesIds[2]]],
+);
+const seriesReplacementRow = await one(
+  `select recurrence_group_id, is_recurring, recurrence_rule from public.lessons where id=$1`,
+  [seriesReplacement.id],
+);
+check(
+  seriesAfter.every((row) => row.lesson_status === "scheduled") &&
+    seriesAfter.every((row) => row.recurrence_group_id === reschedSeries),
+  "reagendar uma ocorrência deixa as outras exatamente como estavam",
+);
+check(
+  seriesReplacementRow.recurrence_group_id === reschedSeries &&
+    seriesReplacementRow.is_recurring === true,
+  "a substituta continua a pertencer à mesma série",
+);
+check(
+  (await pkg(reschedAnaPack.id)).credits_reserved === seriesPackBefore.credits_reserved,
+  "reagendar uma ocorrência não mexe nas reservas das outras",
+);
+
+// ── Escrita direta e permissões ─────────────────────────────────────────────
+
+await mustReject("cliente não marca uma aula como reagendada diretamente", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`update public.lessons set status='rescheduled' where id=$1`, [
+      overlapReplacement.id,
+    ]),
+  ),
+);
+
+const reschedFunctionAnon = await rows(
+  `select proc.proname from pg_proc proc
+     join pg_namespace ns on ns.oid = proc.pronamespace
+    where ns.nspname='public'
+      and proc.proname in ('reschedule_lesson','package_covers_lesson_date')
+      and has_function_privilege('anon', proc.oid, 'EXECUTE')`,
+);
+check(reschedFunctionAnon.length === 0, "anon não executa nenhuma função de reagendamento");
+
+const reschedInternal = await rows(
+  `select proc.proname from pg_proc proc
+     join pg_namespace ns on ns.oid = proc.pronamespace
+    where ns.nspname='public'
+      and proc.proname = 'package_covers_lesson_date'
+      and has_function_privilege('authenticated', proc.oid, 'EXECUTE')`,
+);
+check(
+  reschedInternal.length === 0,
+  "sondar a validade de um pacote alheio não é executável pelo cliente",
+);
+
+const reschedSearchPath = await rows(
+  `select proc.proname from pg_proc proc
+     join pg_namespace ns on ns.oid = proc.pronamespace
+    where ns.nspname='public'
+      and proc.proname in ('reschedule_lesson','package_covers_lesson_date')
+      and not exists (
+        select 1 from unnest(coalesce(proc.proconfig, array[]::text[])) as config
+        where config like 'search_path=%'
+      )`,
+);
+check(reschedSearchPath.length === 0, "as funções de reagendamento fixam search_path");
+
+// ── Invariante final: a cadeia é navegável e única ──────────────────────────
+
+const chainDuplicates = await rows(
+  `select rescheduled_to_id, count(*)::int as total
+     from public.lessons
+    where rescheduled_to_id is not null
+    group by rescheduled_to_id having count(*) > 1`,
+);
+check(chainDuplicates.length === 0, "nenhuma aula tem duas antecessoras");
+
+const orphanChain = await rows(
+  `select original.id
+     from public.lessons original
+     join public.lessons replacement on replacement.id = original.rescheduled_to_id
+    where original.status <> 'rescheduled'
+       or replacement.rescheduled_from_id is distinct from original.id`,
+);
+check(orphanChain.length === 0, "toda a cadeia de reagendamento aponta nos dois sentidos");
+
 section("Aulas (Fase 1)");
 
 const [generated] = await rows(

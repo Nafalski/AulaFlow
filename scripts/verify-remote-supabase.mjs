@@ -298,6 +298,8 @@ const expectedFunctions = [
   "cancel_lesson",
   "cancel_lesson_participation",
   "complete_lesson",
+  "reschedule_lesson",
+  "package_covers_lesson_date",
 ];
 
 const authenticatedRpc = [
@@ -356,6 +358,7 @@ const authenticatedRpc = [
   "cancel_lesson",
   "cancel_lesson_participation",
   "complete_lesson",
+  "reschedule_lesson",
 ];
 
 const internalFunctions = [
@@ -1238,6 +1241,47 @@ checks as (
           'credits_available', 'credits_total', 'credits_used'
         )
     ), 'ok')
+
+  union all
+  select
+    'estrutura',
+    'reagendamento reutiliza as colunas historicas da Fase 1',
+    (
+      select count(*) = 3
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'lessons'
+        and column_name in ('rescheduled_from_id', 'rescheduled_to_id', 'reschedule_reason')
+    ),
+    'ok'
+
+  union all
+  select
+    'seguranca',
+    'anon nao executa o reagendamento',
+    not exists (
+      select 1
+      from pg_proc proc
+      join pg_namespace ns on ns.oid = proc.pronamespace
+      where ns.nspname = 'public'
+        and proc.proname in ('reschedule_lesson', 'package_covers_lesson_date')
+        and has_function_privilege('anon', proc.oid, 'EXECUTE')
+    ),
+    'ok'
+
+  union all
+  select
+    'seguranca',
+    'validade de pacote alheio nao e sondavel pelo cliente',
+    not exists (
+      select 1
+      from pg_proc proc
+      join pg_namespace ns on ns.oid = proc.pronamespace
+      where ns.nspname = 'public'
+        and proc.proname = 'package_covers_lesson_date'
+        and has_function_privilege('authenticated', proc.oid, 'EXECUTE')
+    ),
+    'ok'
 
   union all
   select

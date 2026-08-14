@@ -447,7 +447,7 @@ A estrutura fica pronta para notificações push (Fase 8).
 | **3** | Alunos, turmas, locais, política de cancelamento | **Concluído** |
 | **4** | Pacotes: modelos, atribuição, ajustes, painel de saldo | **Concluído** — Etapas 1A, 1B, 1C, 1D e 1E validadas |
 | **5** | Calendário e criação de aulas, com reserva de créditos | **Concluído** — disponibilidade, calendário, clubes, locais, recursos, criação/edição de aulas, conflitos atómicos, reserva atómica de créditos, recorrência semanal segura e revisão integrada |
-| **6** | Cancelamento, reagendamento, presenças, histórico | **6A e 6B concluídas** — presença, falta/no-show, conclusão normal/mista, cancelamento de aula e cancelamento de participação com `reserved -> available` ou `reserved -> used` seguros. Falta reagendamento operacional |
+| **6** | Cancelamento, reagendamento, presenças, histórico | **6A, 6B e 6C.1 concluídas** (falta a interface da 6C.2) — presença, falta/no-show, conclusão normal/mista, cancelamento de aula e cancelamento de participação com `reserved -> available` ou `reserved -> used` seguros. Falta reagendamento operacional |
 | **7** | Área do aluno: aulas, saldo, confirmação de presença | **Planeado** |
 | **8** | Notificações, lembretes e expiração agendada | **Planeado** |
 | **9** | Supabase real, concorrência, acessibilidade, deployment | **Parcialmente concluído** — Supabase/Auth reais validados até à 6B (405 verificações, repetíveis); browser automatizado com sessão GoTrue real; paridade dev/produção confirmada na 6B.2; deployment pendente |
@@ -1055,7 +1055,46 @@ As Actions passaram a devolver `confirmed`, um resultado mínimo e serializável
 
 Nenhuma rota `/api/...` foi criada, o proxy não foi tocado, e não há `revalidatePath()`: todas as páginas envolvidas são `force-dynamic`, pelo que uma navegação nova lê sempre a base de dados.
 
-**Ainda não implementado depois da 6B:****Ainda não implementado depois da 6B:** política configurável de cancelamento, self-cancel do aluno, janela de 12h/24h, cobrança parcial, multa/tolerância, reativação de participação cancelada, reagendamento operacional, edição/cancelamento de série inteira, notificações, pagamentos e calendários externos.
+### Concluído na Fase 6C.1 — contrato transacional de reagendamento
+
+Estado: **backend concluído. A interface operacional é a 6C.2 e ainda não existe.**
+
+A Fase 1 tinha desenhado o mecanismo inteiro de reagendamento e nunca o ligou: o estado `rescheduled`, as colunas `rescheduled_from_id`/`rescheduled_to_id`, as constraints que exigem alvo e motivo, e `transfer_participation_reservation()`. A 6C.1 é a peça que faltava para os juntar numa transação — não uma arquitetura nova.
+
+#### Editar não é reagendar
+
+`update_lesson()` muda campos da mesma aula. Reagendar cria um facto novo e preserva o antigo:
+
+```text
+aula original  → rescheduled, com motivo, a apontar para a substituta
+aula substituta → scheduled, a apontar de volta
+```
+
+A original nunca é apagada nem reescrita no essencial.
+
+#### Créditos: a reserva muda de aula, os saldos não
+
+`transfer_participation_reservation()` move a reserva entre participações sem tocar em `student_packages`: `available`, `reserved` e `used` ficam exatamente iguais. Como nenhum valor mudou, **não há linha no livro-razão** — inventar uma para assinalar o reagendamento poluiria o histórico financeiro com um facto que não é financeiro. O rasto operacional vive em `lesson_change_history`.
+
+Nunca se faz `reserved → available → reserved`: seriam duas operações com uma janela de falha entre elas.
+
+#### Validade do pacote na data nova
+
+Mudar a data pode empurrar a aula para fora da validade do pacote que já tinha o crédito reservado. `package_covers_lesson_date()` responde à pergunta e a operação inteira é **recusada** quando a resposta é não. Trocar de pacote automaticamente seria decidir por quem paga — é outra decisão de produto, e fica de fora.
+
+#### Uma aula não colide com aquela que veio substituir
+
+Mover uma aula das 18:00 para as 18:30 sobrepõe-se a si própria. Ao inserir a substituta, a original ainda está `scheduled` — tem de estar, porque a constraint só a deixa passar a `rescheduled` depois de a substituta existir para ser apontada. `ensure_lesson_has_no_conflict()` passou a ignorar a antecessora indicada em `rescheduled_from_id`, e só quando ela é do mesmo professor. Sem isto, o reagendamento mais comum de todos era recusado.
+
+#### Participantes e recorrência
+
+O snapshot viaja: quem estava previsto para a original continua previsto para a substituta, e a composição **atual** da turma é irrelevante. De uma série, só esta ocorrência muda; as outras mantêm horário, estado e reservas, e a substituta continua a pertencer ao mesmo `recurrence_group_id`.
+
+#### Autorização
+
+Só o professor responsável. Nem owner ou manager de clube, nem administrador da plataforma, nem o aluno. `reschedule_lesson()` não tem parâmetro de professor, organização, participante ou pacote: tudo é derivado da aula original.
+
+**Ainda não implementado depois da 6C.1:** interface de reagendamento (6C.2), reagendar série inteira, "esta e futuras", self-reschedule do aluno, política configurável de cancelamento, self-cancel do aluno, janela de 12h/24h, cobrança parcial, multa/tolerância, reativação de participação cancelada, notificações, pagamentos e calendários externos.
 
 ### Fase 2 — estado por item
 

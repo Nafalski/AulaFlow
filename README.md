@@ -6,6 +6,7 @@ Professores configuram alunos, pacotes, disponibilidade, locais e aulas; os alun
 A começar pelo **beach tennis**, com arquitetura preparada para outras modalidades.
 
 > **Estado:** Fases 1, 1.5, 2, 3, 4 e 5 concluídas. A Fase 6A acrescentou presença e conclusão segura da aula; a Fase 6B acrescenta cancelamento de aula, cancelamento de participação em turma e falta/no-show com destino financeiro seguro.
+> A **Etapa 6C.1** acrescenta o contrato transacional de reagendamento: a aula original fica histórica, a substituta herda participantes e reserva, e nenhum saldo se move. A interface de reagendamento (6C.2) ainda não existe.
 > Reagendamento operacional, self-service de cancelamento do aluno, política configurável de janelas, notificações, pagamentos e transferência/fusão de pacotes continuam nas etapas seguintes.
 
 ---
