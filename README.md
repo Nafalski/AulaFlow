@@ -1,7 +1,7 @@
 # AulaFlow
 
 Plataforma web *mobile-first* para gestão de aulas desportivas.
-Professores marcam aulas, escolhem os alunos e registam presenças; os alunos veem as suas aulas e são avisados quando algo muda.
+Professores configuram alunos, pacotes, disponibilidade, locais e aulas; os alunos veem as suas aulas e o próprio estado de crédito reservado.
 
 A começar pelo **beach tennis**, com arquitetura preparada para outras modalidades.
 

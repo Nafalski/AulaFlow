@@ -15,13 +15,13 @@ const FEATURES = [
     icon: Users,
     title: "Alunos sempre a par",
     description:
-      "Cada aluno vê as suas aulas, o horário e o local. Quando algo muda, recebe aviso automaticamente.",
+      "Cada aluno vê as suas aulas, o horário, o local e o próprio estado de crédito reservado.",
   },
   {
     icon: CalendarSync,
-    title: "Nada se perde",
+    title: "Créditos controlados",
     description:
-      "Cancelamentos e remarcações ficam no histórico, com o motivo. Sabe sempre o que aconteceu e porquê.",
+      "Ao marcar uma aula, o pacote válido é escolhido no servidor e o crédito fica reservado.",
   },
 ];
 
@@ -39,8 +39,8 @@ export default function LandingPage() {
         </h1>
 
         <p className="mx-auto mt-5 max-w-xl text-lg text-ink-soft">
-          Marque aulas, escolha os alunos, registe presenças e avise toda a gente quando algo
-          muda. O AulaFlow trata do resto.
+          Marque aulas, escolha os alunos, organize pacotes e acompanhe a disponibilidade num
+          calendário feito para o dia a dia do professor.
         </p>
 
         <div className="mt-9 flex flex-col items-center justify-center gap-3 sm:flex-row">

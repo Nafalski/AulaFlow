@@ -9319,6 +9319,168 @@ check(
   "o contexto de uma aula é pessoal ou de clube, e nada mais",
 );
 
+// ── Invariantes integrados 5D.4 ─────────────────────────────────────────────
+
+section("Invariantes integrados de aulas, créditos e recorrência");
+
+const packageReservedDrift = await rows(
+  `select package.id, package.credits_reserved,
+          coalesce(sum(participant.credits_reserved), 0)::int as reserved_in_lessons
+     from public.student_packages package
+     left join public.lesson_participants participant
+       on participant.student_package_id = package.id
+      and participant.billing_status = 'reserved'
+    group by package.id, package.credits_reserved
+   having package.credits_reserved <> coalesce(sum(participant.credits_reserved), 0)::int`,
+);
+check(
+  packageReservedDrift.length === 0,
+  "saldo reservado dos pacotes reconcilia com participações ainda reservadas",
+  `pacotes com reserva divergente: ${packageReservedDrift.map((row) => row.id).join(", ")}`,
+);
+
+const invalidReservedParticipants = await rows(
+  `select participant.id
+     from public.lesson_participants participant
+     join public.lessons lesson on lesson.id = participant.lesson_id
+    where participant.billing_status = 'reserved'
+      and (
+        participant.student_package_id is null
+        or participant.credits_reserved <= 0
+        or participant.credits_consumed <> 0
+        or not exists (
+          select 1 from public.student_packages package
+           where package.id = participant.student_package_id
+             and package.student_id = participant.student_id
+             and package.organization_id = lesson.organization_id
+        )
+        or not (
+          (
+            select count(*)::int
+              from public.package_credit_transactions transaction
+             where transaction.type = 'credit_reserved'
+               and transaction.lesson_id = participant.lesson_id
+               and transaction.lesson_participant_id = participant.id
+               and transaction.student_package_id = participant.student_package_id
+               and transaction.quantity = participant.credits_reserved
+          ) = 1
+          or exists (
+            select 1
+              from public.lesson_participants previous_participant
+              join public.lessons previous_lesson
+                on previous_lesson.id = previous_participant.lesson_id
+             where previous_participant.student_id = participant.student_id
+               and previous_participant.student_package_id = participant.student_package_id
+               and previous_participant.billing_status = 'released'
+               and previous_participant.credits_reserved = 0
+               and previous_lesson.status = 'rescheduled'
+               and previous_lesson.rescheduled_to_id = lesson.id
+               and lesson.rescheduled_from_id = previous_lesson.id
+          )
+        )
+      )`,
+);
+check(
+  invalidReservedParticipants.length === 0,
+  "toda participação reservada aponta para pacote próprio e origem de reserva válida",
+  `participações reservadas incoerentes: ${invalidReservedParticipants.map((row) => row.id).join(", ")}`,
+);
+
+const createdLessonParticipantDrift = await rows(
+  `select lesson.id
+     from public.lessons lesson
+    where lesson.creation_idempotency_key is not null
+      and lesson.status in ('scheduled', 'confirmed')
+      and (
+        (lesson.group_id is null and (
+          select count(*)::int from public.lesson_participants participant
+           where participant.lesson_id = lesson.id
+        ) <> 1)
+        or
+        (lesson.group_id is not null and not exists (
+          select 1 from public.lesson_participants participant
+           where participant.lesson_id = lesson.id
+        ))
+      )`,
+);
+check(
+  createdLessonParticipantDrift.length === 0,
+  "aulas criadas por RPC têm participantes materializados de forma coerente",
+  `aulas com participantes incoerentes: ${createdLessonParticipantDrift.map((row) => row.id).join(", ")}`,
+);
+
+const lessonScopeDrift = await rows(
+  `select lesson.id
+     from public.lessons lesson
+     left join public.location_resources resource
+       on resource.id = lesson.location_resource_id
+     left join public.organizations club
+       on club.id = lesson.club_organization_id
+    where (lesson.location_resource_id is not null and resource.location_id is distinct from lesson.location_id)
+       or (lesson.context_kind = 'personal' and lesson.club_organization_id is not null)
+       or (lesson.context_kind = 'club' and (club.id is null or club.kind <> 'club'))`,
+);
+check(
+  lessonScopeDrift.length === 0,
+  "aulas mantêm recurso/local e contexto pessoal/clube consistentes",
+  `aulas com escopo incoerente: ${lessonScopeDrift.map((row) => row.id).join(", ")}`,
+);
+
+const invalidRecurringRows = await rows(
+  `select lesson.id
+     from public.lessons lesson
+    where (
+        lesson.is_recurring = false
+        and (lesson.recurrence_group_id is not null or lesson.recurrence_rule is not null)
+      )
+       or (
+        lesson.is_recurring = true
+        and (
+          lesson.recurrence_group_id is null
+          or lesson.recurrence_rule is null
+          or lesson.recurrence_rule ->> 'frequency' <> 'weekly'
+          or lesson.recurrence_rule ->> 'interval_weeks' !~ '^[0-9]+$'
+          or lesson.recurrence_rule ->> 'occurrence_count' !~ '^[0-9]+$'
+          or lesson.recurrence_rule ->> 'occurrence_index' !~ '^[0-9]+$'
+          or (lesson.recurrence_rule ->> 'interval_weeks')::int <> 1
+          or (lesson.recurrence_rule ->> 'occurrence_count')::int not between 2 and 12
+          or (lesson.recurrence_rule ->> 'occurrence_index')::int not between 1
+             and (lesson.recurrence_rule ->> 'occurrence_count')::int
+        )
+      )`,
+);
+check(
+  invalidRecurringRows.length === 0,
+  "linhas recorrentes têm apenas a regra semanal segura e índices válidos",
+  `aulas recorrentes incoerentes: ${invalidRecurringRows.map((row) => row.id).join(", ")}`,
+);
+
+const invalidRecurringGroups = await rows(
+  `with recurring as (
+     select recurrence_group_id,
+            (recurrence_rule ->> 'occurrence_index')::int as occurrence_index,
+            (recurrence_rule ->> 'occurrence_count')::int as occurrence_count
+      from public.lessons
+      where is_recurring
+        and recurrence_group_id is not null
+        and recurrence_rule ->> 'occurrence_index' ~ '^[0-9]+$'
+        and recurrence_rule ->> 'occurrence_count' ~ '^[0-9]+$'
+    )
+    select recurrence_group_id
+      from recurring
+     group by recurrence_group_id
+    having count(*)::int <> min(occurrence_count)
+        or count(distinct occurrence_index)::int <> min(occurrence_count)
+        or min(occurrence_index) <> 1
+        or max(occurrence_index) <> min(occurrence_count)
+        or min(occurrence_count) <> max(occurrence_count)`,
+);
+check(
+  invalidRecurringGroups.length === 0,
+  "cada grupo recorrente tem todas as ocorrências esperadas uma vez",
+  `grupos recorrentes incoerentes: ${invalidRecurringGroups.map((row) => row.recurrence_group_id).join(", ")}`,
+);
+
 section("Aulas (Fase 1)");
 
 const [generated] = await rows(

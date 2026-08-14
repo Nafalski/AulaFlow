@@ -17,8 +17,8 @@ export default function TermsPage() {
       <LegalSection title="1. O que é o AulaFlow">
         <p>
           O AulaFlow é uma plataforma de organização de aulas desportivas. Permite a professores
-          marcar aulas, gerir alunos e registar presenças, e a alunos consultar as aulas em que
-          estão inscritos.
+          marcar aulas, gerir alunos e pacotes, e a alunos consultar as aulas em que estão
+          inscritos.
         </p>
         <p>
           Esta é uma versão inicial do produto. Podem existir falhas, e funcionalidades podem

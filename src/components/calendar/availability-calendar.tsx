@@ -22,6 +22,7 @@ import {
   timelineHourLabels,
   timelinePositionForMinutes,
   timelineRangeForItems,
+  timeToMinutes,
   type CalendarDisplayKind,
   type CalendarTimelineRange,
   type CalendarView,
@@ -313,6 +314,30 @@ function timelineHeight(range: CalendarTimelineRange): number {
   return (range.endMinutes - range.startMinutes) * TIMELINE_MINUTE_HEIGHT;
 }
 
+function overlapMinutes(a: AvailabilityCalendarItem, b: AvailabilityCalendarItem): number {
+  if (!a.startsAt || !a.endsAt || !b.startsAt || !b.endsAt) return 0;
+
+  const startsAt = Math.max(timeToMinutes(a.startsAt), timeToMinutes(b.startsAt));
+  const endsAt = Math.min(timeToMinutes(a.endsAt), timeToMinutes(b.endsAt));
+  return Math.max(0, endsAt - startsAt);
+}
+
+function isCoveredByLesson(
+  item: AvailabilityCalendarItem,
+  dayItems: AvailabilityCalendarItem[],
+): boolean {
+  if (item.lesson || item.status !== "available" || !item.startsAt || !item.endsAt) return false;
+
+  const durationMinutes = timeToMinutes(item.endsAt) - timeToMinutes(item.startsAt);
+  if (!Number.isFinite(durationMinutes) || durationMinutes <= 0) return false;
+
+  const coveredMinutes = dayItems
+    .filter((candidate) => candidate.lesson)
+    .reduce((total, lesson) => total + overlapMinutes(item, lesson), 0);
+
+  return Math.min(coveredMinutes, durationMinutes) / durationMinutes >= 0.5;
+}
+
 function TimelineTimeColumn({ range }: { range: CalendarTimelineRange }) {
   const height = timelineHeight(range);
 
@@ -347,6 +372,7 @@ function TimelineBlock({
   audience,
   basePath,
   compact = false,
+  coveredByLesson = false,
 }: {
   item: AvailabilityCalendarItem;
   index: number;
@@ -354,6 +380,7 @@ function TimelineBlock({
   audience: CalendarAudience;
   basePath: string;
   compact?: boolean;
+  coveredByLesson?: boolean;
 }) {
   const position = positionCalendarBlock(item, range);
   if (!position) return null;
@@ -363,10 +390,13 @@ function TimelineBlock({
   return (
     <Link
       href={item.lesson?.href ?? calendarHref({ basePath, date: item.date, view: "day" })}
-      aria-label={itemDescription(item, audience)}
+      aria-hidden={coveredByLesson ? "true" : undefined}
+      aria-label={coveredByLesson ? undefined : itemDescription(item, audience)}
+      tabIndex={coveredByLesson ? -1 : undefined}
       className={cn(
         "absolute right-1 left-1 overflow-hidden rounded-[var(--radius-field)] border px-2 py-1.5 text-left shadow-card transition-colors hover:brightness-[0.98] focus-visible:z-50",
         itemClasses(item, audience),
+        coveredByLesson && "pointer-events-none",
       )}
       data-calendar-block="true"
       data-calendar-kind={displayKind(item)}
@@ -381,18 +411,24 @@ function TimelineBlock({
         zIndex: calendarItemLayer({ ...item, isLesson: Boolean(item.lesson) }),
       }}
     >
-      <span className="flex min-w-0 items-center gap-1.5 text-xs font-extrabold">
-        <ItemIcon item={item} audience={audience} />
-        <span className="truncate">{itemTitle(item, audience)}</span>
-      </span>
-      <span className="mt-0.5 block truncate text-[0.75rem] font-semibold tabular-nums">
-        {timeRangeLabel(item.startsAt, item.endsAt)}
-      </span>
-      {!compact && meta && <span className="mt-0.5 block truncate text-[0.72rem] opacity-80">{meta}</span>}
-      {!compact && audience === "teacher" && item.reason && (
-        <span className="mt-0.5 block truncate text-[0.72rem] opacity-80">{item.reason}</span>
+      {!coveredByLesson && (
+        <>
+          <span className="flex min-w-0 items-center gap-1.5 text-xs font-extrabold">
+            <ItemIcon item={item} audience={audience} />
+            <span className="truncate">{itemTitle(item, audience)}</span>
+          </span>
+          <span className="mt-0.5 block truncate text-[0.75rem] font-semibold tabular-nums">
+            {timeRangeLabel(item.startsAt, item.endsAt)}
+          </span>
+          {!compact && meta && (
+            <span className="mt-0.5 block truncate text-[0.72rem] opacity-80">{meta}</span>
+          )}
+          {!compact && audience === "teacher" && item.reason && (
+            <span className="mt-0.5 block truncate text-[0.72rem] opacity-80">{item.reason}</span>
+          )}
+          <span className="sr-only">{index + 1}</span>
+        </>
       )}
-      <span className="sr-only">{index + 1}</span>
     </Link>
   );
 }
@@ -413,6 +449,7 @@ function TimedDayColumn({
   compact?: boolean;
 }) {
   const height = timelineHeight(range);
+  const timedItems = timedItemsForDate(items, date);
 
   return (
     <div
@@ -426,7 +463,7 @@ function TimedDayColumn({
       }}
     >
       <CurrentTimeLine date={date} range={range} />
-      {timedItemsForDate(items, date).map((item, index) => (
+      {timedItems.map((item, index) => (
         <TimelineBlock
           key={itemKey(item, index)}
           item={item}
@@ -435,6 +472,7 @@ function TimedDayColumn({
           audience={audience}
           basePath={basePath}
           compact={compact}
+          coveredByLesson={isCoveredByLesson(item, timedItems)}
         />
       ))}
     </div>

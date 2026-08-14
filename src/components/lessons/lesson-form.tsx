@@ -232,6 +232,10 @@ export function LessonForm({
   const [clubId, setClubId] = useState<string>(data.clubs[0]?.id ?? "");
   const [locationId, setLocationId] = useState<string>(values.locationId ?? "");
   const [resourceId, setResourceId] = useState<string>(values.locationResourceId ?? "");
+  const [durationMinutes, setDurationMinutes] = useState(String(values.durationMinutes));
+  const [title, setTitle] = useState(values.title);
+  const [notesForStudents, setNotesForStudents] = useState(values.notesForStudents ?? "");
+  const [privateNotes, setPrivateNotes] = useState(values.privateNotes ?? "");
   const [recurrenceMode, setRecurrenceMode] = useState<LessonRecurrenceMode>("none");
   const [recurrenceCount, setRecurrenceCount] = useState("4");
 
@@ -451,7 +455,8 @@ export function LessonForm({
           <SelectField
             name="durationMinutes"
             label="Duração"
-            defaultValue={String(values.durationMinutes)}
+            value={durationMinutes}
+            onChange={(event) => setDurationMinutes(event.target.value)}
             required
             error={state.fieldErrors?.durationMinutes}
           >
@@ -576,7 +581,8 @@ export function LessonForm({
           <TextField
             name="title"
             label="Título"
-            defaultValue={values.title}
+            value={title}
+            onChange={(event) => setTitle(event.target.value)}
             minLength={2}
             maxLength={120}
             required
@@ -587,7 +593,8 @@ export function LessonForm({
           <TextareaField
             name="notesForStudents"
             label="Observações para o aluno"
-            defaultValue={values.notesForStudents ?? ""}
+            value={notesForStudents}
+            onChange={(event) => setNotesForStudents(event.target.value)}
             maxLength={2_000}
             rows={3}
             hint="Aparecem na aula do aluno."
@@ -597,7 +604,8 @@ export function LessonForm({
           <TextareaField
             name="privateNotes"
             label="Observações privadas"
-            defaultValue={values.privateNotes ?? ""}
+            value={privateNotes}
+            onChange={(event) => setPrivateNotes(event.target.value)}
             maxLength={2_000}
             rows={3}
             hint="Só para si. Nunca aparecem na área do aluno."
