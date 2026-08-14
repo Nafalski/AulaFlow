@@ -137,6 +137,11 @@ const mask = (value) => (typeof value === "string" ? `${value.slice(0, 8)}…` :
  */
 async function signIn(context, account) {
   const page = await context.newPage();
+  // Cancelar e concluir pedem confirmação. Um handler permanente responde a
+  // todos, em vez de se gastar no primeiro.
+  page.on("dialog", (dialog) => {
+    dialog.accept().catch(() => {});
+  });
   await page.goto(`${BASE_URL}/entrar`, { waitUntil: "domcontentloaded" });
 
   await page.fill('input[name="email"]', account.email);
@@ -207,7 +212,24 @@ async function runLessonOperation(page, accessibleName, label) {
 }
 
 async function panelText(page) {
-  return (await page.locator("main").innerText()).replace(/\s+/g, " ");
+  try {
+    return (await page.locator("main").innerText()).replace(/\s+/g, " ");
+  } catch {
+    return "";
+  }
+}
+
+
+/**
+ * Espera que o painel mostre um estado — o repintar chega logo a seguir à
+ * mutação, mas não no mesmo instante: são dois tempos desde a Etapa 6B.2.
+ */
+async function waitForPanel(page, needle, timeout = 20_000) {
+  for (let waited = 0; waited < timeout; waited += 250) {
+    if ((await panelText(page)).includes(needle)) return true;
+    await page.waitForTimeout(250);
+  }
+  return false;
 }
 
 // ── Encontrar aulas reais para operar ───────────────────────────────────────
@@ -388,10 +410,35 @@ async function teacherScenarios(context, lessons) {
     );
     check(!page.url().includes("atualizado="), "O URL da aula continua limpo, sem cachebuster");
 
-    await runLessonOperation(page, /Marcar .* como presente/, "Marcar presente");
-    const after = await panelText(page);
+    // REGRESSÃO 6B.2 — a mutação tem de resolver por si.
+    //
+    // Enquanto a revalidação viajava dentro da resposta da Action, um stream RSC
+    // abortado deixava a operação em pending para sempre, com a alteração já
+    // gravada: 1 em 5 tentativas chegava ao fim. O contrato agora é que o botão
+    // se liberta quando a base de dados confirma, sem depender do repintar.
+    //
+    // O limite é generoso de propósito: o que se afirma é "resolve", não "resolve
+    // em X ms". Antes da correção isto nunca acontecia.
+    const presentButton = page.getByRole("button", { name: /Marcar .* como presente/ }).first();
+    const clickedAt = Date.now();
+    await presentButton.click();
+    let settled = false;
+    for (let waited = 0; waited < 20_000; waited += 200) {
+      if (!(await presentButton.isDisabled().catch(() => true))) {
+        settled = true;
+        break;
+      }
+      await page.waitForTimeout(200);
+    }
     check(
-      after.includes("Presença: Presente"),
+      settled,
+      `A mutação resolve sem depender do refresh da rota (${Date.now() - clickedAt}ms)`,
+      "botão preso em pending — a Action voltou a ficar acoplada ao re-render",
+    );
+    await page.waitForLoadState("networkidle").catch(() => {});
+
+    check(
+      await waitForPanel(page, "Presença: Presente"),
       "Depois de marcar, o ecrã mostra o estado persistido (Presente)",
     );
     check(
@@ -412,25 +459,48 @@ async function teacherScenarios(context, lessons) {
     const absent = page.getByRole("button", { name: /Marcar .* como falta/ }).first();
     if (await absent.isEnabled().catch(() => false)) {
       await runLessonOperation(page, /Marcar .* como falta/, "Marcar falta");
-      const marked = await panelText(page);
       check(
-        marked.includes("Presença: Falta"),
+        await waitForPanel(page, "Presença: Falta"),
         "Falta registada e visível como estado persistido",
       );
       check(
-        marked.includes("reservados"),
+        (await panelText(page)).includes("reservados"),
         "Falta mantém o crédito reservado até à conclusão",
       );
     }
 
     // ── Conclusão ──
+    //
+    // Concluir só fica disponível quando o servidor já sabe o desfecho de todos
+    // os participantes. Desde a 6B.2 isso chega no refresh, logo a seguir à
+    // mutação — esperar por ele é testar o contrato real, e não uma corrida.
     const complete = page.getByRole("button", { name: /Concluir aula/ }).first();
-    if (await complete.isEnabled().catch(() => false)) {
-      page.once("dialog", (dialog) => dialog.accept());
+    let completeReady = false;
+    for (let waited = 0; waited < 20_000; waited += 250) {
+      if (await complete.isEnabled().catch(() => false)) {
+        completeReady = true;
+        break;
+      }
+      await page.waitForTimeout(250);
+    }
+    if (completeReady) {
       await runLessonOperation(page, /Concluir aula/, "Concluir aula");
-      const done = await panelText(page);
-      check(done.includes("Concluída"), "Aula concluída e o estado persistido aparece");
-      check(done.includes("utilizados"), "Depois de concluir, o crédito aparece como utilizado");
+      // A conclusão depende do estado de TODOS os participantes e da reserva de
+      // cada um. Quando a agenda de desenvolvimento não oferece uma aula nessas
+      // condições, isso é dito — dar por validado o que não correu seria pior
+      // do que não o correr.
+      const completed = await waitForPanel(page, "Concluída");
+      check(
+        completed,
+        "Aula concluída e o estado persistido aparece",
+        "a aula escolhida não reuniu as condições de conclusão nesta execução",
+      );
+      if (completed) {
+        check(
+          (await panelText(page)).includes("utilizados"),
+          "Depois de concluir, o crédito aparece como utilizado",
+        );
+      }
     }
   }
 
@@ -452,18 +522,31 @@ async function teacherScenarios(context, lessons) {
       `Controlo de cancelamento presente (${mask(cancellable)})`,
     );
 
-    page.once("dialog", (dialog) => dialog.accept());
-    await runLessonOperation(page, /^Cancelar aula$/, "Cancelar aula");
-    const cancelled = await panelText(page);
+    // O botão fica desativado quando já há presença registada na aula. Se a
+    // agenda de desenvolvimento só oferecer aulas nessa condição, isso diz-se —
+    // afirmar que o cancelamento foi validado seria falso.
+    const cancelButton = page.getByRole("button", { name: /^Cancelar aula$/ }).first();
+    const canCancelNow = await cancelButton.isEnabled().catch(() => false);
     check(
-      cancelled.includes("Cancelada pelo professor"),
-      "Aula cancelada e o estado persistido aparece",
+      canCancelNow,
+      "A aula escolhida aceita cancelamento",
+      "botão desativado — provavelmente já tem presença registada",
     );
-    check(
-      !page.url().includes("atualizado="),
-      "Cancelar não sujou o URL",
-      page.url(),
-    );
+
+    if (canCancelNow) {
+      await runLessonOperation(page, /^Cancelar aula$/, "Cancelar aula");
+      const cancelledOk = await waitForPanel(page, "Cancelada pelo professor");
+      check(
+        cancelledOk,
+        "Aula cancelada e o estado persistido aparece",
+        cancelledOk ? undefined : (await panelText(page)).slice(0, 200),
+      );
+      check(
+        !page.url().includes("atualizado="),
+        "Cancelar não sujou o URL",
+        page.url(),
+      );
+    }
   }
 
   return page;

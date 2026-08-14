@@ -6,7 +6,6 @@ Professores configuram alunos, pacotes, disponibilidade, locais e aulas; os alun
 A começar pelo **beach tennis**, com arquitetura preparada para outras modalidades.
 
 > **Estado:** Fases 1, 1.5, 2, 3, 4 e 5 concluídas. A Fase 6A acrescentou presença e conclusão segura da aula; a Fase 6B acrescenta cancelamento de aula, cancelamento de participação em turma e falta/no-show com destino financeiro seguro.
-> A 6B está funcionalmente completa e validada, mas **ainda não fechada**: na build de produção a primeira Server Action a seguir a um carregamento de página pode ficar em pending, embora a mutação seja gravada. Ver `implementation_plan.md`.
 > Reagendamento operacional, self-service de cancelamento do aluno, política configurável de janelas, notificações, pagamentos e transferência/fusão de pacotes continuam nas etapas seguintes.
 
 ---

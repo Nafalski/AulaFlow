@@ -447,10 +447,10 @@ A estrutura fica pronta para notificações push (Fase 8).
 | **3** | Alunos, turmas, locais, política de cancelamento | **Concluído** |
 | **4** | Pacotes: modelos, atribuição, ajustes, painel de saldo | **Concluído** — Etapas 1A, 1B, 1C, 1D e 1E validadas |
 | **5** | Calendário e criação de aulas, com reserva de créditos | **Concluído** — disponibilidade, calendário, clubes, locais, recursos, criação/edição de aulas, conflitos atómicos, reserva atómica de créditos, recorrência semanal segura e revisão integrada |
-| **6** | Cancelamento, reagendamento, presenças, histórico | **Parcialmente concluído** — 6A/6B: presença, falta/no-show, conclusão normal/mista, cancelamento de aula e cancelamento de participação com `reserved -> available` ou `reserved -> used` seguros. Falta reagendamento operacional |
+| **6** | Cancelamento, reagendamento, presenças, histórico | **6A e 6B concluídas** — presença, falta/no-show, conclusão normal/mista, cancelamento de aula e cancelamento de participação com `reserved -> available` ou `reserved -> used` seguros. Falta reagendamento operacional |
 | **7** | Área do aluno: aulas, saldo, confirmação de presença | **Planeado** |
 | **8** | Notificações, lembretes e expiração agendada | **Planeado** |
-| **9** | Supabase real, concorrência, acessibilidade, deployment | **Parcialmente concluído** — Supabase/Auth reais validados até à 6B (405 verificações, repetíveis); browser automatizado com sessão GoTrue real; **paridade dev/produção por resolver** na primeira Server Action após carregamento; deployment pendente |
+| **9** | Supabase real, concorrência, acessibilidade, deployment | **Parcialmente concluído** — Supabase/Auth reais validados até à 6B (405 verificações, repetíveis); browser automatizado com sessão GoTrue real; paridade dev/produção confirmada na 6B.2; deployment pendente |
 
 A ordem segue as prioridades pedidas: primeiro a área do professor ao computador, depois as regras seguras de créditos, depois o aluno no telemóvel.
 
@@ -1038,11 +1038,24 @@ A correção foi devolver estado serializável e apagar o redirect e o cachebust
 
 Segunda correção, encontrada com a suite de browser: as Actions revalidavam também `/aluno`, `/aluno/calendario` e `/aluno/pacotes`. Rotas que a sessão do professor nunca visitou não estão na cache daquele cliente, e obrigar o servidor a renderizá-las como parte da resposta faz o guarda de papel disparar um reencaminhamento a meio. O aluno vê o estado novo à mesma, porque as páginas dele são `force-dynamic`.
 
-**O que continua por resolver, e não deve ser dado como fechado:** na *build de produção*, a **primeira** Server Action a seguir a um carregamento de página pode não resolver — o botão fica em pending indefinidamente enquanto a mutação é confirmada na base de dados. A segunda e as seguintes resolvem em ~2 s, com o estado correto. A medição está feita: a primeira operação passou dos 60 s sem destrancar; a seguinte demorou 2 s. Ao redor da falha há uma vaga de *prefetch* RSC de toda a navegação lateral, e o comportamento não é determinista.
+**Resolvido na 6B.2: a mutação deixou de transportar o repintar.**
 
-Isto **não** é específico da 6B — é a fronteira sessão/prefetch, e reproduz-se com `npm run build && npm start`. Corrigi-lo exige investigar a renovação de sessão no `proxy.ts` sob pedidos concorrentes, e não deve ser resolvido enfraquecendo transações, locking ou RLS. Enquanto não estiver resolvido, a 6B fica **funcionalmente completa mas não pronta a fechar**.
+O sintoma era a primeira Server Action depois de abrir a página ficar em pending para sempre, com a alteração já gravada. A medição arrumou as hipóteses: o proxy respondia em <225 ms, a RPC e a revalidação em <200 ms, e o servidor devolvia **200 em ~500 ms**. O que falhava era o *stream* — a payload RSC que a resposta transportava era abortada (`net::ERR_ABORTED`) sob a vaga inicial de pedidos da navegação, e `useActionState` nunca resolvia. Em cinco contextos novos, **1 em 5** chegava ao fim.
 
-**Ainda não implementado depois da 6B:** política configurável de cancelamento, self-cancel do aluno, janela de 12h/24h, cobrança parcial, multa/tolerância, reativação de participação cancelada, reagendamento operacional, edição/cancelamento de série inteira, notificações, pagamentos e calendários externos.
+A correção separa os dois tempos:
+
+```text
+Action → auth → Zod → RPC → devolve resultado confirmado   (a operação acaba aqui)
+Cliente → router.refresh()                                  (o ecrã repinta a seguir)
+```
+
+Medido depois, nos mesmos cinco contextos novos: **5/5**, mutação entre 464 ms e 791 ms, interface a mostrar o estado confirmado até ~20 ms depois. O experimento A/B intermédio — Action sem revalidação nenhuma — deu 5/5 na mutação e nenhuma atualização de ecrã, o que isolou a causa antes de se escolher a solução.
+
+As Actions passaram a devolver `confirmed`, um resultado mínimo e serializável (operação, desfecho, se mudou). `ParticipantRow` mostra esse valor confirmado pelo servidor enquanto o refresh não chega — não é otimismo: antes da resposta o botão está em pending. `router.refresh()` funde a nova payload sem destruir estado de cliente, e um `useRef` com o último estado tratado impede o ciclo refresh → render → refresh.
+
+Nenhuma rota `/api/...` foi criada, o proxy não foi tocado, e não há `revalidatePath()`: todas as páginas envolvidas são `force-dynamic`, pelo que uma navegação nova lê sempre a base de dados.
+
+**Ainda não implementado depois da 6B:****Ainda não implementado depois da 6B:** política configurável de cancelamento, self-cancel do aluno, janela de 12h/24h, cobrança parcial, multa/tolerância, reativação de participação cancelada, reagendamento operacional, edição/cancelamento de série inteira, notificações, pagamentos e calendários externos.
 
 ### Fase 2 — estado por item
 

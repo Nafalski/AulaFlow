@@ -11,7 +11,27 @@ export type TeacherManagementActionState = {
   fieldErrors?: Record<string, string>;
   resourceId?: string;
   resourceCount?: number;
+  /**
+   * O que o servidor CONFIRMOU, para a interface poder mostrá-lo sem esperar
+   * pelo refresh da rota.
+   *
+   * Existe porque a mutação e o repintar da página deixaram de andar juntos: a
+   * Action responde assim que a base de dados confirma, e o refresh é pedido a
+   * seguir pelo cliente. Nesta janela a interface mostra este valor — que veio
+   * do servidor, e portanto não é um palpite otimista.
+   *
+   * Mínimo por desenho: nada de identificadores de pacote, organização ou
+   * autor, e nenhum saldo.
+   */
+  confirmed?: LessonOperationOutcome;
 };
+
+/** Resultado confirmado de uma operação de aula (Etapa 6B.2). */
+export type LessonOperationOutcome =
+  | { operation: "attendance"; attendance: "present" | "absent" | null; changed: boolean }
+  | { operation: "lesson_cancelled"; changed: boolean }
+  | { operation: "participation_cancelled"; changed: boolean }
+  | { operation: "lesson_completed"; changed: boolean };
 
 type TeacherAuthorization =
   | { user: SessionUser & { teacherId: string }; state?: never }

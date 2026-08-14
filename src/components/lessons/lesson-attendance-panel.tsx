@@ -1,13 +1,15 @@
 "use client";
 
 import { Ban, CheckCircle2, CircleX, Flag, Undo2, UserMinus, Users } from "lucide-react";
-import { useActionState, type ReactNode } from "react";
+import { useRouter } from "next/navigation";
+import { useActionState, useEffect, useRef, useState, useTransition, type ReactNode } from "react";
 
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { Badge } from "@/components/ui/status-badge";
 import { FORM_ACTION_IDLE_STATE } from "@/lib/actions/action-state";
+import type { TeacherManagementActionState } from "@/lib/actions/teacher-management";
 import {
   cancelLessonAction,
   cancelLessonParticipantAction,
@@ -77,6 +79,33 @@ function quantityLabel(participant: Participant): string | null {
   return null;
 }
 
+
+/**
+ * Pede o repintar da rota DEPOIS de a mutação ter respondido.
+ *
+ * Enquanto a revalidação viajava dentro da resposta da Action, um stream RSC
+ * abortado deixava a operação eternamente em pending — com a alteração já
+ * gravada. Agora são dois tempos: a Action resolve, o botão liberta-se, e só
+ * então se pede `router.refresh()`.
+ *
+ * `router.refresh()` funde a nova payload sem destruir estado de cliente, pelo
+ * que o resultado confirmado que se mostra por baixo sobrevive à atualização.
+ *
+ * O `useRef` guarda o último estado já tratado: sem ele, cada repintar
+ * provocado pelo refresh voltaria a disparar outro refresh, em ciclo.
+ */
+function useRefreshAfterAction(state: TeacherManagementActionState) {
+  const router = useRouter();
+  const [, startTransition] = useTransition();
+  const handled = useRef<TeacherManagementActionState | null>(null);
+
+  useEffect(() => {
+    if (state.status !== "success" || handled.current === state) return;
+    handled.current = state;
+    startTransition(() => router.refresh());
+  }, [state, router, startTransition]);
+}
+
 function AttendanceAction({
   lessonId,
   participant,
@@ -87,6 +116,7 @@ function AttendanceAction({
   ariaLabel,
   variant = "outline",
   icon,
+  onConfirmed,
 }: {
   lessonId: string;
   participant: Participant;
@@ -97,11 +127,20 @@ function AttendanceAction({
   ariaLabel: string;
   variant?: "primary" | "outline" | "ghost" | "danger";
   icon: ReactNode;
+  onConfirmed: (status: AttendanceStatus | null) => void;
 }) {
   const [state, formAction, pending] = useActionState(
     setLessonAttendanceAction,
     FORM_ACTION_IDLE_STATE,
   );
+  useRefreshAfterAction(state);
+
+  const reported = useRef<TeacherManagementActionState | null>(null);
+  useEffect(() => {
+    if (state.status !== "success" || reported.current === state) return;
+    reported.current = state;
+    if (state.confirmed?.operation === "attendance") onConfirmed(state.confirmed.attendance);
+  }, [state, onConfirmed]);
 
   return (
     <form action={formAction} className="flex flex-col gap-2">
@@ -127,6 +166,181 @@ function AttendanceAction({
   );
 }
 
+
+/**
+ * Uma linha de participante, com o desfecho confirmado a cobrir a janela entre
+ * a resposta da mutação e a chegada dos props frescos.
+ *
+ * O valor mostrado é sempre o que o SERVIDOR confirmou — nunca um palpite
+ * otimista. Antes da resposta o botão está em pending; depois dela mostra-se o
+ * que ficou gravado. Quando o refresh traz props novos, eles coincidem.
+ */
+function ParticipantAttendanceControls({
+  lessonId,
+  participant,
+  attendanceEditable,
+  absenceEditable,
+  onConfirmed,
+}: {
+  lessonId: string;
+  participant: Participant;
+  attendanceEditable: boolean;
+  absenceEditable: boolean;
+  onConfirmed: (status: AttendanceStatus | null) => void;
+}) {
+  const status = participant.attendanceStatus;
+  const shown = participant;
+  const setConfirmed = onConfirmed;
+
+  return (
+    <div className="flex flex-wrap gap-2 lg:justify-end">
+      <AttendanceAction
+        lessonId={lessonId}
+        participant={shown}
+        attendanceStatus="present"
+        label="Presente"
+        loadingLabel="A marcar"
+        disabled={!attendanceEditable}
+        icon={<CheckCircle2 className="size-4" aria-hidden="true" />}
+        ariaLabel={`Marcar ${participant.fullName} como presente`}
+        variant={status === "present" ? "primary" : "outline"}
+        onConfirmed={setConfirmed}
+      />
+      <AttendanceAction
+        lessonId={lessonId}
+        participant={shown}
+        attendanceStatus="absent"
+        label="Falta"
+        loadingLabel="A marcar"
+        disabled={!absenceEditable}
+        icon={<Ban className="size-4" aria-hidden="true" />}
+        ariaLabel={`Marcar ${participant.fullName} como falta`}
+        variant={status === "absent" ? "danger" : "outline"}
+        onConfirmed={setConfirmed}
+      />
+      {status !== null && (
+        <AttendanceAction
+          lessonId={lessonId}
+          participant={shown}
+          attendanceStatus={null}
+          label="Não confirmado"
+          loadingLabel="A limpar"
+          disabled={!attendanceEditable}
+          icon={<Undo2 className="size-4" aria-hidden="true" />}
+          ariaLabel={`Voltar a deixar ${participant.fullName} sem confirmação`}
+          variant="ghost"
+          onConfirmed={setConfirmed}
+        />
+      )}
+    </div>
+  );
+}
+
+
+/**
+ * Uma linha de participante.
+ *
+ * Detém o desfecho CONFIRMADO pelo servidor, para cobrir a janela entre a
+ * resposta da mutação e a chegada dos props frescos do `router.refresh()`.
+ * A etiqueta e os botões leem o mesmo valor, por isso nunca se contradizem.
+ *
+ * Nada aqui é otimista: antes da resposta o botão está em pending; só depois
+ * de a base de dados confirmar é que este estado muda.
+ */
+function ParticipantRow({
+  lessonId,
+  lessonStatus,
+  participant,
+  attendanceEditable,
+  absenceEditable,
+  isGroupLesson,
+  cancellationAvailability,
+  participantActive,
+}: {
+  lessonId: string;
+  lessonStatus: LessonStatus;
+  participant: Participant;
+  attendanceEditable: boolean;
+  absenceEditable: boolean;
+  isGroupLesson: boolean;
+  cancellationAvailability: { canCancel: boolean; message?: string | null };
+  participantActive: boolean;
+}) {
+  const [confirmed, setConfirmed] = useState<AttendanceStatus | null | undefined>(undefined);
+  const shownParticipant: Participant =
+    confirmed === undefined ? participant : { ...participant, attendanceStatus: confirmed };
+
+  const billingMeta = BILLING_STATUS_META[shownParticipant.billingStatus];
+  const attendanceMeta = attendanceDisplayMeta(shownParticipant.attendanceStatus);
+  const participantMeta = PARTICIPANT_STATUS_META[shownParticipant.status];
+  const packageName = packageLabel(shownParticipant);
+  const quantity = quantityLabel(shownParticipant);
+
+  return (
+                <li
+                  className="grid min-h-11 gap-3 rounded-[var(--radius-field)] border border-line bg-surface px-3 py-3 lg:grid-cols-[minmax(0,1fr)_auto]"
+                >
+                  <div className="min-w-0">
+                    <span className="inline-flex min-w-0 items-center gap-2 text-sm font-semibold text-ink">
+                      <Users className="size-4 shrink-0 text-muted" aria-hidden="true" />
+                      <span className="break-words">{shownParticipant.fullName}</span>
+                    </span>
+                    <div className="mt-2 flex flex-wrap gap-1.5">
+                      <Badge tone={attendanceMeta.tone}>
+                        Presença: {attendanceMeta.label}
+                      </Badge>
+                      <Badge tone={billingMeta.tone}>Crédito: {billingMeta.label}</Badge>
+                      <Badge tone={participantMeta.tone}>{participantMeta.label}</Badge>
+                    </div>
+                    <p className="mt-2 text-xs leading-snug text-muted">
+                      {quantity ?? "Sem movimento de crédito"}
+                      {packageName ? ` · Pacote: ${packageName}` : ""}
+                      {shownParticipant.isException ? " · Exceção autorizada" : ""}
+                    </p>
+                    {shownParticipant.attendanceStatus === "absent" &&
+                      lessonStatus !== "completed" && (
+                        <p className="mt-2 text-xs leading-snug text-state-warning">
+                          {LESSON_ABSENCE_CREDIT_WARNING}
+                        </p>
+                      )}
+                    {shownParticipant.status === "declined" && (
+                      <p className="mt-2 text-xs leading-snug text-muted">
+                        Participação cancelada nesta etapa. Não pode ser reativada aqui.
+                      </p>
+                    )}
+                  </div>
+
+                  {canCancelLesson(lessonStatus) && (
+                    <div className="flex flex-col gap-2 lg:items-end">
+                      {participantActive && (
+                        <ParticipantAttendanceControls
+                          lessonId={lessonId}
+                          participant={shownParticipant}
+                          attendanceEditable={attendanceEditable}
+                          absenceEditable={absenceEditable}
+                          onConfirmed={setConfirmed}
+                        />
+                      )}
+                      {isGroupLesson && participantActive && (
+                        <>
+                          <CancelParticipantForm
+                            lessonId={lessonId}
+                            participant={shownParticipant}
+                            disabled={!cancellationAvailability.canCancel}
+                          />
+                          {!cancellationAvailability.canCancel && (
+                            <p className="max-w-60 text-right text-xs leading-snug text-muted">
+                              {cancellationAvailability.message}
+                            </p>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  )}
+                </li>
+  );
+}
+
 function CancelLessonForm({
   lessonId,
   disabled,
@@ -140,6 +354,7 @@ function CancelLessonForm({
     cancelLessonAction,
     FORM_ACTION_IDLE_STATE,
   );
+  useRefreshAfterAction(state);
 
   return (
     <form
@@ -185,6 +400,7 @@ function CancelParticipantForm({
     cancelLessonParticipantAction,
     FORM_ACTION_IDLE_STATE,
   );
+  useRefreshAfterAction(state);
 
   return (
     <form
@@ -236,6 +452,7 @@ function CompleteLessonForm({
     completeLessonAction,
     FORM_ACTION_IDLE_STATE,
   );
+  useRefreshAfterAction(state);
 
   return (
     <form
@@ -355,11 +572,8 @@ export function LessonAttendancePanel({
         ) : (
           <ul className="flex flex-col gap-2">
             {participants.map((participant) => {
-              const billingMeta = BILLING_STATUS_META[participant.billingStatus];
-              const attendanceMeta = attendanceDisplayMeta(participant.attendanceStatus);
-              const participantMeta = PARTICIPANT_STATUS_META[participant.status];
-              const packageName = packageLabel(participant);
-              const quantity = quantityLabel(participant);
+              // As etiquetas passaram a ser derivadas dentro de `ParticipantRow`,
+              // que é quem conhece o desfecho confirmado pelo servidor.
               const participantActive =
                 participant.status !== "removed" && participant.status !== "declined";
               const cancellationAvailability = lessonParticipationCancellationAvailability({
@@ -372,102 +586,17 @@ export function LessonAttendancePanel({
               });
 
               return (
-                <li
+                <ParticipantRow
                   key={participant.lessonParticipantId}
-                  className="grid min-h-11 gap-3 rounded-[var(--radius-field)] border border-line bg-surface px-3 py-3 lg:grid-cols-[minmax(0,1fr)_auto]"
-                >
-                  <div className="min-w-0">
-                    <span className="inline-flex min-w-0 items-center gap-2 text-sm font-semibold text-ink">
-                      <Users className="size-4 shrink-0 text-muted" aria-hidden="true" />
-                      <span className="break-words">{participant.fullName}</span>
-                    </span>
-                    <div className="mt-2 flex flex-wrap gap-1.5">
-                      <Badge tone={attendanceMeta.tone}>
-                        Presença: {attendanceMeta.label}
-                      </Badge>
-                      <Badge tone={billingMeta.tone}>Crédito: {billingMeta.label}</Badge>
-                      <Badge tone={participantMeta.tone}>{participantMeta.label}</Badge>
-                    </div>
-                    <p className="mt-2 text-xs leading-snug text-muted">
-                      {quantity ?? "Sem movimento de crédito"}
-                      {packageName ? ` · Pacote: ${packageName}` : ""}
-                      {participant.isException ? " · Exceção autorizada" : ""}
-                    </p>
-                    {participant.attendanceStatus === "absent" &&
-                      lessonStatus !== "completed" && (
-                        <p className="mt-2 text-xs leading-snug text-state-warning">
-                          {LESSON_ABSENCE_CREDIT_WARNING}
-                        </p>
-                      )}
-                    {participant.status === "declined" && (
-                      <p className="mt-2 text-xs leading-snug text-muted">
-                        Participação cancelada nesta etapa. Não pode ser reativada aqui.
-                      </p>
-                    )}
-                  </div>
-
-                  {canCancelLesson(lessonStatus) && (
-                    <div className="flex flex-col gap-2 lg:items-end">
-                      {participantActive && (
-                        <div className="flex flex-wrap gap-2 lg:justify-end">
-                          <AttendanceAction
-                            lessonId={lessonId}
-                            participant={participant}
-                            attendanceStatus="present"
-                            label="Presente"
-                            loadingLabel="A marcar"
-                            disabled={!attendanceEditable}
-                            icon={<CheckCircle2 className="size-4" aria-hidden="true" />}
-                            ariaLabel={`Marcar ${participant.fullName} como presente`}
-                            variant={
-                              participant.attendanceStatus === "present" ? "primary" : "outline"
-                            }
-                          />
-                          <AttendanceAction
-                            lessonId={lessonId}
-                            participant={participant}
-                            attendanceStatus="absent"
-                            label="Falta"
-                            loadingLabel="A marcar"
-                            disabled={!absenceEditable}
-                            icon={<Ban className="size-4" aria-hidden="true" />}
-                            ariaLabel={`Marcar ${participant.fullName} como falta`}
-                            variant={
-                              participant.attendanceStatus === "absent" ? "danger" : "outline"
-                            }
-                          />
-                          {participant.attendanceStatus !== null && (
-                            <AttendanceAction
-                              lessonId={lessonId}
-                              participant={participant}
-                              attendanceStatus={null}
-                              label="Não confirmado"
-                              loadingLabel="A limpar"
-                              disabled={!attendanceEditable}
-                              icon={<Undo2 className="size-4" aria-hidden="true" />}
-                              ariaLabel={`Voltar a deixar ${participant.fullName} sem confirmação`}
-                              variant="ghost"
-                            />
-                          )}
-                        </div>
-                      )}
-                      {isGroupLesson && participantActive && (
-                        <>
-                          <CancelParticipantForm
-                            lessonId={lessonId}
-                            participant={participant}
-                            disabled={!cancellationAvailability.canCancel}
-                          />
-                          {!cancellationAvailability.canCancel && (
-                            <p className="max-w-60 text-right text-xs leading-snug text-muted">
-                              {cancellationAvailability.message}
-                            </p>
-                          )}
-                        </>
-                      )}
-                    </div>
-                  )}
-                </li>
+                  lessonId={lessonId}
+                  lessonStatus={lessonStatus}
+                  participant={participant}
+                  attendanceEditable={attendanceEditable}
+                  absenceEditable={absenceEditable}
+                  isGroupLesson={isGroupLesson}
+                  cancellationAvailability={cancellationAvailability}
+                  participantActive={participantActive}
+                />
               );
             })}
           </ul>

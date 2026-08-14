@@ -1,6 +1,5 @@
 "use server";
 
-import { revalidatePath } from "next/cache";
 
 import {
   authorizeActiveTeacher,
@@ -33,11 +32,6 @@ import {
   unexpectedLessonFields,
 } from "@/lib/validation/lessons";
 
-const LESSONS_PATH = "/professor/aulas";
-const CALENDAR_PATH = "/professor/calendario";
-const TEACHER_DASHBOARD_PATH = "/professor";
-const TEACHER_PACKAGES_PATH = "/professor/pacotes";
-const TEACHER_PACKAGE_HISTORY_PATH = "/professor/pacotes/historico";
 
 /**
  * As RPCs de aulas falam português e podem ser mostradas tal como estão.
@@ -92,50 +86,25 @@ function lessonWindow(input: { date: string; time: string; durationMinutes: numb
 }
 
 /**
- * Revalida apenas o que o router DESTE utilizador tem em cache.
+ * A mutação deixou de transportar o repintar da página.
  *
- * Chegou a revalidar-se também `/aluno`, `/aluno/calendario` e
- * `/aluno/pacotes` — rotas que a sessão do professor nunca visitou. Além de não
- * servir para nada (não estão na cache deste cliente), obrigava o Next.js a
- * renderizá-las do lado do servidor como parte da resposta da Action; e
- * renderizar `/aluno` com sessão de professor bate no guarda de papel e produz
- * um reencaminhamento a meio da resposta. Em produção isso deixava a segunda
- * submissão da página sem resolução, e o botão preso em "A marcar…".
+ * O QUE SE MEDIU, E PORQUÊ ISTO MUDOU
  *
- * O aluno vê o estado novo porque as páginas dele são `force-dynamic`: leem a
- * base de dados a cada pedido. A revalidação cruzada nunca foi o que o fazia
- * funcionar.
+ * Quando a Action também revalidava a rota, a resposta levava consigo a payload
+ * RSC re-renderizada. Na build de produção, com a vaga inicial de pedidos da
+ * navegação ainda em curso, esse stream era abortado (`net::ERR_ABORTED`) — e
+ * `useActionState` nunca resolvia. O botão ficava em "A marcar…" apesar de a
+ * base de dados já ter sido alterada. Medido em cinco contextos novos: **1 em 5**
+ * chegava ao fim.
+ *
+ * Com a mutação a responder sozinha, as mesmas cinco tentativas responderam
+ * todas, entre 445 ms e 916 ms. O repintar passou a ser pedido pelo cliente a
+ * seguir, com `router.refresh()`, e deixou de poder prender a operação.
+ *
+ * As páginas envolvidas são todas `force-dynamic`: uma navegação nova lê sempre
+ * a base de dados, pelo que nada fica desatualizado por não haver
+ * `revalidatePath()` aqui.
  */
-function revalidateLessons(lessonId?: string) {
-  revalidatePath(CALENDAR_PATH);
-  revalidatePath(TEACHER_DASHBOARD_PATH);
-  if (lessonId) revalidatePath(`${LESSONS_PATH}/${lessonId}`);
-}
-
-function revalidateLessonOperation(lessonId: string, includePackages = false) {
-  revalidateLessons(lessonId);
-
-  if (includePackages) {
-    revalidatePath(TEACHER_PACKAGES_PATH);
-    revalidatePath(TEACHER_PACKAGE_HISTORY_PATH);
-  }
-}
-
-/**
- * Porque é que estas operações NÃO redirecionam.
- *
- * Chegaram a fazer `redirect()` para a própria aula com um sufixo `?atualizado=`
- * variável, para forçar o router a recarregar. Era desnecessário e custava caro:
- * o Next.js 16 já inclui uma nova renderização da rota atual na MESMA resposta
- * da Action quando ela chama `revalidatePath()` — e uma Action que redireciona
- * nunca devolve estado, pelo que `useActionState` ficava sem resolução e o
- * botão permanecia em "A cancelar…" mesmo depois de a mutação ter sido
- * confirmada no PostgreSQL.
- *
- * Devolver um estado serializável fecha o ciclo: o pending termina, a página
- * já vem repintada com o estado persistido, e o URL fica limpo.
- */
-
 export async function createLessonAction(
   _previousState: TeacherManagementActionState,
   formData: FormData,
@@ -191,8 +160,7 @@ export async function createLessonAction(
         );
       }
 
-      revalidateLessons(recurring.firstLessonId);
-      return {
+        return {
         status: "success",
         message: `${recurring.count} aulas criadas com sucesso.`,
         resourceId: recurring.firstLessonId,
@@ -212,7 +180,6 @@ export async function createLessonAction(
       );
     }
 
-    revalidateLessons(data);
     return { status: "success", message: "Aula criada.", resourceId: data };
   } catch (error) {
     return persistenceState("Erro inesperado ao criar uma aula.", error);
@@ -256,7 +223,6 @@ export async function updateLessonAction(
       );
     }
 
-    revalidateLessons(parsed.data.lessonId);
     return {
       status: "success",
       // A RPC devolve `false` quando nada mudou. Dizer "guardada" nesse caso
@@ -313,11 +279,14 @@ export async function setLessonAttendanceAction(
       );
     }
 
-    revalidateLessonOperation(parsed.data.lessonId);
-
     return {
       status: "success",
       message: attendanceSuccessMessage(parsed.data.attendanceStatus, data === false),
+      confirmed: {
+        operation: "attendance",
+        attendance: parsed.data.attendanceStatus,
+        changed: data !== false,
+      },
     };
   } catch (error) {
     return persistenceState("Erro inesperado ao registar presença.", error);
@@ -353,7 +322,7 @@ export async function cancelLessonAction(
       );
     }
 
-    revalidateLessonOperation(parsed.data.lessonId, true);
+
 
     return {
       status: "success",
@@ -361,6 +330,7 @@ export async function cancelLessonAction(
         data === false
           ? "Esta aula já estava cancelada."
           : "Aula cancelada. Os créditos reservados foram devolvidos.",
+      confirmed: { operation: "lesson_cancelled", changed: data !== false },
     };
   } catch (error) {
     return persistenceState("Erro inesperado ao cancelar aula.", error);
@@ -402,7 +372,7 @@ export async function cancelLessonParticipantAction(
       );
     }
 
-    revalidateLessonOperation(parsed.data.lessonId, true);
+
 
     return {
       status: "success",
@@ -410,6 +380,7 @@ export async function cancelLessonParticipantAction(
         data === false
           ? "Esta participação já estava cancelada."
           : "Participação cancelada. O crédito reservado foi devolvido.",
+      confirmed: { operation: "participation_cancelled", changed: data !== false },
     };
   } catch (error) {
     return persistenceState("Erro inesperado ao cancelar participação.", error);
@@ -445,7 +416,7 @@ export async function completeLessonAction(
       );
     }
 
-    revalidateLessonOperation(parsed.data.lessonId, true);
+
 
     return {
       status: "success",
@@ -453,6 +424,7 @@ export async function completeLessonAction(
         data === false
           ? "Esta aula já estava concluída."
           : "Aula concluída. Os créditos reservados passaram a utilizados.",
+      confirmed: { operation: "lesson_completed", changed: data !== false },
     };
   } catch (error) {
     return persistenceState("Erro inesperado ao concluir aula.", error);
