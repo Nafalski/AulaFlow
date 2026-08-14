@@ -75,6 +75,7 @@ const expectedTables = [
   "location_resources",
   "lessons",
   "lesson_participants",
+  "attendance",
   "lesson_change_history",
 ];
 
@@ -202,6 +203,7 @@ const expectedConstraints = [
   "locations_rejection_needs_reason",
   "location_resources_name_length",
   "location_resources_display_order_range",
+  "attendance_matches_lesson_participant",
   "lessons_context_matches_club",
   "lessons_ends_after_starts",
   "lessons_duration_sane",
@@ -290,6 +292,8 @@ const expectedFunctions = [
   "create_lesson",
   "create_recurring_lessons",
   "update_lesson",
+  "set_lesson_attendance",
+  "complete_lesson",
 ];
 
 const authenticatedRpc = [
@@ -343,6 +347,8 @@ const authenticatedRpc = [
   "create_lesson",
   "create_recurring_lessons",
   "update_lesson",
+  "set_lesson_attendance",
+  "complete_lesson",
 ];
 
 const internalFunctions = [
@@ -904,12 +910,12 @@ checks as (
   union all
   select
     'seguranca',
-    'cliente autenticado nao cria nem altera aulas diretamente',
+    'cliente autenticado nao cria nem altera aulas, participantes ou presencas diretamente',
     not exists (
       select 1
       from information_schema.table_privileges
       where table_schema = 'public'
-        and table_name in ('lessons', 'lesson_participants')
+        and table_name in ('lessons', 'lesson_participants', 'attendance')
         and grantee in ('authenticated', 'anon')
         and privilege_type in ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE')
     ),
@@ -917,7 +923,7 @@ checks as (
       select string_agg(table_name || ':' || privilege_type, ', ')
       from information_schema.table_privileges
       where table_schema = 'public'
-        and table_name in ('lessons', 'lesson_participants')
+        and table_name in ('lessons', 'lesson_participants', 'attendance')
         and grantee in ('authenticated', 'anon')
         and privilege_type in ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE')
     ), 'ok')
@@ -983,6 +989,22 @@ checks as (
   union all
   select
     'estrutura',
+    'attendance aponta para participante materializado por FK composta',
+    (
+      select count(*) = 1
+      from pg_constraint constraint_row
+      join pg_class table_row on table_row.oid = constraint_row.conrelid
+      join pg_namespace namespace on namespace.oid = table_row.relnamespace
+      where namespace.nspname = 'public'
+        and table_row.relname = 'attendance'
+        and constraint_row.conname = 'attendance_matches_lesson_participant'
+        and constraint_row.contype = 'f'
+    ),
+    'ok'
+
+  union all
+  select
+    'estrutura',
     'a projecao legada de aulas, que dava notas privadas ao admin, foi removida',
     not exists (
       select 1 from information_schema.views
@@ -1002,7 +1024,8 @@ checks as (
         and column_name in (
           'group_id', 'credit_cost', 'created_by', 'organization_id', 'teacher_id',
           'private_notes', 'club_organization_id', 'participant_count', 'max_participants',
-          'student_package_id', 'credits_available', 'credits_used'
+          'student_package_id', 'credits_available', 'credits_used',
+          'marked_by', 'attendance_marked_by'
         )
     ),
     coalesce((
@@ -1013,14 +1036,15 @@ checks as (
         and column_name in (
           'group_id', 'credit_cost', 'created_by', 'organization_id', 'teacher_id',
           'private_notes', 'club_organization_id', 'participant_count', 'max_participants',
-          'student_package_id', 'credits_available', 'credits_used'
+          'student_package_id', 'credits_available', 'credits_used',
+          'marked_by', 'attendance_marked_by'
         )
     ), 'ok')
 
   union all
   select
     'estrutura',
-    'a projecao do aluno inclui apenas o proprio estado de credito seguro',
+    'a projecao do aluno inclui apenas o proprio estado de credito e presenca seguros',
     exists (
       select 1
       from information_schema.columns
@@ -1041,6 +1065,20 @@ checks as (
       where table_schema = 'public'
         and table_name = 'student_lesson_records'
         and column_name = 'package_name'
+    )
+    and exists (
+      select 1
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'student_lesson_records'
+        and column_name = 'attendance_status'
+    )
+    and exists (
+      select 1
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'student_lesson_records'
+        and column_name = 'attendance_marked_at'
     ),
     'ok'
 
@@ -1109,7 +1147,7 @@ checks as (
   union all
   select
     'estrutura',
-    'a projecao financeira do professor inclui estado de credito por participante',
+    'a projecao financeira do professor inclui presenca e credito por participante',
     exists (
       select 1
       from information_schema.columns
@@ -1130,8 +1168,54 @@ checks as (
       where table_schema = 'public'
         and table_name = 'teacher_lesson_participant_credit_records'
         and column_name = 'package_name'
+    )
+    and exists (
+      select 1
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'teacher_lesson_participant_credit_records'
+        and column_name = 'lesson_participant_id'
+    )
+    and exists (
+      select 1
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'teacher_lesson_participant_credit_records'
+        and column_name = 'attendance_status'
+    )
+    and exists (
+      select 1
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'teacher_lesson_participant_credit_records'
+        and column_name = 'attendance_marked_at'
     ),
     'ok'
+
+  union all
+  select
+    'privacidade',
+    'a projecao financeira do professor nao expoe ator da presenca nem ids de pacote',
+    not exists (
+      select 1
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'teacher_lesson_participant_credit_records'
+        and column_name in (
+          'marked_by', 'attendance_marked_by', 'student_package_id',
+          'credits_available', 'credits_total', 'credits_used'
+        )
+    ),
+    coalesce((
+      select string_agg(column_name, ', ')
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'teacher_lesson_participant_credit_records'
+        and column_name in (
+          'marked_by', 'attendance_marked_by', 'student_package_id',
+          'credits_available', 'credits_total', 'credits_used'
+        )
+    ), 'ok')
 
   union all
   select

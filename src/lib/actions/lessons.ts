@@ -12,10 +12,16 @@ import {
 import { addMinutes, lisbonInputToInstant } from "@/lib/datetime";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import {
+  LESSON_ATTENDANCE_FIELDS,
   LESSON_CREATE_FIELDS,
+  LESSON_COMPLETE_FIELDS,
   LESSON_UPDATE_FIELDS,
+  lessonAttendanceSchema,
+  lessonCompleteSchema,
   lessonCreateSchema,
   lessonUpdateSchema,
+  readLessonAttendanceFormData,
+  readLessonCompleteFormData,
   readLessonCreateFormData,
   readLessonUpdateFormData,
   unexpectedLessonFields,
@@ -23,6 +29,12 @@ import {
 
 const LESSONS_PATH = "/professor/aulas";
 const CALENDAR_PATH = "/professor/calendario";
+const TEACHER_DASHBOARD_PATH = "/professor";
+const TEACHER_PACKAGES_PATH = "/professor/pacotes";
+const TEACHER_PACKAGE_HISTORY_PATH = "/professor/pacotes/historico";
+const STUDENT_DASHBOARD_PATH = "/aluno";
+const STUDENT_CALENDAR_PATH = "/aluno/calendario";
+const STUDENT_PACKAGES_PATH = "/aluno/pacotes";
 
 /**
  * As RPCs de aulas falam português e podem ser mostradas tal como estão.
@@ -37,7 +49,7 @@ function lessonMessage(message: string | undefined, fallback: string): string {
     return fallback;
   }
 
-  return /disponibilidade|bloqueio|aluno|turma|clube|local|campo|sala|modalidade|permissão|autoriza|ativa|horário|aula|série|crédito|créditos|pacote|saldo|reserva/i.test(
+  return /disponibilidade|bloqueio|aluno|turma|clube|local|campo|sala|modalidade|permissão|autoriza|ativa|horário|aula|série|crédito|créditos|pacote|saldo|reserva|presença|participante|concluída|concluir/i.test(
     raw,
   )
     ? raw
@@ -79,7 +91,20 @@ function lessonWindow(input: { date: string; time: string; durationMinutes: numb
 function revalidateLessons(lessonId?: string) {
   revalidatePath(LESSONS_PATH);
   revalidatePath(CALENDAR_PATH);
+  revalidatePath(TEACHER_DASHBOARD_PATH);
   if (lessonId) revalidatePath(`${LESSONS_PATH}/${lessonId}`);
+}
+
+function revalidateLessonOperation(lessonId: string, includePackages = false) {
+  revalidateLessons(lessonId);
+  revalidatePath(STUDENT_DASHBOARD_PATH);
+  revalidatePath(STUDENT_CALENDAR_PATH);
+
+  if (includePackages) {
+    revalidatePath(TEACHER_PACKAGES_PATH);
+    revalidatePath(TEACHER_PACKAGE_HISTORY_PATH);
+    revalidatePath(STUDENT_PACKAGES_PATH);
+  }
 }
 
 export async function createLessonAction(
@@ -211,5 +236,101 @@ export async function updateLessonAction(
     };
   } catch (error) {
     return persistenceState("Erro inesperado ao atualizar uma aula.", error);
+  }
+}
+
+export async function setLessonAttendanceAction(
+  _previousState: TeacherManagementActionState,
+  formData: FormData,
+): Promise<TeacherManagementActionState> {
+  void _previousState;
+
+  const extraFields = unexpectedLessonFields(formData, LESSON_ATTENDANCE_FIELDS);
+  if (extraFields.length > 0) return unexpectedFieldsState(extraFields);
+
+  const parsed = lessonAttendanceSchema.safeParse(readLessonAttendanceFormData(formData));
+  if (!parsed.success) return validationState(parsed.error);
+
+  const authorization = await authorizeActiveTeacher();
+  if (authorization.state) return authorization.state;
+
+  try {
+    const supabase = await createSupabaseServerClient();
+    const { data, error } = await supabase.rpc("set_lesson_attendance", {
+      p_lesson_id: parsed.data.lessonId,
+      p_lesson_participant_id: parsed.data.participantId,
+      p_present: parsed.data.present,
+    });
+
+    if (error) {
+      return persistenceState(
+        "Falha ao registar presença.",
+        error,
+        lessonMessage(error.message, "Não foi possível registar a presença. Tente novamente."),
+      );
+    }
+
+    revalidateLessonOperation(parsed.data.lessonId);
+
+    if (data === false) {
+      return {
+        status: "success",
+        message: parsed.data.present
+          ? "A presença já estava confirmada."
+          : "A presença já estava por confirmar.",
+      };
+    }
+
+    return {
+      status: "success",
+      message: parsed.data.present
+        ? "Presença confirmada."
+        : "Presença voltou a ficar por confirmar.",
+    };
+  } catch (error) {
+    return persistenceState("Erro inesperado ao registar presença.", error);
+  }
+}
+
+export async function completeLessonAction(
+  _previousState: TeacherManagementActionState,
+  formData: FormData,
+): Promise<TeacherManagementActionState> {
+  void _previousState;
+
+  const extraFields = unexpectedLessonFields(formData, LESSON_COMPLETE_FIELDS);
+  if (extraFields.length > 0) return unexpectedFieldsState(extraFields);
+
+  const parsed = lessonCompleteSchema.safeParse(readLessonCompleteFormData(formData));
+  if (!parsed.success) return validationState(parsed.error);
+
+  const authorization = await authorizeActiveTeacher();
+  if (authorization.state) return authorization.state;
+
+  try {
+    const supabase = await createSupabaseServerClient();
+    const { data, error } = await supabase.rpc("complete_lesson", {
+      p_lesson_id: parsed.data.lessonId,
+    });
+
+    if (error) {
+      return persistenceState(
+        "Falha ao concluir aula.",
+        error,
+        lessonMessage(error.message, "Não foi possível concluir a aula. Tente novamente."),
+      );
+    }
+
+    revalidateLessonOperation(parsed.data.lessonId, true);
+
+    return {
+      status: "success",
+      message:
+        data === false
+          ? "Esta aula já está concluída."
+          : "Aula concluída. O crédito reservado foi marcado como utilizado.",
+    };
+  } catch (error) {
+    return persistenceState("Erro inesperado ao concluir aula.", error);
   }
 }

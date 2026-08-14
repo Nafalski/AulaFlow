@@ -2,9 +2,15 @@ import { describe, expect, it } from "vitest";
 
 import {
   LESSON_CREATE_FIELDS,
+  LESSON_ATTENDANCE_FIELDS,
+  LESSON_COMPLETE_FIELDS,
   lessonCreateSchema,
+  lessonAttendanceSchema,
+  lessonCompleteSchema,
   lessonIdSchema,
   lessonUpdateSchema,
+  readLessonAttendanceFormData,
+  readLessonCompleteFormData,
   readLessonCreateFormData,
   unexpectedLessonFields,
 } from "./lessons";
@@ -17,6 +23,7 @@ const RESOURCE = "55555555-5555-4555-8555-555555555555";
 const CLUB = "66666666-6666-4666-8666-666666666666";
 const LESSON = "77777777-7777-4777-8777-777777777777";
 const KEY = "88888888-8888-4888-8888-888888888888";
+const PARTICIPANT = "99999999-9999-4999-8999-999999999999";
 
 const base = {
   sportId: SPORT,
@@ -260,6 +267,49 @@ describe("lessonIdSchema", () => {
   });
 });
 
+describe("lessonAttendanceSchema", () => {
+  it("aceita marcar e retirar presença", () => {
+    expect(
+      lessonAttendanceSchema.parse({
+        lessonId: LESSON,
+        participantId: PARTICIPANT,
+        present: "true",
+      }),
+    ).toEqual({ lessonId: LESSON, participantId: PARTICIPANT, present: true });
+    expect(
+      lessonAttendanceSchema.parse({
+        lessonId: LESSON,
+        participantId: PARTICIPANT,
+        present: "false",
+      }),
+    ).toEqual({ lessonId: LESSON, participantId: PARTICIPANT, present: false });
+  });
+
+  it("recusa participantes e booleanos forjados", () => {
+    expect(
+      lessonAttendanceSchema.safeParse({
+        lessonId: LESSON,
+        participantId: "participante",
+        present: "true",
+      }).success,
+    ).toBe(false);
+    expect(
+      lessonAttendanceSchema.safeParse({
+        lessonId: LESSON,
+        participantId: PARTICIPANT,
+        present: "sim",
+      }).success,
+    ).toBe(false);
+  });
+});
+
+describe("lessonCompleteSchema", () => {
+  it("aceita apenas o identificador da aula", () => {
+    expect(lessonCompleteSchema.parse({ lessonId: LESSON })).toEqual({ lessonId: LESSON });
+    expect(lessonCompleteSchema.safeParse({ lessonId: "aula-1" }).success).toBe(false);
+  });
+});
+
 describe("leitura do FormData", () => {
   it("lê apenas os campos do contrato", () => {
     const formData = new FormData();
@@ -279,5 +329,35 @@ describe("leitura do FormData", () => {
     formData.set("teacher_id", "outro-professor");
 
     expect(unexpectedLessonFields(formData, LESSON_CREATE_FIELDS)).toEqual(["teacher_id"]);
+  });
+
+  it("lê presença apenas pelo contrato seguro", () => {
+    const formData = new FormData();
+    formData.set("lessonId", LESSON);
+    formData.set("participantId", PARTICIPANT);
+    formData.set("present", "true");
+    formData.set("studentPackageId", "forjado");
+
+    expect(readLessonAttendanceFormData(formData)).toEqual({
+      lessonId: LESSON,
+      participantId: PARTICIPANT,
+      present: "true",
+    });
+    expect(unexpectedLessonFields(formData, LESSON_ATTENDANCE_FIELDS)).toEqual([
+      "studentPackageId",
+    ]);
+  });
+
+  it("lê conclusão sem aceitar campos financeiros do browser", () => {
+    const formData = new FormData();
+    formData.set("lessonId", LESSON);
+    formData.set("studentPackageId", "forjado");
+    formData.set("creditsConsumed", "99");
+
+    expect(readLessonCompleteFormData(formData)).toEqual({ lessonId: LESSON });
+    expect(unexpectedLessonFields(formData, LESSON_COMPLETE_FIELDS)).toEqual([
+      "studentPackageId",
+      "creditsConsumed",
+    ]);
   });
 });

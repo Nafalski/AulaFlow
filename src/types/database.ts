@@ -793,9 +793,12 @@ export type LessonParticipantDirectoryEntry = {
 
 export type TeacherLessonParticipantCreditRecord = {
   lesson_id: UUID;
+  lesson_participant_id: UUID;
   student_id: UUID;
   status: ParticipantStatus;
   confirmed_at: Timestamp | null;
+  attendance_status: AttendanceStatus | null;
+  attendance_marked_at: Timestamp | null;
   full_name: string;
   billing_status: ParticipationBillingStatus;
   credits_reserved: number;
@@ -1165,6 +1168,8 @@ export type StudentLessonRecord = {
   duration_minutes: number;
   status: LessonStatus;
   participation_status: ParticipantStatus;
+  attendance_status: AttendanceStatus | null;
+  attendance_marked_at: Timestamp | null;
   billing_status: ParticipationBillingStatus;
   credits_reserved: number;
   credits_consumed: number;
@@ -1592,8 +1597,9 @@ export type Database = {
       };
       attendance: {
         Row: Attendance;
-        Insert: Insertable<Attendance, Audited | "marked_by" | "marked_at" | "notes">;
-        Update: Partial<Attendance>;
+        // Escrita de presença só pelas RPCs da Fase 6A.
+        Insert: never;
+        Update: never;
         Relationships: [];
       };
       lesson_change_history: {
@@ -1879,6 +1885,18 @@ export type Database = {
       };
       consume_participation_credits: {
         Args: { p_participant_id: UUID; p_reason?: string | null };
+        Returns: boolean;
+      };
+      set_lesson_attendance: {
+        Args: {
+          p_lesson_id: UUID;
+          p_lesson_participant_id: UUID;
+          p_present: boolean;
+        };
+        Returns: boolean;
+      };
+      complete_lesson: {
+        Args: { p_lesson_id: UUID };
         Returns: boolean;
       };
       transfer_participation_reservation: {

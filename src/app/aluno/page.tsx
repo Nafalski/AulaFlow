@@ -39,6 +39,7 @@ export default async function StudentHomePage() {
           .from("student_lesson_records")
           .select("id, title, starts_at, ends_at, duration_minutes, status, billing_status, package_name, sport_name, teacher_name, location_name, location_resource_name, is_recurring, recurrence_frequency, recurrence_occurrence_index, recurrence_occurrence_count")
           .gte("starts_at", new Date().toISOString())
+          .in("status", ["scheduled", "confirmed"])
           .order("starts_at")
           .limit(UPCOMING_LIMIT);
 
@@ -141,7 +142,7 @@ export default async function StudentHomePage() {
       </section>
 
       <p className="text-xs text-muted">
-        Confirmar presença e pedir marcação chegam numa etapa seguinte.
+        A presença e a conclusão registadas pelo professor aparecem no calendário e nos pacotes.
       </p>
     </div>
   );

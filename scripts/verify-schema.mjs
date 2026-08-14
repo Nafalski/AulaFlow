@@ -7783,6 +7783,11 @@ check(
 await db.query(`update public.lessons set status='completed', completed_at=now() where id=$1`, [
   exactBreakLesson.id,
 ]);
+await db.query(
+  `select public.consume_participation_credits(id, 'Fixture concluído')
+     from public.lesson_participants where lesson_id=$1`,
+  [exactBreakLesson.id],
+);
 
 const overlapsCompletedLesson = await createLessonAs(TEACHER_UID, {
   studentId: ana.id,
@@ -7797,6 +7802,11 @@ check(
 await db.query(`update public.lessons set status='completed', completed_at=now() where id=$1`, [
   overlapsCompletedLesson.id,
 ]);
+await db.query(
+  `select public.consume_participation_credits(id, 'Fixture concluído')
+     from public.lesson_participants where lesson_id=$1`,
+  [overlapsCompletedLesson.id],
+);
 
 // ── Aula de turma: materialização ───────────────────────────────────────────
 
@@ -8793,6 +8803,523 @@ await asDatabaseRole("authenticated", TEACHER_UID, () =>
   db.query(`select public.add_group_member($1,$2)`, [managedGroup.id, bruno.id]),
 );
 
+// ── Presença e conclusão segura (Fase 6A) ──────────────────────────────────
+
+section("Presença e conclusão de aulas (Fase 6A)");
+
+const createOperationalLesson = ({ title, startOffset, endOffset, groupId = null }) =>
+  one(
+    `insert into public.lessons
+       (organization_id, teacher_id, sport_id, title, starts_at, ends_at, group_id, credit_cost)
+     values ($1,$2,$3,$4, now() + $5::interval, now() + $6::interval, $7::uuid, 1)
+     returning id`,
+    [org, teacher.id, sport, title, startOffset, endOffset, groupId],
+  );
+
+const reserveParticipant = (lessonId, studentId, packageId) =>
+  one(
+    `select public.reserve_participation_credits($1,$2,$3) as id`,
+    [lessonId, studentId, packageId],
+  );
+
+const setAttendanceAs = (uid, lessonId, participantId, present = true) =>
+  asDatabaseRole("authenticated", uid, () =>
+    one(
+      `select public.set_lesson_attendance($1,$2,$3) as changed`,
+      [lessonId, participantId, present],
+    ),
+  );
+
+const completeLessonAs = (uid, lessonId) =>
+  asDatabaseRole("authenticated", uid, () =>
+    one(`select public.complete_lesson($1) as changed`, [lessonId]),
+  );
+
+const futureAttendanceLesson = await createOperationalLesson({
+  title: "Presença futura 6A",
+  startOffset: "1 hour",
+  endOffset: "2 hours",
+});
+const futureAttendanceParticipant = await reserveParticipant(
+  futureAttendanceLesson.id,
+  ana.id,
+  schedulingAnaPack.id,
+);
+await mustReject(
+  "presença antes do início da aula é recusada",
+  () =>
+    setAttendanceAs(
+      TEACHER_UID,
+      futureAttendanceLesson.id,
+      futureAttendanceParticipant.id,
+      true,
+    ),
+  "começou",
+);
+
+const runningLesson = await createOperationalLesson({
+  title: "Presença em curso 6A",
+  startOffset: "-30 minutes",
+  endOffset: "30 minutes",
+});
+const runningParticipant = await reserveParticipant(runningLesson.id, ana.id, schedulingAnaPack.id);
+const runningAttendance = await setAttendanceAs(
+  TEACHER_UID,
+  runningLesson.id,
+  runningParticipant.id,
+  true,
+);
+check(runningAttendance.changed === true, "professor regista presença depois do início");
+await mustReject(
+  "conclusão antes do fim da aula é recusada",
+  () => completeLessonAs(TEACHER_UID, runningLesson.id),
+  "depois do horário",
+);
+
+const missingAttendanceLesson = await createOperationalLesson({
+  title: "Conclusão sem presença 6A",
+  startOffset: "-3 hours",
+  endOffset: "-2 hours",
+});
+const missingAttendanceParticipant = await reserveParticipant(
+  missingAttendanceLesson.id,
+  ana.id,
+  schedulingAnaPack.id,
+);
+const missingAttendancePackBefore = await pkg(schedulingAnaPack.id);
+await mustReject(
+  "conclusão exige presença confirmada",
+  () => completeLessonAs(TEACHER_UID, missingAttendanceLesson.id),
+  "presença",
+);
+const missingAttendancePackAfter = await pkg(schedulingAnaPack.id);
+const missingAttendanceParticipantAfter = await one(
+  `select billing_status::text, credits_reserved, credits_consumed
+     from public.lesson_participants where id=$1`,
+  [missingAttendanceParticipant.id],
+);
+check(
+  missingAttendancePackAfter.credits_reserved === missingAttendancePackBefore.credits_reserved &&
+    missingAttendancePackAfter.credits_used === missingAttendancePackBefore.credits_used &&
+    missingAttendanceParticipantAfter.billing_status === "reserved",
+  "falha por presença em falta não consome nem liberta a reserva",
+);
+
+const legacyLesson = await createOperationalLesson({
+  title: "Legacy sem reserva 6A",
+  startOffset: "-13 hours",
+  endOffset: "-12 hours",
+});
+const legacyParticipant = await one(
+  `insert into public.lesson_participants (lesson_id, student_id, added_by)
+   values ($1,$2,$3)
+   returning id`,
+  [legacyLesson.id, ana.id, TEACHER_UID],
+);
+await setAttendanceAs(TEACHER_UID, legacyLesson.id, legacyParticipant.id, true);
+const legacyLedgerBefore = await one(
+  `select count(*)::int as total
+     from public.package_credit_transactions where lesson_id=$1`,
+  [legacyLesson.id],
+);
+await mustReject(
+  "aula legacy sem reserva não é concluída automaticamente",
+  () => completeLessonAs(TEACHER_UID, legacyLesson.id),
+  "reserva",
+);
+const legacyAfter = await one(
+  `select lesson.status::text as lesson_status, participant.billing_status::text as billing_status
+     from public.lessons lesson
+     join public.lesson_participants participant on participant.lesson_id = lesson.id
+    where participant.id=$1`,
+  [legacyParticipant.id],
+);
+const legacyLedgerAfter = await one(
+  `select count(*)::int as total
+     from public.package_credit_transactions where lesson_id=$1`,
+  [legacyLesson.id],
+);
+check(
+  legacyAfter.lesson_status === "scheduled" &&
+    legacyAfter.billing_status === "pending" &&
+    Number(legacyLedgerAfter.total) === Number(legacyLedgerBefore.total),
+  "legacy sem reserva não ganha pacote nem ledger retroativo",
+);
+
+const completionLesson = await createOperationalLesson({
+  title: "Conclusão individual 6A",
+  startOffset: "-5 hours",
+  endOffset: "-4 hours",
+});
+const completionParticipant = await reserveParticipant(
+  completionLesson.id,
+  ana.id,
+  schedulingAnaPack.id,
+);
+const attendanceOn = await setAttendanceAs(
+  TEACHER_UID,
+  completionLesson.id,
+  completionParticipant.id,
+  true,
+);
+const attendanceOnAgain = await setAttendanceAs(
+  TEACHER_UID,
+  completionLesson.id,
+  completionParticipant.id,
+  true,
+);
+const attendanceOff = await setAttendanceAs(
+  TEACHER_UID,
+  completionLesson.id,
+  completionParticipant.id,
+  false,
+);
+const attendanceBackOn = await setAttendanceAs(
+  TEACHER_UID,
+  completionLesson.id,
+  completionParticipant.id,
+  true,
+);
+check(
+  attendanceOn.changed === true &&
+    attendanceOnAgain.changed === false &&
+    attendanceOff.changed === true &&
+    attendanceBackOn.changed === true,
+  "marcar presença é idempotente e retirar volta ao estado por confirmar",
+);
+const completionAttendanceRows = await one(
+  `select count(*)::int as total
+     from public.attendance where lesson_id=$1 and student_id=$2`,
+  [completionLesson.id, ana.id],
+);
+const completionAttendanceHistory = await one(
+  `select count(*)::int as total
+     from public.lesson_change_history
+    where lesson_id=$1 and change_type='attendance_recorded'`,
+  [completionLesson.id],
+);
+check(
+  Number(completionAttendanceRows.total) === 1 &&
+    Number(completionAttendanceHistory.total) === 3,
+  "no-op de presença não duplica linha nem histórico",
+);
+
+const completionPackBefore = await pkg(schedulingAnaPack.id);
+const completionLedgerBefore = await one(
+  `select count(*)::int as total
+     from public.package_credit_transactions
+    where lesson_id=$1 and type='credit_consumed'`,
+  [completionLesson.id],
+);
+const completed = await completeLessonAs(TEACHER_UID, completionLesson.id);
+const completedAgain = await completeLessonAs(TEACHER_UID, completionLesson.id);
+const completionPackAfter = await pkg(schedulingAnaPack.id);
+const completionParticipantAfter = await one(
+  `select billing_status::text, credits_reserved, credits_consumed
+     from public.lesson_participants where id=$1`,
+  [completionParticipant.id],
+);
+const completionLessonAfter = await one(
+  `select status::text, completed_at is not null as has_completed_at
+     from public.lessons where id=$1`,
+  [completionLesson.id],
+);
+const completionLedgerAfter = await one(
+  `select count(*)::int as total
+     from public.package_credit_transactions
+    where lesson_id=$1 and type='credit_consumed'`,
+  [completionLesson.id],
+);
+check(
+  completed.changed === true &&
+    completedAgain.changed === false &&
+    completionLessonAfter.status === "completed" &&
+    completionLessonAfter.has_completed_at === true,
+  "conclusão muda a aula para concluída e repetir é no-op",
+);
+check(
+  completionParticipantAfter.billing_status === "consumed" &&
+    completionParticipantAfter.credits_reserved === 0 &&
+    completionParticipantAfter.credits_consumed === 1 &&
+    completionPackAfter.credits_reserved === completionPackBefore.credits_reserved - 1 &&
+    completionPackAfter.credits_used === completionPackBefore.credits_used + 1 &&
+    Number(completionLedgerAfter.total) === Number(completionLedgerBefore.total) + 1,
+  "concluir consome exatamente uma vez o crédito reservado",
+);
+
+await mustReject("outro professor não marca presença em aula alheia", () =>
+  setAttendanceAs(OTHER_TEACHER_UID, missingAttendanceLesson.id, missingAttendanceParticipant.id, true),
+);
+await mustReject("aluno não marca presença", () =>
+  setAttendanceAs(ANA_UID, missingAttendanceLesson.id, missingAttendanceParticipant.id, true),
+);
+await mustReject("administrador não marca presença operacional", () =>
+  setAttendanceAs(ADMIN_UID, missingAttendanceLesson.id, missingAttendanceParticipant.id, true),
+);
+await mustReject("anónimo não marca presença", () =>
+  asDatabaseRole("anon", null, () =>
+    db.query(
+      `select public.set_lesson_attendance($1,$2,true)`,
+      [missingAttendanceLesson.id, missingAttendanceParticipant.id],
+    ),
+  ),
+);
+await mustReject("outro professor não conclui aula alheia", () =>
+  completeLessonAs(OTHER_TEACHER_UID, missingAttendanceLesson.id),
+);
+await mustReject("aluno não conclui aula", () => completeLessonAs(ANA_UID, missingAttendanceLesson.id));
+await mustReject("administrador não conclui aula operacional", () =>
+  completeLessonAs(ADMIN_UID, missingAttendanceLesson.id),
+);
+await mustReject("anónimo não conclui aula", () =>
+  asDatabaseRole("anon", null, () =>
+    db.query(`select public.complete_lesson($1)`, [missingAttendanceLesson.id]),
+  ),
+);
+
+await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  db.query(`select public.admin_set_account_status($1,'blocked','Teste 6A')`, [TEACHER_UID]),
+);
+await mustReject("conta bloqueada não marca presença", () =>
+  setAttendanceAs(TEACHER_UID, missingAttendanceLesson.id, missingAttendanceParticipant.id, true),
+);
+await mustReject("conta bloqueada não conclui aula", () =>
+  completeLessonAs(TEACHER_UID, missingAttendanceLesson.id),
+);
+await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  db.query(`select public.admin_set_account_status($1,'active',null)`, [TEACHER_UID]),
+);
+
+const incompleteGroupLesson = await createOperationalLesson({
+  title: "Turma presença incompleta 6A",
+  startOffset: "-7 hours",
+  endOffset: "-6 hours",
+  groupId: managedGroup.id,
+});
+const incompleteAnaParticipant = await reserveParticipant(
+  incompleteGroupLesson.id,
+  ana.id,
+  schedulingAnaPack.id,
+);
+const incompleteBrunoParticipant = await reserveParticipant(
+  incompleteGroupLesson.id,
+  bruno.id,
+  schedulingBrunoPack.id,
+);
+await setAttendanceAs(TEACHER_UID, incompleteGroupLesson.id, incompleteAnaParticipant.id, true);
+const incompleteGroupAnaBefore = await pkg(schedulingAnaPack.id);
+const incompleteGroupBrunoBefore = await pkg(schedulingBrunoPack.id);
+await mustReject(
+  "aula de turma não conclui com presença parcial",
+  () => completeLessonAs(TEACHER_UID, incompleteGroupLesson.id),
+  "presença",
+);
+const incompleteGroupAnaAfter = await pkg(schedulingAnaPack.id);
+const incompleteGroupBrunoAfter = await pkg(schedulingBrunoPack.id);
+const incompleteGroupStates = await rows(
+  `select id, billing_status::text, credits_reserved, credits_consumed
+     from public.lesson_participants
+    where id = any($1::uuid[])
+    order by id`,
+  [[incompleteAnaParticipant.id, incompleteBrunoParticipant.id]],
+);
+check(
+  incompleteGroupAnaAfter.credits_reserved === incompleteGroupAnaBefore.credits_reserved &&
+    incompleteGroupBrunoAfter.credits_reserved === incompleteGroupBrunoBefore.credits_reserved &&
+    incompleteGroupStates.every((row) => row.billing_status === "reserved"),
+  "falha de turma por presença parcial não consome ninguém",
+);
+
+const completeGroupLesson = await createOperationalLesson({
+  title: "Turma completa 6A",
+  startOffset: "-9 hours",
+  endOffset: "-8 hours",
+  groupId: managedGroup.id,
+});
+const completeGroupAnaParticipant = await reserveParticipant(
+  completeGroupLesson.id,
+  ana.id,
+  schedulingAnaPack.id,
+);
+const completeGroupBrunoParticipant = await reserveParticipant(
+  completeGroupLesson.id,
+  bruno.id,
+  schedulingBrunoPack.id,
+);
+await setAttendanceAs(TEACHER_UID, completeGroupLesson.id, completeGroupAnaParticipant.id, true);
+await setAttendanceAs(TEACHER_UID, completeGroupLesson.id, completeGroupBrunoParticipant.id, true);
+const completeGroupLedgerBefore = await one(
+  `select count(*)::int as total
+     from public.package_credit_transactions
+    where lesson_id=$1 and type='credit_consumed'`,
+  [completeGroupLesson.id],
+);
+const completeGroupResult = await completeLessonAs(TEACHER_UID, completeGroupLesson.id);
+const completeGroupLedgerAfter = await one(
+  `select count(*)::int as total
+     from public.package_credit_transactions
+    where lesson_id=$1 and type='credit_consumed'`,
+  [completeGroupLesson.id],
+);
+const completeGroupStates = await rows(
+  `select billing_status::text, credits_reserved, credits_consumed
+     from public.lesson_participants
+    where id = any($1::uuid[])
+    order by id`,
+  [[completeGroupAnaParticipant.id, completeGroupBrunoParticipant.id]],
+);
+check(
+  completeGroupResult.changed === true &&
+    Number(completeGroupLedgerAfter.total) === Number(completeGroupLedgerBefore.total) + 2 &&
+    completeGroupStates.every(
+      (row) =>
+        row.billing_status === "consumed" &&
+        row.credits_reserved === 0 &&
+        row.credits_consumed === 1,
+    ),
+  "turma com todas as presenças conclui e consome todos os participantes na mesma transação",
+);
+
+const recurringCompletionLessonId = recurringIds[1];
+const recurringCompletionParticipant = await one(
+  `select id from public.lesson_participants where lesson_id=$1`,
+  [recurringCompletionLessonId],
+);
+await db.query(
+  `update public.lessons
+      set starts_at = now() + '-11 hours'::interval,
+          ends_at = now() + '-10 hours'::interval
+    where id=$1`,
+  [recurringCompletionLessonId],
+);
+const recurringCompletionBefore = await pkg(recurringPack.id);
+await setAttendanceAs(
+  TEACHER_UID,
+  recurringCompletionLessonId,
+  recurringCompletionParticipant.id,
+  true,
+);
+const recurringCompletion = await completeLessonAs(TEACHER_UID, recurringCompletionLessonId);
+const recurringCompletionAfter = await pkg(recurringPack.id);
+const recurringSiblingStatuses = await rows(
+  `select id, status::text from public.lessons where id = any($1::uuid[]) order by id`,
+  [recurringIds],
+);
+check(
+  recurringCompletion.changed === true &&
+    recurringCompletionAfter.credits_reserved === recurringCompletionBefore.credits_reserved - 1 &&
+    recurringCompletionAfter.credits_used === recurringCompletionBefore.credits_used + 1 &&
+    recurringSiblingStatuses.filter((row) => row.status === "completed").length === 1,
+  "concluir uma ocorrência recorrente não conclui as restantes",
+);
+
+const teacherAttendanceProjection = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select lesson_participant_id, attendance_status::text, attendance_marked_at,
+            billing_status::text, credits_reserved, credits_consumed
+       from public.teacher_lesson_participant_credit_records where lesson_id=$1`,
+    [completionLesson.id],
+  ),
+);
+check(
+  teacherAttendanceProjection?.lesson_participant_id === completionParticipant.id &&
+    teacherAttendanceProjection.attendance_status === "present" &&
+    teacherAttendanceProjection.attendance_marked_at !== null &&
+    teacherAttendanceProjection.billing_status === "consumed" &&
+    teacherAttendanceProjection.credits_reserved === 0 &&
+    teacherAttendanceProjection.credits_consumed === 1,
+  "projeção do professor mostra presença e consumo sem expor pacote interno",
+);
+check(
+  forbiddenColumns(teacherAttendanceProjection ?? {}, [
+    "marked_by",
+    "attendance_marked_by",
+    "student_package_id",
+    "credits_available",
+    "credits_total",
+  ]).length === 0,
+  "projeção operacional do professor não expõe ator da presença nem id de pacote",
+);
+
+const studentAttendanceProjection = await asDatabaseRole("authenticated", ANA_UID, () =>
+  one(
+    `select id, attendance_status::text, attendance_marked_at, billing_status::text,
+            credits_reserved, credits_consumed
+       from public.student_lesson_records where id=$1`,
+    [completionLesson.id],
+  ),
+);
+check(
+  studentAttendanceProjection?.attendance_status === "present" &&
+    studentAttendanceProjection.attendance_marked_at !== null &&
+    studentAttendanceProjection.billing_status === "consumed" &&
+    studentAttendanceProjection.credits_reserved === 0 &&
+    studentAttendanceProjection.credits_consumed === 1,
+  "aluno vê apenas a própria presença e o próprio crédito consumido",
+);
+check(
+  forbiddenColumns(studentAttendanceProjection ?? {}, [
+    "marked_by",
+    "attendance_marked_by",
+    "student_package_id",
+    "teacher_id",
+    "participant_count",
+    "recurrence_group_id",
+  ]).length === 0,
+  "projeção do aluno não expõe ator, pacote, professor interno nem colegas",
+);
+
+const anaAttendanceRows = await asDatabaseRole("authenticated", ANA_UID, () =>
+  rows(
+    `select student_id, status::text from public.attendance where lesson_id=$1 order by student_id`,
+    [completeGroupLesson.id],
+  ),
+);
+const BRUNO_UID = "edededed-eded-eded-eded-edededededed";
+await db.exec(`
+  insert into auth.users (id, email, email_confirmed_at, raw_user_meta_data)
+  values ('${BRUNO_UID}', 'bruno@exemplo.pt', now(),
+          '{"role":"student","full_name":"Bruno Dias"}'::jsonb)
+`);
+const claimedBruno = await asDatabaseRole("authenticated", BRUNO_UID, () =>
+  one(`select public.claim_student_profile(null::text) as id`),
+);
+check(claimedBruno.id === bruno.id, "aluno Bruno autenticado reclamou a própria ficha");
+const brunoAttendanceRows = await asDatabaseRole("authenticated", BRUNO_UID, () =>
+  rows(
+    `select student_id, status::text from public.attendance where lesson_id=$1 order by student_id`,
+    [completeGroupLesson.id],
+  ),
+);
+const adminAttendanceRows = await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  rows(`select id from public.attendance where lesson_id=$1`, [completeGroupLesson.id]),
+);
+check(
+  anaAttendanceRows.length === 1 &&
+    anaAttendanceRows[0].student_id === ana.id &&
+    brunoAttendanceRows.length === 1 &&
+    brunoAttendanceRows[0].student_id === bruno.id &&
+    adminAttendanceRows.length === 0,
+  "RLS da tabela attendance isola aluno por aluno e não abre leitura operacional ao admin",
+);
+
+await mustReject("cliente não insere presença diretamente", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(
+      `insert into public.attendance (lesson_id, student_id, status)
+       values ($1,$2,'present')`,
+      [completionLesson.id, ana.id],
+    ),
+  ),
+);
+await mustReject("cliente não altera presença diretamente", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`update public.attendance set status='absent' where lesson_id=$1`, [
+      completionLesson.id,
+    ]),
+  ),
+);
+
 // ── Aluno, turma e modalidade ───────────────────────────────────────────────
 
 await mustReject("aluno de outra organização", () =>
@@ -8864,13 +9391,13 @@ const lessonWriteGrants = await rows(
   `select table_name, privilege_type
      from information_schema.table_privileges
     where table_schema='public'
-      and table_name in ('lessons','lesson_participants')
+      and table_name in ('lessons','lesson_participants','attendance')
       and grantee in ('authenticated','anon')
       and privilege_type in ('INSERT','UPDATE','DELETE','TRUNCATE')`,
 );
 check(
   lessonWriteGrants.length === 0,
-  "cliente autenticado não insere nem altera aulas diretamente",
+  "cliente autenticado não insere nem altera aulas, participantes ou presenças diretamente",
 );
 await mustReject("professor não insere aulas diretamente", () =>
   asDatabaseRole("authenticated", TEACHER_UID, () =>
@@ -8996,6 +9523,11 @@ await mustReject("editar com recurso de outro local", () =>
 
 await db.query(
   `update public.lessons set status='completed', completed_at=now() where id=$1`,
+  [contiguousLesson.id],
+);
+await db.query(
+  `select public.consume_participation_credits(id, 'Fixture concluído')
+     from public.lesson_participants where lesson_id=$1`,
   [contiguousLesson.id],
 );
 await mustReject("editar uma aula em estado terminal", () =>
@@ -9224,6 +9756,7 @@ const lessonFunctionAnon = await rows(
      join pg_namespace ns on ns.oid = proc.pronamespace
     where ns.nspname='public'
       and proc.proname in ('create_lesson','create_recurring_lessons','update_lesson',
+                           'set_lesson_attendance','complete_lesson',
                            'can_schedule_at_location','stable_uuid_from_text',
                            'lock_lesson_creation_intention','create_lesson_occurrence',
                            'lesson_fits_teacher_availability','validate_lesson_scope',
@@ -9237,12 +9770,13 @@ const lessonAuthenticatedPublicFunctions = await rows(
   `select proc.proname from pg_proc proc
      join pg_namespace ns on ns.oid = proc.pronamespace
     where ns.nspname='public'
-      and proc.proname in ('create_lesson','create_recurring_lessons','update_lesson')
+      and proc.proname in ('create_lesson','create_recurring_lessons','update_lesson',
+                           'set_lesson_attendance','complete_lesson')
       and has_function_privilege('authenticated', proc.oid, 'EXECUTE')`,
 );
 check(
-  new Set(lessonAuthenticatedPublicFunctions.map((row) => row.proname)).size === 3,
-  "authenticated executa as RPCs públicas de aula única, série semanal e edição",
+  new Set(lessonAuthenticatedPublicFunctions.map((row) => row.proname)).size === 5,
+  "authenticated executa as RPCs públicas de aula única, série, edição, presença e conclusão",
 );
 
 const lessonInternalFunctions = await rows(
@@ -9266,6 +9800,7 @@ const lessonSearchPath = await rows(
      join pg_namespace ns on ns.oid = proc.pronamespace
     where ns.nspname='public'
       and proc.proname in ('create_lesson','create_recurring_lessons','update_lesson',
+                           'set_lesson_attendance','complete_lesson',
                            'can_schedule_at_location','stable_uuid_from_text',
                            'lock_lesson_creation_intention','create_lesson_occurrence',
                            'lesson_fits_teacher_availability','validate_lesson_scope',
@@ -9289,6 +9824,19 @@ const lessonConflictTrigger = await one(
 check(
   Number(lessonConflictTrigger.total) === 1,
   "trigger de conflitos de aulas está instalado na tabela lessons",
+);
+
+const attendanceParticipantFk = await one(
+  `select count(*)::int as total
+     from pg_constraint constraint_row
+     join pg_class table_row on table_row.oid = constraint_row.conrelid
+    where table_row.relname='attendance'
+      and constraint_row.conname='attendance_matches_lesson_participant'
+      and constraint_row.contype='f'`,
+);
+check(
+  Number(attendanceParticipantFk.total) === 1,
+  "attendance tem FK composta para o participante materializado da aula",
 );
 
 const lessonViewsAnon = await rows(
@@ -9384,6 +9932,55 @@ check(
   invalidReservedParticipants.length === 0,
   "toda participação reservada aponta para pacote próprio e origem de reserva válida",
   `participações reservadas incoerentes: ${invalidReservedParticipants.map((row) => row.id).join(", ")}`,
+);
+
+const completedReservedParticipants = await rows(
+  `select participant.id
+     from public.lesson_participants participant
+     join public.lessons lesson on lesson.id = participant.lesson_id
+    where lesson.status = 'completed'
+      and participant.billing_status = 'reserved'`,
+);
+check(
+  completedReservedParticipants.length === 0,
+  "aula concluída não mantém participantes com crédito reservado",
+  `participações concluídas ainda reservadas: ${completedReservedParticipants.map((row) => row.id).join(", ")}`,
+);
+
+const consumedWithoutLedger = await rows(
+  `select participant.id
+     from public.lesson_participants participant
+    where participant.billing_status = 'consumed'
+      and not exists (
+        select 1
+          from public.package_credit_transactions transaction
+         where transaction.type = 'credit_consumed'
+           and transaction.lesson_participant_id = participant.id
+           and transaction.lesson_id = participant.lesson_id
+           and transaction.student_package_id = participant.student_package_id
+           and transaction.quantity = participant.credits_consumed
+      )`,
+);
+check(
+  consumedWithoutLedger.length === 0,
+  "toda participação consumida tem movimento de crédito consumido correspondente",
+  `participações consumidas sem ledger: ${consumedWithoutLedger.map((row) => row.id).join(", ")}`,
+);
+
+const attendanceWithoutParticipant = await rows(
+  `select attendance.id
+     from public.attendance attendance
+    where not exists (
+      select 1
+        from public.lesson_participants participant
+       where participant.lesson_id = attendance.lesson_id
+         and participant.student_id = attendance.student_id
+    )`,
+);
+check(
+  attendanceWithoutParticipant.length === 0,
+  "presença só existe para participantes materializados da aula",
+  `presenças sem participante: ${attendanceWithoutParticipant.map((row) => row.id).join(", ")}`,
 );
 
 const createdLessonParticipantDrift = await rows(

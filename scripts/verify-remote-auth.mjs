@@ -2168,6 +2168,13 @@ try {
     const naive = Date.UTC(year, month - 1, day, hour, minute);
     return new Date(naive - lisbonOffsetMinutes(new Date(naive)) * 60_000).toISOString();
   };
+  const dateOnlyFromNow = (days) =>
+    new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const timeFromMinutes = (value) => {
+    const hours = String(Math.floor(value / 60)).padStart(2, "0");
+    const minutes = String(value % 60).padStart(2, "0");
+    return `${hours}:${minutes}`;
+  };
 
   // Fixture própria da 5D.2: não reutiliza a aula E2E antiga, que pode ter sido
   // criada antes de a criação reservar créditos.
@@ -2219,15 +2226,23 @@ try {
     return data;
   }
 
-  async function assignLessonPackage(supabase, studentId, label, credits, key, sportId = sportRow.id) {
+  async function assignLessonPackage(
+    supabase,
+    studentId,
+    label,
+    credits,
+    key,
+    sportId = sportRow.id,
+    options = {},
+  ) {
     const { data: id, error } = await supabase.rpc("assign_student_package", {
       p_student_id: studentId,
       p_template_id: null,
       p_credits: credits,
       p_name: label,
       p_sport_id: sportId,
-      p_starts_on: lessonPackageStartsOn,
-      p_expires_on: lessonPackageExpiresOn,
+      p_starts_on: options.startsOn ?? lessonPackageStartsOn,
+      p_expires_on: options.expiresOn ?? lessonPackageExpiresOn,
       p_paid_amount_cents: null,
       p_notes: "e2e_aulaflow_agendamento",
       p_origin: "manual",
@@ -2502,11 +2517,18 @@ try {
   const minimumBreakDate = isoDatePlusDays(132, fixtureBaseDate);
   const resourceConflictDate = isoDatePlusDays(133, fixtureBaseDate);
 
-  const prepareException = async (supabase, label, dateOnly, keyPrefix) => {
+  const prepareException = async (
+    supabase,
+    label,
+    dateOnly,
+    keyPrefix,
+    startsAt = "10:00",
+    endsAt = "12:00",
+  ) => {
     const { error } = await supabase.rpc("upsert_teacher_availability_exception", {
       p_exception_date: dateOnly,
-      p_starts_at: "10:00",
-      p_ends_at: "12:00",
+      p_starts_at: startsAt,
+      p_ends_at: endsAt,
       p_mode: "replace",
       p_idempotency_key: deterministicUuid(`${keyPrefix}:${runId}`),
     });
@@ -3318,6 +3340,574 @@ try {
   check(
     (groupSeriesParticipantsAfterRemoval.data ?? []).length === groupSeriesResult.lesson_ids.length,
     "Remover membro depois da criacao nao altera o snapshot das ocorrencias recorrentes",
+  );
+
+  // ── Presenca e conclusao segura (Fase 6A) ────────────────────────────────
+
+  section("Presenca e conclusao de aulas");
+
+  await ensureGroupMember(teacherClient, group.id, groupStudent.id, "Aluno da turma para 6A");
+
+  const phase6RunSuffix = `${runId}-${Date.now().toString(36)}`;
+  const phase6PastDate = dateOnlyFromNow(-1);
+  const phase6EditRaceDate = dateOnlyFromNow(-2);
+  const phase6RecurringSecondDate = dateOnlyFromNow(6);
+  const phase6FutureDate = dateOnlyFromNow(30);
+  const phase6PastPackageExpiresOn = dateOnlyFromNow(10);
+  const phase6FuturePackageExpiresOn = dateOnlyFromNow(45);
+  const phase6BaseMinute = 360 + (Math.floor(Date.now() / 60000) % 90);
+  const phase6Slot = (index) => {
+    const startsAt = phase6BaseMinute + index * 80;
+    return {
+      startsAt: timeFromMinutes(startsAt),
+      endsAt: timeFromMinutes(startsAt + 60),
+    };
+  };
+
+  await prepareException(
+    teacherClient,
+    "Disponibilidade passada para 6A",
+    phase6PastDate,
+    `lesson-6a-past-${phase6RunSuffix}`,
+    "06:00",
+    "18:00",
+  );
+  await prepareException(
+    teacherClient,
+    "Disponibilidade para corridas 6A",
+    phase6EditRaceDate,
+    `lesson-6a-races-${phase6RunSuffix}`,
+    "06:00",
+    "18:00",
+  );
+  await prepareException(
+    teacherClient,
+    "Disponibilidade futura para 6A",
+    phase6FutureDate,
+    `lesson-6a-future-${phase6RunSuffix}`,
+    "06:00",
+    "18:00",
+  );
+  await prepareException(
+    teacherClient,
+    "Disponibilidade da segunda ocorrencia 6A",
+    phase6RecurringSecondDate,
+    `lesson-6a-recurring-second-${phase6RunSuffix}`,
+    "06:00",
+    "18:00",
+  );
+
+  const phase6PastPackageA = await assignLessonPackage(
+    teacherClient,
+    studentsA.id,
+    `Pacote presenca A ${phase6RunSuffix}`,
+    12,
+    deterministicUuid(`lesson-6a-package-a:${phase6RunSuffix}`),
+    sportRow.id,
+    { expiresOn: phase6PastPackageExpiresOn },
+  );
+  const phase6FuturePackageA = await assignLessonPackage(
+    teacherClient,
+    studentsA.id,
+    `Pacote presenca futura A ${phase6RunSuffix}`,
+    2,
+    deterministicUuid(`lesson-6a-package-future-a:${phase6RunSuffix}`),
+    sportRow.id,
+    { expiresOn: phase6FuturePackageExpiresOn },
+  );
+  const phase6GroupPackage = await assignLessonPackage(
+    teacherClient,
+    groupStudent.id,
+    `Pacote presenca turma ${phase6RunSuffix}`,
+    4,
+    deterministicUuid(`lesson-6a-package-group:${phase6RunSuffix}`),
+    sportRow.id,
+    { expiresOn: phase6PastPackageExpiresOn },
+  );
+  check(
+    phase6PastPackageA.status === "active" &&
+      phase6FuturePackageA.status === "active" &&
+      phase6GroupPackage.status === "active",
+    "Pacotes 6A foram criados ativos para presenca e conclusao",
+  );
+
+  const setAttendance = (client, lessonIdValue, participantId, present = true) =>
+    client.rpc("set_lesson_attendance", {
+      p_lesson_id: lessonIdValue,
+      p_lesson_participant_id: participantId,
+      p_present: present,
+    });
+  const completeLessonRpc = (client, lessonIdValue) =>
+    client.rpc("complete_lesson", { p_lesson_id: lessonIdValue });
+
+  const createPhase6Lesson = async ({ index, title, date = phase6PastDate, studentId = studentsA.id, groupId = null }) => {
+    const slot = phase6Slot(index);
+    const { data, error } = await createLesson(teacherClient, {
+      p_starts_at: lisbonInstant(date, slot.startsAt),
+      p_ends_at: lisbonInstant(date, slot.endsAt),
+      p_title: `${title} ${phase6RunSuffix}`,
+      p_location_id: null,
+      p_location_resource_id: null,
+      p_student_id: studentId,
+      p_group_id: groupId,
+      p_idempotency_key: deterministicUuid(`${title}:${phase6RunSuffix}`),
+    });
+    if (error || !data) throw new Error(`${title}: ${summarizeError(error)}`);
+    return data;
+  };
+
+  const readParticipant = (lessonIdValue, studentIdValue) =>
+    getSingle(
+      "participante 6A",
+      teacherClient
+        .from("teacher_lesson_participant_credit_records")
+        .select("lesson_participant_id, student_id, attendance_status, attendance_marked_at, billing_status, credits_reserved, credits_consumed, package_name")
+        .eq("lesson_id", lessonIdValue)
+        .eq("student_id", studentIdValue),
+    );
+
+  const futureLessonId = await createPhase6Lesson({
+    index: 0,
+    title: "Aula E2E 6A futura",
+    date: phase6FutureDate,
+  });
+  const futureParticipant = await readParticipant(futureLessonId, studentsA.id);
+  await mustReject("Presenca antes do inicio e recusada", async () =>
+    setAttendance(teacherClient, futureLessonId, futureParticipant.lesson_participant_id, true),
+  );
+  await mustReject("Conclusao antes do fim e recusada", async () =>
+    completeLessonRpc(teacherClient, futureLessonId),
+  );
+
+  const noAttendanceLessonId = await createPhase6Lesson({
+    index: 1,
+    title: "Aula E2E 6A sem presenca",
+  });
+  const noAttendanceParticipant = await readParticipant(noAttendanceLessonId, studentsA.id);
+  const noAttendancePackageBefore = await getSingle(
+    "pacote 6A antes de presenca em falta",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_available, credits_reserved, credits_used")
+      .eq("name", noAttendanceParticipant.package_name),
+  );
+  await mustReject("Conclusao exige presenca confirmada", async () =>
+    completeLessonRpc(teacherClient, noAttendanceLessonId),
+  );
+  const noAttendancePackageAfter = await getSingle(
+    "pacote 6A depois de presenca em falta",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_available, credits_reserved, credits_used")
+      .eq("name", noAttendanceParticipant.package_name),
+  );
+  const noAttendanceAfter = await readParticipant(noAttendanceLessonId, studentsA.id);
+  check(
+    noAttendancePackageAfter.credits_reserved === noAttendancePackageBefore.credits_reserved &&
+      noAttendancePackageAfter.credits_used === noAttendancePackageBefore.credits_used &&
+      noAttendanceAfter.lesson_participant_id === noAttendanceParticipant.lesson_participant_id &&
+      noAttendanceAfter.billing_status === "reserved",
+    "Falha por presenca em falta conserva a reserva e nao consome credito",
+  );
+
+  const completeLessonId = await createPhase6Lesson({
+    index: 2,
+    title: "Aula E2E 6A concluir",
+  });
+  const completeParticipant = await readParticipant(completeLessonId, studentsA.id);
+  const markPresent = await setAttendance(
+    teacherClient,
+    completeLessonId,
+    completeParticipant.lesson_participant_id,
+    true,
+  );
+  const markPresentAgain = await setAttendance(
+    teacherClient,
+    completeLessonId,
+    completeParticipant.lesson_participant_id,
+    true,
+  );
+  const unmarkPresent = await setAttendance(
+    teacherClient,
+    completeLessonId,
+    completeParticipant.lesson_participant_id,
+    false,
+  );
+  const markPresentBack = await setAttendance(
+    teacherClient,
+    completeLessonId,
+    completeParticipant.lesson_participant_id,
+    true,
+  );
+  check(
+    !markPresent.error &&
+      markPresent.data === true &&
+      !markPresentAgain.error &&
+      markPresentAgain.data === false &&
+      !unmarkPresent.error &&
+      unmarkPresent.data === true &&
+      !markPresentBack.error &&
+      markPresentBack.data === true,
+    "Marcar presenca e idempotente e retirar volta ao estado por confirmar",
+  );
+
+  const completePackageBefore = await getSingle(
+    "pacote 6A antes da conclusao",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_available, credits_reserved, credits_used")
+      .eq("name", completeParticipant.package_name),
+  );
+  const completeResult = await completeLessonRpc(teacherClient, completeLessonId);
+  if (completeResult.error) throw new Error(`Concluir aula 6A: ${summarizeError(completeResult.error)}`);
+  const completeAgain = await completeLessonRpc(teacherClient, completeLessonId);
+  if (completeAgain.error) throw new Error(`Repetir conclusao 6A: ${summarizeError(completeAgain.error)}`);
+  const completePackageAfter = await getSingle(
+    "pacote 6A depois da conclusao",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_available, credits_reserved, credits_used")
+      .eq("name", completeParticipant.package_name),
+  );
+  const completeLessonAfter = await getSingle(
+    "aula 6A concluida",
+    teacherClient
+      .from("teacher_lesson_schedule_records")
+      .select("id, status")
+      .eq("id", completeLessonId),
+  );
+  const completeParticipantAfter = await readParticipant(completeLessonId, studentsA.id);
+  const completeLedger = await teacherClient
+    .from("package_credit_transactions")
+    .select("id, type")
+    .eq("lesson_id", completeLessonId)
+    .eq("type", "credit_consumed");
+  check(
+    completeResult.data === true &&
+      completeAgain.data === false &&
+      completeLessonAfter.status === "completed" &&
+      completeParticipantAfter.attendance_status === "present" &&
+      completeParticipantAfter.billing_status === "consumed" &&
+      completeParticipantAfter.credits_reserved === 0 &&
+      completeParticipantAfter.credits_consumed === 1,
+    "Conclusao muda a aula para concluida, guarda presenca e repetir e no-op",
+  );
+  check(
+    !completeLedger.error &&
+      (completeLedger.data ?? []).length === 1 &&
+      completePackageAfter.credits_reserved === completePackageBefore.credits_reserved - 1 &&
+      completePackageAfter.credits_used === completePackageBefore.credits_used + 1,
+    "Conclusao consome exatamente uma vez o credito reservado",
+  );
+
+  await mustReject("Professor B nao marca presenca em aula alheia", async () =>
+    setAttendance(teacherBClient, noAttendanceLessonId, noAttendanceParticipant.lesson_participant_id, true),
+  );
+  await mustReject("Aluno nao marca presenca", async () =>
+    setAttendance(studentClient, noAttendanceLessonId, noAttendanceParticipant.lesson_participant_id, true),
+  );
+  await mustReject("Admin nao marca presenca operacional", async () =>
+    setAttendance(adminClient, noAttendanceLessonId, noAttendanceParticipant.lesson_participant_id, true),
+  );
+  await mustReject("Anonimo nao marca presenca", async () =>
+    setAttendance(anonClient, noAttendanceLessonId, noAttendanceParticipant.lesson_participant_id, true),
+  );
+  await mustReject("Professor B nao conclui aula alheia", async () =>
+    completeLessonRpc(teacherBClient, noAttendanceLessonId),
+  );
+  await mustReject("Aluno nao conclui aula", async () =>
+    completeLessonRpc(studentClient, noAttendanceLessonId),
+  );
+  await mustReject("Admin nao conclui aula operacional", async () =>
+    completeLessonRpc(adminClient, noAttendanceLessonId),
+  );
+  await mustReject("Anonimo nao conclui aula", async () =>
+    completeLessonRpc(anonClient, noAttendanceLessonId),
+  );
+
+  await signIn(blockedClient, credentials.blocked.email, credentials.blocked.password, "Conta bloqueada 6A");
+  await mustReject("Conta bloqueada nao marca presenca", async () =>
+    setAttendance(blockedClient, noAttendanceLessonId, noAttendanceParticipant.lesson_participant_id, true),
+  );
+  await mustReject("Conta bloqueada nao conclui aula", async () =>
+    completeLessonRpc(blockedClient, noAttendanceLessonId),
+  );
+
+  const incompleteGroupLessonId = await createPhase6Lesson({
+    index: 3,
+    title: "Aula E2E 6A turma parcial",
+    studentId: null,
+    groupId: group.id,
+  });
+  const incompleteGroupParticipants = await teacherClient
+    .from("teacher_lesson_participant_credit_records")
+    .select("lesson_participant_id, student_id, billing_status, credits_reserved, credits_consumed, package_name")
+    .eq("lesson_id", incompleteGroupLessonId);
+  if (incompleteGroupParticipants.error) {
+    throw new Error(`Participantes 6A turma parcial: ${summarizeError(incompleteGroupParticipants.error)}`);
+  }
+  const incompleteRows = incompleteGroupParticipants.data ?? [];
+  const incompleteStudentA = incompleteRows.find((row) => row.student_id === studentsA.id);
+  const incompleteGroupStudent = incompleteRows.find((row) => row.student_id === groupStudent.id);
+  if (!incompleteStudentA) throw new Error("Turma 6A parcial sem Aluno A");
+  if (!incompleteGroupStudent?.package_name) throw new Error("Turma 6A parcial sem pacote do aluno da turma");
+  await setAttendance(teacherClient, incompleteGroupLessonId, incompleteStudentA.lesson_participant_id, true);
+  const incompleteGroupBefore = await getSingle(
+    "pacote grupo 6A antes de falha",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_reserved, credits_used")
+      .eq("name", incompleteGroupStudent.package_name),
+  );
+  await mustReject("Turma nao conclui com presenca parcial", async () =>
+    completeLessonRpc(teacherClient, incompleteGroupLessonId),
+  );
+  const incompleteGroupAfter = await getSingle(
+    "pacote grupo 6A depois de falha",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_reserved, credits_used")
+      .eq("name", incompleteGroupStudent.package_name),
+  );
+  const incompleteGroupParticipantsAfter = await teacherClient
+    .from("teacher_lesson_participant_credit_records")
+    .select("billing_status, credits_reserved, credits_consumed")
+    .eq("lesson_id", incompleteGroupLessonId);
+  check(
+    !incompleteGroupParticipantsAfter.error &&
+      incompleteGroupAfter.credits_reserved === incompleteGroupBefore.credits_reserved &&
+      incompleteGroupAfter.credits_used === incompleteGroupBefore.credits_used &&
+      (incompleteGroupParticipantsAfter.data ?? []).every((row) => row.billing_status === "reserved"),
+    "Falha de turma por presenca parcial nao consome nenhum participante",
+  );
+
+  const completeGroupLessonId = await createPhase6Lesson({
+    index: 4,
+    title: "Aula E2E 6A turma completa",
+    studentId: null,
+    groupId: group.id,
+  });
+  const completeGroupParticipants = await teacherClient
+    .from("teacher_lesson_participant_credit_records")
+    .select("lesson_participant_id, student_id")
+    .eq("lesson_id", completeGroupLessonId);
+  if (completeGroupParticipants.error) {
+    throw new Error(`Participantes 6A turma completa: ${summarizeError(completeGroupParticipants.error)}`);
+  }
+  for (const participant of completeGroupParticipants.data ?? []) {
+    const { error } = await setAttendance(
+      teacherClient,
+      completeGroupLessonId,
+      participant.lesson_participant_id,
+      true,
+    );
+    if (error) throw new Error(`Marcar turma 6A: ${summarizeError(error)}`);
+  }
+  const completeGroupResult = await completeLessonRpc(teacherClient, completeGroupLessonId);
+  if (completeGroupResult.error) throw new Error(`Concluir turma 6A: ${summarizeError(completeGroupResult.error)}`);
+  const completeGroupAfter = await teacherClient
+    .from("teacher_lesson_participant_credit_records")
+    .select("billing_status, credits_reserved, credits_consumed")
+    .eq("lesson_id", completeGroupLessonId);
+  const completeGroupLedger = await teacherClient
+    .from("package_credit_transactions")
+    .select("id, type")
+    .eq("lesson_id", completeGroupLessonId)
+    .eq("type", "credit_consumed");
+  check(
+    !completeGroupAfter.error &&
+      !completeGroupLedger.error &&
+      completeGroupResult.data === true &&
+      (completeGroupAfter.data ?? []).length >= 2 &&
+      (completeGroupAfter.data ?? []).every(
+        (row) =>
+          row.billing_status === "consumed" &&
+          row.credits_reserved === 0 &&
+          row.credits_consumed === 1,
+      ) &&
+      (completeGroupLedger.data ?? []).length === (completeGroupAfter.data ?? []).length,
+    "Turma com todas as presencas conclui e consome todos os participantes",
+  );
+
+  const recurring6AData = await createRecurringLessons(teacherClient, {
+    p_starts_at: lisbonInstant(phase6PastDate, phase6Slot(5).startsAt),
+    p_ends_at: lisbonInstant(phase6PastDate, phase6Slot(5).endsAt),
+    p_title: `Serie E2E 6A ${phase6RunSuffix}`,
+    p_occurrence_count: 2,
+    p_location_id: null,
+    p_location_resource_id: null,
+    p_student_id: studentsA.id,
+    p_group_id: null,
+    p_idempotency_key: deterministicUuid(`lesson-6a-series:${phase6RunSuffix}`),
+  });
+  if (recurring6AData.error || !recurring6AData.data) {
+    throw new Error(`Criar serie 6A: ${summarizeError(recurring6AData.error)}`);
+  }
+  const recurring6A = readRecurringResult(recurring6AData.data, "serie 6A");
+  const recurring6AParticipant = await readParticipant(recurring6A.lesson_ids[0], studentsA.id);
+  await setAttendance(
+    teacherClient,
+    recurring6A.lesson_ids[0],
+    recurring6AParticipant.lesson_participant_id,
+    true,
+  );
+  const recurring6AResult = await completeLessonRpc(teacherClient, recurring6A.lesson_ids[0]);
+  if (recurring6AResult.error) throw new Error(`Concluir ocorrencia 6A: ${summarizeError(recurring6AResult.error)}`);
+  const recurring6AStatuses = await teacherClient
+    .from("teacher_lesson_schedule_records")
+    .select("id, status")
+    .in("id", recurring6A.lesson_ids);
+  check(
+    !recurring6AStatuses.error &&
+      recurring6AResult.data === true &&
+      (recurring6AStatuses.data ?? []).filter((row) => row.status === "completed").length === 1 &&
+      (recurring6AStatuses.data ?? []).filter((row) => row.status === "scheduled").length === 1,
+    "Concluir uma ocorrencia recorrente nao conclui as restantes",
+  );
+
+  const raceLessonId = await createPhase6Lesson({
+    index: 6,
+    title: "Aula E2E 6A corrida conclusao",
+  });
+  const raceParticipant = await readParticipant(raceLessonId, studentsA.id);
+  await setAttendance(teacherClient, raceLessonId, raceParticipant.lesson_participant_id, true);
+  const raceClientA = client(url, anonKey);
+  const raceClientB = client(url, anonKey);
+  await signIn(raceClientA, credentials.teacherA.email, credentials.teacherA.password, "Professor A corrida conclusao A");
+  await signIn(raceClientB, credentials.teacherA.email, credentials.teacherA.password, "Professor A corrida conclusao B");
+  const completionRace = await Promise.all([
+    rpcOutcome(() => completeLessonRpc(raceClientA, raceLessonId)),
+    rpcOutcome(() => completeLessonRpc(raceClientB, raceLessonId)),
+  ]);
+  const completionRaceSuccesses = completionRace.filter((outcome) => outcome.ok && outcome.data === true);
+  const completionRaceNoops = completionRace.filter((outcome) => outcome.ok && outcome.data === false);
+  const raceLedger = await teacherClient
+    .from("package_credit_transactions")
+    .select("id")
+    .eq("lesson_id", raceLessonId)
+    .eq("type", "credit_consumed");
+  check(
+    !raceLedger.error &&
+      completionRaceSuccesses.length === 1 &&
+      completionRaceNoops.length === 1 &&
+      (raceLedger.data ?? []).length === 1,
+    "Conclusao concorrente consome uma vez e a segunda chamada vira no-op",
+  );
+
+  const presenceRaceLessonId = await createPhase6Lesson({
+    index: 0,
+    title: "Aula E2E 6A corrida presenca",
+    date: phase6EditRaceDate,
+  });
+  const presenceRaceParticipant = await readParticipant(presenceRaceLessonId, studentsA.id);
+  const presenceRace = await Promise.all([
+    rpcOutcome(() =>
+      setAttendance(raceClientA, presenceRaceLessonId, presenceRaceParticipant.lesson_participant_id, true),
+    ),
+    rpcOutcome(() =>
+      setAttendance(raceClientB, presenceRaceLessonId, presenceRaceParticipant.lesson_participant_id, true),
+    ),
+  ]);
+  const presenceRaceRows = await teacherClient
+    .from("attendance")
+    .select("id, status")
+    .eq("lesson_id", presenceRaceLessonId)
+    .eq("student_id", studentsA.id);
+  check(
+    !presenceRaceRows.error &&
+      presenceRace.filter((outcome) => outcome.ok && outcome.data === true).length === 1 &&
+      presenceRace.filter((outcome) => outcome.ok && outcome.data === false).length === 1 &&
+      (presenceRaceRows.data ?? []).length === 1 &&
+      presenceRaceRows.data?.[0]?.status === "present",
+    "Presenca concorrente cria uma unica linha e a segunda chamada e no-op",
+  );
+
+  const editRaceLessonId = await createPhase6Lesson({
+    index: 1,
+    title: "Aula E2E 6A corrida edicao",
+    date: phase6EditRaceDate,
+  });
+  const editRaceParticipant = await readParticipant(editRaceLessonId, studentsA.id);
+  await setAttendance(teacherClient, editRaceLessonId, editRaceParticipant.lesson_participant_id, true);
+  const editRaceTarget = phase6Slot(3);
+  const completionEditRace = await Promise.all([
+    rpcOutcome(() => completeLessonRpc(raceClientA, editRaceLessonId)),
+    rpcOutcome(() =>
+      raceClientB.rpc("update_lesson", {
+        p_lesson_id: editRaceLessonId,
+        p_starts_at: lisbonInstant(phase6EditRaceDate, editRaceTarget.startsAt),
+        p_ends_at: lisbonInstant(phase6EditRaceDate, editRaceTarget.endsAt),
+        p_title: `Aula E2E 6A corrida edicao ajustada ${phase6RunSuffix}`,
+        p_location_id: null,
+        p_location_resource_id: null,
+        p_notes_for_students: "e2e_6a_edit_race",
+        p_private_notes: "e2e_6a_edit_race_privada",
+      }),
+    ),
+  ]);
+  const editRaceAfter = await getSingle(
+    "aula depois da corrida conclusao edicao",
+    teacherClient
+      .from("teacher_lesson_schedule_records")
+      .select("id, status")
+      .eq("id", editRaceLessonId),
+  );
+  const editRaceParticipantAfter = await readParticipant(editRaceLessonId, studentsA.id);
+  const editRaceLedger = await teacherClient
+    .from("package_credit_transactions")
+    .select("id")
+    .eq("lesson_id", editRaceLessonId)
+    .eq("type", "credit_consumed");
+  check(
+    !editRaceLedger.error &&
+      completionEditRace.some((outcome) => outcome.ok && outcome.data === true) &&
+      editRaceAfter.status === "completed" &&
+      editRaceParticipantAfter.billing_status === "consumed" &&
+      (editRaceLedger.data ?? []).length === 1,
+    "Conclusao concorrente com edicao termina em estado coerente e um unico consumo",
+  );
+
+  const studentCompletedLesson = await getSingle(
+    "aula concluida do aluno",
+    studentClient
+      .from("student_lesson_records")
+      .select("id, status, attendance_status, attendance_marked_at, billing_status, credits_reserved, credits_consumed, package_name")
+      .eq("id", completeLessonId),
+  );
+  check(
+    studentCompletedLesson.status === "completed" &&
+      studentCompletedLesson.attendance_status === "present" &&
+      studentCompletedLesson.attendance_marked_at !== null &&
+      studentCompletedLesson.billing_status === "consumed" &&
+      studentCompletedLesson.credits_reserved === 0 &&
+      studentCompletedLesson.credits_consumed === 1 &&
+      studentCompletedLesson.package_name !== null,
+    "Aluno ve a propria presenca e o credito consumido depois da conclusao",
+  );
+  check(
+    forbiddenColumns(studentCompletedLesson, [
+      "marked_by",
+      "attendance_marked_by",
+      "student_package_id",
+      "teacher_id",
+      "participant_count",
+      "recurrence_group_id",
+    ]).length === 0,
+    "Projecao 6A do aluno nao expoe ator, pacote interno nem colegas",
+  );
+
+  await mustReturnNoRows("Aluno B nao ve a presenca da aula do Aluno A", () =>
+    studentBClient.from("student_lesson_records").select("id").eq("id", completeLessonId),
+  );
+  await mustReject("Professor nao insere presenca diretamente", async () =>
+    teacherClient.from("attendance").insert({
+      lesson_id: completeLessonId,
+      student_id: studentsA.id,
+      status: "present",
+    }),
+  );
+  await mustReject("Professor nao altera presenca diretamente", async () =>
+    teacherClient.from("attendance").update({ status: "absent" }).eq("lesson_id", completeLessonId),
   );
 
   // ── Escrita direta ────────────────────────────────────────────────────────

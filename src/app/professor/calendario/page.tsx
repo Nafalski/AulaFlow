@@ -108,6 +108,7 @@ export default async function TeacherCalendarPage({
         id: lesson.id,
         title: lesson.title,
         subtitle: [participantLabel, recurrenceLabel].filter(Boolean).join(" · "),
+        status: lesson.status,
         href: `/professor/aulas/${lesson.id}`,
       },
     };

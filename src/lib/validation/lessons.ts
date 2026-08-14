@@ -264,3 +264,40 @@ export function unexpectedLessonFields(
 export const lessonIdSchema = z.strictObject({
   lessonId: z.preprocess(normalizeRequiredUuid, z.uuid("A aula selecionada é inválida.")),
 });
+
+const formBoolean = z.preprocess(
+  (value) => normalizeSingleLine(value),
+  z
+    .enum(["true", "false"], { error: "O estado de presença é inválido." })
+    .transform((value) => value === "true"),
+);
+
+export const lessonAttendanceSchema = z.strictObject({
+  lessonId: z.preprocess(normalizeRequiredUuid, z.uuid("A aula selecionada é inválida.")),
+  participantId: z.preprocess(
+    normalizeRequiredUuid,
+    z.uuid("O participante selecionado é inválido."),
+  ),
+  present: formBoolean,
+});
+
+export type LessonAttendanceInput = z.infer<typeof lessonAttendanceSchema>;
+
+export const lessonCompleteSchema = lessonIdSchema;
+
+export const LESSON_ATTENDANCE_FIELDS = ["lessonId", "participantId", "present"] as const;
+export const LESSON_COMPLETE_FIELDS = ["lessonId"] as const;
+
+export function readLessonAttendanceFormData(formData: FormData) {
+  return {
+    lessonId: formString(formData, "lessonId"),
+    participantId: formString(formData, "participantId"),
+    present: formString(formData, "present"),
+  };
+}
+
+export function readLessonCompleteFormData(formData: FormData) {
+  return {
+    lessonId: formString(formData, "lessonId"),
+  };
+}

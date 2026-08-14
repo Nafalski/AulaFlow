@@ -6,7 +6,7 @@
 
 **Documento vivo.** Atualizado no fim de cada fase com o que foi realmente construído.
 
-- **Estado atual:** Fases 1, 1.5, 2, 3 e 4 concluídas. A Fase 5 tem as **Etapas 5A a 5D.3** concluídas — disponibilidade, projeção segura, calendário visual refinado, clubes/workspaces/membros, calendário partilhado com consentimento, locais com moradas manuais, campos/salas/áreas, **criação e edição de aulas**, conflitos atómicos de professor/recurso, reserva atómica de créditos e recorrência semanal segura.
+- **Estado atual:** Fases 1, 1.5, 2, 3, 4 e 5 concluídas. A **Fase 6A** acrescenta presença e conclusão segura da aula — professor confirma presenças, conclui uma ocorrência terminada e os créditos reservados passam a utilizados numa única transação.
 - **Timezone do sistema:** `Europe/Lisbon`
 - **Idioma da interface:** Português (pt-PT)
 
@@ -234,7 +234,7 @@ As colunas são o **estado atual**; a **história** vive em `package_credit_tran
 
 ### 4.4 Aula de grupo
 
-Cada aluno tem a sua linha em `lesson_participants`, o que permite **pacotes, quantidades e desfechos de cobrança diferentes na mesma aula**. `db:verify` confirma pacotes e quantidades diferentes; os desfechos por aluno estão cobertos nas regras de domínio e só terão teste ponta a ponta quando existirem as Server Actions da Fase 6.
+Cada aluno tem a sua linha em `lesson_participants`, o que permite **pacotes, quantidades e desfechos de cobrança diferentes na mesma aula**. `db:verify` confirma pacotes e quantidades diferentes. A 6A cobre o desfecho normal: todos presentes e reserva válida resultam em consumo atómico. Falta/no-show e libertação de créditos continuam para a 6B.
 
 ---
 
@@ -278,7 +278,7 @@ Exemplo do requisito 10, com um pacote de 10:
 
 O cancelamento pelo professor **não é configurável de propósito**: cobrar um aluno por uma aula que o professor desmarcou não seria uma política, seria um erro.
 
-Implementado em `resolveCreditOutcome()` (`lib/domain/packages.ts`), com 19 testes dedicados. A orquestração que muda o estado da aula e chama consumo/libertação ainda pertence à Fase 6.
+Implementado em `resolveCreditOutcome()` (`lib/domain/packages.ts`), com 19 testes dedicados. A orquestração do desfecho normal foi implementada na 6A: `complete_lesson()` muda a aula para `completed` e chama `consume_participation_credits()` dentro da mesma transação. Cancelamento, falta/no-show e libertação continuam fora desta etapa.
 
 ### 5.3 Reagendamento sem cobrar duas vezes
 
@@ -446,11 +446,11 @@ A estrutura fica pronta para notificações push (Fase 8).
 | **2** | Perfis, definições e gestão administrativa básica de contas | **Concluído** |
 | **3** | Alunos, turmas, locais, política de cancelamento | **Concluído** |
 | **4** | Pacotes: modelos, atribuição, ajustes, painel de saldo | **Concluído** — Etapas 1A, 1B, 1C, 1D e 1E validadas |
-| **5** | Calendário e criação de aulas, com reserva de créditos | **Parcialmente concluído** — Etapas 5A a 5D.3: disponibilidade, calendário, clubes, locais, recursos, criação/edição de aulas, conflitos atómicos, reserva atómica de créditos e recorrência semanal segura. Falta revisão integrada e ciclo operacional posterior |
-| **6** | Cancelamento, reagendamento, presenças, histórico | **Planeado** |
+| **5** | Calendário e criação de aulas, com reserva de créditos | **Concluído** — disponibilidade, calendário, clubes, locais, recursos, criação/edição de aulas, conflitos atómicos, reserva atómica de créditos, recorrência semanal segura e revisão integrada |
+| **6** | Cancelamento, reagendamento, presenças, histórico | **Parcialmente concluído** — 6A: presença confirmada e conclusão normal com `reserved -> used`. Falta cancelamento, ausência/no-show, libertação de créditos e reagendamento operacional |
 | **7** | Área do aluno: aulas, saldo, confirmação de presença | **Planeado** |
 | **8** | Notificações, lembretes e expiração agendada | **Planeado** |
-| **9** | Supabase real, concorrência, acessibilidade, deployment | **Parcialmente concluído** — Supabase/Auth reais validados para a Fase 4 e Etapas 5A-5D.3; concorrência real de aulas/créditos/recorrência coberta, acessibilidade completa e deployment pendentes |
+| **9** | Supabase real, concorrência, acessibilidade, deployment | **Parcialmente concluído** — Supabase/Auth reais validados para a Fase 4, Fase 5 e Fase 6A; concorrência real de aulas/créditos/recorrência/conclusão coberta, acessibilidade completa e deployment pendentes |
 
 A ordem segue as prioridades pedidas: primeiro a área do professor ao computador, depois as regras seguras de créditos, depois o aluno no telemóvel.
 
@@ -962,9 +962,47 @@ Em turmas, os membros ativos são materializados ocorrência a ocorrência no mo
 
 O professor vê os indicadores da série e a posição "N de M" nas suas projeções. O aluno recebe apenas indicadores seguros de recorrência; não recebe `recurrence_group_id`, regra completa, colegas, turma, custo, pacote, saldos internos nem notas privadas.
 
-#### Não implementado
+### Concluído na Fase 6A — presença e conclusão segura
 
-Presença, conclusão, falta, cancelamento e reagendamento operacionais, edição/cancelamento de série inteira, consumo/libertação de créditos pela interface, confirmação pelo aluno, lista de espera, notificações, pagamentos, calendários externos.
+Estado: **concluída**.
+
+A 6A pega no fluxo normal de uma aula que aconteceu:
+
+```text
+aula marcada -> presença confirmada -> aula concluída -> reserved -> used
+```
+
+#### Auditoria da presença existente
+
+`attendance` já existia desde a Fase 1, com uma linha única por `(lesson_id, student_id)`, timestamps, actor (`marked_by`) e estado (`present`, `absent`, `late`, `excused`). A 6A não criou uma estrutura paralela. A migração acrescenta uma FK composta para `lesson_participants(lesson_id, student_id)`, revoga escrita direta do cliente e deixa a leitura limitada ao professor responsável ou ao próprio aluno participante. Nesta fase a aplicação usa apenas `present`; ausência, atraso e falta justificada continuam sem semântica financeira.
+
+#### Presença
+
+`set_lesson_attendance(p_lesson_id, p_lesson_participant_id, p_present)` é o único caminho público. A função exige professor ativo responsável pela aula, estado `scheduled`/`confirmed`, participante materializado e `now() >= starts_at`. Marcar presença não consome crédito. Antes de a aula ficar concluída, o professor pode retirar a presença para corrigir erro; no-op não gera histórico duplicado.
+
+#### Conclusão
+
+`complete_lesson(p_lesson_id)` bloqueia a aula e os participantes, exige `now() >= ends_at`, pelo menos um participante ativo, todos com presença `present` e cada cobrança em estado válido. Participações reservadas precisam de pacote real, `credits_reserved > 0` e `credits_consumed = 0`; participações `exempt` ficam sem movimento financeiro.
+
+A transição implementada é apenas:
+
+```text
+scheduled/confirmed -> completed
+```
+
+Depois de `completed`, `update_lesson()` continua a recusar edição porque só aceita `scheduled`/`confirmed`. Cada ocorrência recorrente é concluída isoladamente; não existe conclusão de série inteira.
+
+#### Crédito e ledger
+
+Na conclusão, `complete_lesson()` reutiliza `consume_participation_credits()` dentro da mesma transação. O saldo muda de `reserved` para `used`, sem descontar `available` outra vez, e o livro-razão recebe `credit_consumed`. Se uma participação falhar, a transação desfaz a aula, as participações, os saldos e qualquer ledger produzido no caminho. Chamada repetida numa aula já concluída é no-op e não duplica consumo.
+
+#### UI e projeções
+
+`/professor/aulas/[id]` mostra a lista de participantes, presença, estado de crédito e botão de conclusão com confirmação explícita. Calendários de professor e aluno distinguem aulas concluídas sem remover o histórico. A projeção do aluno inclui apenas a própria presença e o próprio crédito; não expõe colegas, actor da presença, `student_package_id`, saldos internos, custo, turma, notas privadas nem identificadores de professor/organização.
+
+#### Não implementado na 6A
+
+Ausência/no-show com decisão financeira, cancelamento operacional, libertação de créditos, reagendamento operacional, edição/cancelamento de série inteira, confirmação pelo aluno, lista de espera, notificações, pagamentos e calendários externos.
 
 ### Fase 2 — estado por item
 
@@ -980,7 +1018,7 @@ Presença, conclusão, falta, cancelamento e reagendamento operacionais, ediçã
 | Preferências de notificação | **Concluído** | Persistência de canais/eventos; entrega automática continua planeada para a Fase 8 |
 | Diretório administrativo | **Concluído** | Pesquisa, filtros, professores, detalhe, estados vazios/erro/loading e resposta mobile/desktop |
 | Bloqueio e reativação | **Concluído** | RPC exclusiva de admin, sem auto-bloqueio, motivo, auditoria e revogação efetiva por RLS |
-| Validação num Supabase remoto | **Concluído para a Fase 4 e Etapas 5A-5D.3** | Migrações, catálogo remoto, GoTrue/Auth, JWT/PostgREST, contas reais, calendário seguro, aulas, conflitos, reserva de créditos e recorrência semanal validados por RPC/Auth real |
+| Validação num Supabase remoto | **Concluído para a Fase 4, Fase 5 e Fase 6A** | Migrações, catálogo remoto, GoTrue/Auth, JWT/PostgREST, contas reais, calendário seguro, aulas, conflitos, reserva, recorrência, presença, conclusão, privacidade e concorrência validados por RPC/Auth real |
 
 ### Concluído na Fase 2
 
@@ -1011,8 +1049,8 @@ Presença, conclusão, falta, cancelamento e reagendamento operacionais, ediçã
 - **A interface de pacotes ainda é parcial.** `/professor/pacotes` gere modelos, atribuição, consulta, ajustes administrativos e histórico; `/aluno/pacotes` mostra os próprios pacotes. Transferências/fusões/divisões e o ciclo posterior de consumo/libertação continuam pendentes.
 - **A expiração de pacotes não é automática.** `refresh_package_status()` marca `expired` quando é chamada, mas nada corre à meia-noite. Precisa de uma tarefa agendada — Fase 8, com os lembretes.
 - **`credit_expired` e `credit_transferred_*` existem no enum mas não têm função.** Ficam para quando a expiração automática e a transferência entre pacotes forem implementadas numa fase futura.
-- **A validação remota já cobre concorrência real de aulas/créditos/recorrência.** `db:verify:auth` abre sessões reais paralelas para disputar o último crédito, combinar conflito de agenda com reserva e testar séries incompatíveis; deployment e auditoria completa de acessibilidade continuam fora desta etapa.
-- **Server Actions do ciclo operacional ainda são parciais.** Criar aula já reserva créditos; cancelar, concluir, libertar, consumir e reagendar operacionalmente continuam nas Fases 5–6.
+- **A validação remota já cobre concorrência real de aulas/créditos/recorrência/conclusão.** `db:verify:auth` abre sessões reais paralelas para disputar o último crédito, combinar conflito de agenda com reserva, testar séries incompatíveis, dupla conclusão e conclusão contra edição; deployment e auditoria completa de acessibilidade continuam fora desta etapa.
+- **Server Actions do ciclo operacional ainda são parciais.** Criar aula já reserva créditos e a 6A já marca presença/conclui aula normal; cancelar, falta/no-show, libertar créditos e reagendar operacionalmente continuam nas Fases 6B/6C.
 
 ---
 

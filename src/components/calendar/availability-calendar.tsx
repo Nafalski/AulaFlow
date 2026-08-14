@@ -6,6 +6,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Clock,
+  Flag,
   GraduationCap,
   Plus,
   Settings2,
@@ -29,6 +30,7 @@ import {
   type CalendarWindow,
 } from "@/lib/domain/calendar";
 import { categoryLabel, timeRangeLabel, type TimeSlot } from "@/lib/domain/availability";
+import { LESSON_STATUS_META } from "@/lib/domain/lesson-status";
 import {
   formatDayMonth,
   formatFullDate,
@@ -41,6 +43,7 @@ import { cn } from "@/lib/utils";
 import type {
   AvailabilityCalendarSource,
   AvailabilityPublicStatus,
+  LessonStatus,
   ScheduleBlockCategory,
 } from "@/types/database";
 
@@ -55,6 +58,7 @@ export type LessonCalendarBadge = {
   id: string;
   title: string;
   subtitle: string | null;
+  status: LessonStatus;
   href: string | null;
 };
 
@@ -219,7 +223,10 @@ function itemTitle(item: AvailabilityCalendarItem, audience: CalendarAudience): 
 }
 
 function itemMeta(item: AvailabilityCalendarItem, audience: CalendarAudience): string | null {
-  if (item.lesson) return item.lesson.subtitle;
+  if (item.lesson) {
+    const status = LESSON_STATUS_META[item.lesson.status].label;
+    return item.lesson.subtitle ? `${status} · ${item.lesson.subtitle}` : status;
+  }
   if (audience !== "teacher") return null;
   if (item.source === "schedule_block" && item.category) return categoryLabel(item.category);
   if (item.source) return SOURCE_LABELS[item.source];
@@ -234,7 +241,8 @@ function itemDescription(item: AvailabilityCalendarItem, audience: CalendarAudie
 
   if (item.lesson) {
     const detail = item.lesson.subtitle ? `, ${item.lesson.subtitle}` : "";
-    return `Aula: ${item.lesson.title}${detail}, ${day}, ${timeLabel}.`;
+    const status = LESSON_STATUS_META[item.lesson.status].label.toLowerCase();
+    return `Aula ${status}: ${item.lesson.title}${detail}, ${day}, ${timeLabel}.`;
   }
 
   if (audience !== "teacher") {
@@ -253,6 +261,10 @@ function itemClasses(item: AvailabilityCalendarItem, audience: CalendarAudience)
   // Preenchimento sólido: uma aula é um compromisso, e tem de se distinguir à
   // primeira vista dos tons suaves que descrevem apenas disponibilidade.
   if (kind === "lesson") {
+    if (item.lesson?.status === "completed") {
+      return "border-state-success/35 bg-state-success-soft text-state-success";
+    }
+
     return "border-brand-deep/50 bg-brand text-white";
   }
 
@@ -278,6 +290,10 @@ function ItemIcon({ item, audience }: { item: AvailabilityCalendarItem; audience
       : "availability";
 
   if (kind === "lesson") {
+    if (item.lesson?.status === "completed") {
+      return <Flag className="size-4 shrink-0" aria-hidden="true" />;
+    }
+
     return <GraduationCap className="size-4 shrink-0" aria-hidden="true" />;
   }
 

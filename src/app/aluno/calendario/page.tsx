@@ -132,6 +132,7 @@ export default async function StudentCalendarPage({
       lesson: {
         id: lesson.id,
         title: lesson.title,
+        status: lesson.status,
         // Modalidade, local e o próprio estado de crédito — nunca colegas nem IDs internos.
         subtitle:
           [lesson.sport_name, lesson.location_name, billingLabel, lesson.package_name, recurrenceLabel]
@@ -160,8 +161,8 @@ export default async function StudentCalendarPage({
       />
 
       <Alert tone="info">
-        As aulas marcadas pelo seu professor aparecem aqui. Pedir marcação e confirmar presença
-        chegam numa etapa seguinte.
+        As aulas marcadas pelo seu professor aparecem aqui. A presença e a conclusão ficam visíveis
+        quando o professor as registar.
       </Alert>
     </div>
   );
