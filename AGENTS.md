@@ -163,7 +163,9 @@ update public.profiles set role = 'admin' where email = 'voce@exemplo.pt';
 │   ├── ..._phase5d2_lesson_credit_reservation.sql Etapa 5D.2: reserva atómica de créditos da aula
 │   ├── ..._phase5d3_weekly_lesson_recurrence.sql Etapa 5D.3: recorrência semanal segura
 │   ├── ..._phase6a_lesson_completion.sql Fase 6A: presença e conclusão segura
-│   └── ..._phase6b_lesson_cancellations.sql Fase 6B: cancelamentos, faltas e créditos
+│   ├── ..._phase6b_lesson_cancellations.sql Fase 6B: cancelamentos, faltas e créditos
+│   ├── ..._phase6c1_lesson_rescheduling.sql Fase 6C.1: reagendamento transacional
+│   └── ..._phase6c1a_reschedule_idempotency.sql Fase 6C.1A: intenção de reagendamento obrigatória
 │
 └── src/
     ├── proxy.ts             Renova a sessão e protege rotas (era middleware.ts)
@@ -445,13 +447,13 @@ Depois da conclusão, cada participação presente ou em falta/no-show passa `re
 
 **Não implementado:** política configurável de janela/percentagem/tolerância, cancelamento self-service do aluno, reagendamento operacional, reativação de participação cancelada, edição/cancelamento de série inteira, confirmação pelo aluno, lista de espera, notificações e pagamentos.
 
-### Reagendamento de aulas (Etapa 6C.1)
+### Reagendamento de aulas (Etapas 6C.1 e 6C.1A)
 
 Reagendar **não** é editar. `update_lesson()` altera campos da mesma aula; `reschedule_lesson()` cria um facto novo e preserva o antigo:
 
 ```text
 original   → rescheduled, com motivo, a apontar para a substituta
-substituta → scheduled, a apontar de volta
+substituta → herda o estado da original, a apontar de volta
 ```
 
 A original nunca é apagada. O mecanismo já vinha desenhado da Fase 1 — estado, colunas, constraints e `transfer_participation_reservation()` — e a 6C.1 apenas os ligou numa transação. **Não criar uma segunda arquitetura de reagendamento.**
@@ -465,6 +467,18 @@ A original nunca é apagada. O mecanismo já vinha desenhado da Fase 1 — estad
 **Snapshot e recorrência.** Quem estava previsto continua previsto — a composição atual da turma não é reconsultada. De uma série, só esta ocorrência muda.
 
 **Autorização.** Só o professor responsável: nem owner/manager de clube, nem admin, nem aluno. A RPC não aceita professor, organização, participante nem pacote — deriva tudo da aula original.
+
+**A chave de idempotência é obrigatória e tem namespace próprio (6C.1A).** A 6C.1 aceitava `p_idempotency_key => null` e, quando havia chave, procurava-a em `lessons.creation_idempotency_key` — o namespace da **criação**. Encontrar uma linha por `(created_by, chave)` não prova nada sobre a intenção: podia ser uma aula criada por `create_lesson()` com a mesma chave, ou a substituta de outra aula. Devolver sucesso nesse caso é responder ao pedido errado.
+
+Hoje a coluna é `lessons.reschedule_idempotency_key`, com índice único por autor, e a chave identifica a intenção inteira:
+
+```text
+autor + reagendamento + aula original + destino pedido
+```
+
+Ao reencontrar a chave, a função confirma que a substituta é mesmo **desta** original e para **este** destino; se não for, recusa por conflito de intenção. Sem chave, recusa: reagendar apanha duplo clique e retry de rede, e a diferença entre um retry e uma segunda intenção é uma aula a mais na agenda. Os índices únicos em `rescheduled_to_id` e `rescheduled_from_id` impedem a cadeia de bifurcar, e `lessons_reschedule_key_needs_origin` impede uma aula sem origem de carregar chave de reagendamento.
+
+**A substituta herda o estado da original.** Uma aula `confirmed` produz uma substituta `confirmed`. Não existe no produto nenhum fluxo de reconfirmação pelo aluno — a Fase 7 é que o traz —, por isso baixar para `scheduled` inventaria um passo que ninguém pode dar.
 
 **Ainda não existe interface** (6C.2), nem reagendamento de série inteira, "esta e futuras" ou self-reschedule do aluno.
 
@@ -498,7 +512,7 @@ npm run typecheck
 
 ### `npm run db:verify`
 
-Executa **todas** as migrações, a partir de uma base vazia, contra PostgreSQL compilado para WebAssembly (PGlite), e volta a aplicá-las para confirmar idempotência. Depois exerce garantias de RLS com papéis `authenticated`/`anon`, isolamento entre organizações e professores, privilégios das RPCs, perfis/claim/bloqueio, convites sem segredo, alunos, turmas, locais, modelos, atribuição, consulta e ajustes administrativos de pacotes, disponibilidade do professor, calendário seguro, clubes, memberships, convites de workspace, papéis internos, contexto ativo, suspensão, consentimento de partilha por clube, projeção do calendário partilhado, grants estritos das views, políticas, reserva, consumo, libertação, reagendamento, exceções, correções, imutabilidade do livro-razão, locais, campos/salas/áreas, criação/edição de aulas, conflitos, reserva de créditos de aula, recorrência semanal, presença, conclusão, ledger, materialização de turmas e privacidade das projeções de aula.
+Executa **todas** as migrações, a partir de uma base vazia, contra PostgreSQL compilado para WebAssembly (PGlite), e volta a aplicá-las para confirmar idempotência. Depois exerce garantias de RLS com papéis `authenticated`/`anon`, isolamento entre organizações e professores, privilégios das RPCs, perfis/claim/bloqueio, convites sem segredo, alunos, turmas, locais, modelos, atribuição, consulta e ajustes administrativos de pacotes, disponibilidade do professor, calendário seguro, clubes, memberships, convites de workspace, papéis internos, contexto ativo, suspensão, consentimento de partilha por clube, projeção do calendário partilhado, grants estritos das views, políticas, reserva, consumo, libertação, reagendamento, exceções, correções, imutabilidade do livro-razão, locais, campos/salas/áreas, criação/edição de aulas, conflitos, reserva de créditos de aula, recorrência semanal, presença, conclusão, ledger, materialização de turmas, privacidade das projeções de aula e semântica da chave de idempotência do reagendamento.
 
 Corre em segundos, sem Docker e sem projeto na nuvem — serve para o CI.
 
@@ -816,7 +830,7 @@ Interface em `/professor/clubes/[id]/calendario`, com filtro por professor no UR
 
 **Não implementado:** aulas, participantes, locais, campos, recursos, conflitos, reservas e créditos. Os únicos estados são disponível e indisponível — não escrever "ocupado", "reservado", "lotado", "vagas" ou "conflito", porque nada disso existe ainda para ser verdade.
 
-Ordem atual: 6A, 6B e 6C.1 fechadas → próxima etapa é a 6C.2, a interface de reagendamento.
+Ordem atual: 6A, 6B, 6C.1 e 6C.1A fechadas → próxima etapa é a 6C.2, a interface de reagendamento.
 
 ### `src/types/database.ts`
 
@@ -852,7 +866,7 @@ Não existe um comando de formatação separado. Use `npm run lint:fix` apenas p
 | 3 | Alunos, turmas, locais, política de cancelamento | **Concluído** |
 | 4 | Interfaces de modelos, atribuição, ajustes e saldos | **Concluído** — Etapas 1A, 1B, 1C, 1D e 1E validadas com Auth/PostgREST reais e browser desktop/mobile |
 | 5 | Calendário e criação de aulas com reserva | **Concluído** — disponibilidade, projeção segura, refinamento visual, clubes/membros, calendário partilhado, locais com moradas manuais, campos/salas/áreas, criação/edição de aulas, conflitos atómicos, reserva atómica de créditos, recorrência semanal segura e revisão integrada |
-| 6 | Cancelamento, reagendamento, presenças e histórico | **Parcialmente concluído** — 6A/6B: presença, falta/no-show, conclusão normal/mista, cancelamento de aula e cancelamento de participação com `reserved -> available` ou `reserved -> used` seguros. Falta reagendamento operacional da 6C |
+| 6 | Cancelamento, reagendamento, presenças e histórico | **Parcialmente concluído** — 6A/6B: presença, falta/no-show, conclusão normal/mista, cancelamento de aula e cancelamento de participação com `reserved -> available` ou `reserved -> used` seguros. 6C.1/6C.1A: contrato transacional de reagendamento, com chave de idempotência obrigatória em namespace próprio, validado com JWTs reais e concorrência. Falta a interface da 6C.2 |
 | 7 | Área do aluno: aulas, créditos e confirmação | **Planeado** |
 | 8 | Notificações, lembretes e expiração agendada | **Planeado** |
 | 9 | Supabase real, concorrência, acessibilidade e deployment | **Parcialmente concluído** — RLS em PGlite e validação real das Fases 4, 5, 6A e 6B feitas; concorrência real de aulas/créditos/recorrência/conclusão coberta; deployment pendente |

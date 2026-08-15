@@ -447,7 +447,7 @@ A estrutura fica pronta para notificações push (Fase 8).
 | **3** | Alunos, turmas, locais, política de cancelamento | **Concluído** |
 | **4** | Pacotes: modelos, atribuição, ajustes, painel de saldo | **Concluído** — Etapas 1A, 1B, 1C, 1D e 1E validadas |
 | **5** | Calendário e criação de aulas, com reserva de créditos | **Concluído** — disponibilidade, calendário, clubes, locais, recursos, criação/edição de aulas, conflitos atómicos, reserva atómica de créditos, recorrência semanal segura e revisão integrada |
-| **6** | Cancelamento, reagendamento, presenças, histórico | **6A, 6B e 6C.1 concluídas** (falta a interface da 6C.2) — presença, falta/no-show, conclusão normal/mista, cancelamento de aula e cancelamento de participação com `reserved -> available` ou `reserved -> used` seguros. Falta reagendamento operacional |
+| **6** | Cancelamento, reagendamento, presenças, histórico | **6A, 6B, 6C.1 e 6C.1A concluídas** (falta a interface da 6C.2) — presença, falta/no-show, conclusão normal/mista, cancelamento de aula e cancelamento de participação com `reserved -> available` ou `reserved -> used` seguros, e contrato transacional de reagendamento com chave de idempotência obrigatória em namespace próprio |
 | **7** | Área do aluno: aulas, saldo, confirmação de presença | **Planeado** |
 | **8** | Notificações, lembretes e expiração agendada | **Planeado** |
 | **9** | Supabase real, concorrência, acessibilidade, deployment | **Parcialmente concluído** — Supabase/Auth reais validados até à 6B (405 verificações, repetíveis); browser automatizado com sessão GoTrue real; paridade dev/produção confirmada na 6B.2; deployment pendente |
@@ -1055,9 +1055,9 @@ As Actions passaram a devolver `confirmed`, um resultado mínimo e serializável
 
 Nenhuma rota `/api/...` foi criada, o proxy não foi tocado, e não há `revalidatePath()`: todas as páginas envolvidas são `force-dynamic`, pelo que uma navegação nova lê sempre a base de dados.
 
-### Concluído na Fase 6C.1 — contrato transacional de reagendamento
+### Concluído nas Fases 6C.1 e 6C.1A — contrato transacional de reagendamento
 
-Estado: **backend concluído. A interface operacional é a 6C.2 e ainda não existe.**
+Estado: **backend concluído e aceite. A interface operacional é a 6C.2 e ainda não existe.**
 
 A Fase 1 tinha desenhado o mecanismo inteiro de reagendamento e nunca o ligou: o estado `rescheduled`, as colunas `rescheduled_from_id`/`rescheduled_to_id`, as constraints que exigem alvo e motivo, e `transfer_participation_reservation()`. A 6C.1 é a peça que faltava para os juntar numa transação — não uma arquitetura nova.
 
@@ -1093,6 +1093,44 @@ O snapshot viaja: quem estava previsto para a original continua previsto para a 
 #### Autorização
 
 Só o professor responsável. Nem owner ou manager de clube, nem administrador da plataforma, nem o aluno. `reschedule_lesson()` não tem parâmetro de professor, organização, participante ou pacote: tudo é derivado da aula original.
+
+#### Endurecimento da 6C.1A — a intenção passa a ser identificável
+
+A primeira versão do contrato tinha dois defeitos que só apareceram ao tentar aceitá-lo:
+
+1. **A chave de idempotência era opcional.** `p_idempotency_key => null` era aceite. Reagendar é precisamente a operação que apanha duplo clique, retry de rede e repetição de Server Action — e sem uma intenção identificável duas chamadas iguais criavam duas substitutas.
+2. **A chave era procurada no namespace errado.** A pesquisa era feita em `lessons.creation_idempotency_key`, o namespace da **criação**. Encontrar uma linha por `(created_by, chave)` não prova nada sobre a intenção: a linha podia ser uma aula criada por `create_lesson()` com a mesma chave, ou a substituta de outra aula qualquer. Devolver essa linha como sucesso é responder ao pedido errado — e, pior, dizer ao chamador que o reagendamento que ele pediu aconteceu.
+
+A migração `20260806000200_phase6c1a_reschedule_idempotency.sql` resolve os dois. A chave passa a viver em `lessons.reschedule_idempotency_key`, com índice único por autor, e identifica a intenção inteira:
+
+```text
+autor + operação de reagendamento + aula original + destino pedido
+```
+
+Ao reencontrar a chave, a função confirma que a substituta encontrada é mesmo **desta** original e para **este** destino (horário, local e recurso). Se não for, recusa por conflito de intenção em vez de devolver um resultado que não corresponde ao pedido. Sem chave, recusa.
+
+A integridade da cadeia também deixou de depender de boa vontade: índices únicos em `rescheduled_to_id` e `rescheduled_from_id` impedem que uma original ganhe duas substitutas ou que uma substituta ganhe duas antecessoras, e `lessons_reschedule_key_needs_origin` impede uma aula sem origem de carregar uma chave de reagendamento.
+
+**A substituta herda o estado da original.** Uma aula `confirmed` produz uma substituta `confirmed`. Baixar para `scheduled` obrigaria a uma reconfirmação que o produto não tem — a confirmação pelo aluno é da Fase 7 — e deixaria a aula à espera de um passo que ninguém consegue dar.
+
+#### O que foi realmente provado
+
+| Camada | Cobertura do reagendamento |
+|---|---|
+| `npm run db:verify` | 836 verificações, incluindo as seis semânticas da chave (mesma intenção, outra original, outro destino, chave de criação, chave nula, namespace separado), preservação de estado `scheduled`/`confirmed`, ausência de GRANT e de policy de escrita em `lessons`, e recusa de uma antecessora forjada |
+| `db:verify:remote` | coluna, índices únicos, constraint de origem, assinatura única e `search_path` fixo de `reschedule_lesson()` |
+| `db:verify:auth` | 435 verificações com JWTs reais, **duas execuções completas consecutivas verdes**, incluindo concorrência real: dois reagendamentos da mesma aula, duas chamadas com a mesma chave, reagendar × cancelar e reagendar × editar, com os saldos verificados depois de cada corrida |
+
+A concorrência só é demonstrável no PostgreSQL remoto: o PGlite tem uma única ligação e nunca poderia provar que os locks e a transação aguentam.
+
+#### Fixtures E2E: durabilidade e repetibilidade
+
+Fechar estes gates obrigou a corrigir a própria suite de Auth, que já não era repetível:
+
+- **A idempotência das RPCs escondia fixtures partidas.** `upsert_teacher_availability_exception()` é idempotente pela chave; com uma chave fixa por execução, a primeira execução de sempre fixava a janela e nenhuma execução seguinte a conseguia alargar ou reativar. Passou a haver `p_exception_id` e a janela entra na chave.
+- **As fixtures dedicadas do calendário eram destruídas pela limpeza.** A limpeza de exceções sobrepostas desativava-as, e a reposição seguinte era um no-op pela mesma idempotência. Passaram a ser reconhecidas e preservadas.
+- **A banda de datas enchia-se e nunca se libertava.** Cada execução consumia datas livres e não devolvia nenhuma, até "Sem série E2E livre". As exceções de execuções anteriores passam a ser reformadas no início — o que não afeta nenhuma aula, porque a disponibilidade só é validada ao criar ou editar.
+- **A escolha de datas livres ignorava bloqueios e aulas.** Escolher uma data só por não ter exceção deixava passar bloqueios e aulas ativas de execuções anteriores; o servidor recusava corretamente uma fixture errada, e a falha lia-se como defeito do produto.
 
 **Ainda não implementado depois da 6C.1:** interface de reagendamento (6C.2), reagendar série inteira, "esta e futuras", self-reschedule do aluno, política configurável de cancelamento, self-cancel do aluno, janela de 12h/24h, cobrança parcial, multa/tolerância, reativação de participação cancelada, notificações, pagamentos e calendários externos.
 

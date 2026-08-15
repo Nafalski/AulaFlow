@@ -11037,6 +11037,201 @@ check(
   "repetir com a mesma chave devolve a mesma substituta e não transfere duas vezes",
 );
 
+// ── Semântica da chave de idempotência (Etapa 6C.1A) ───────────────────────
+
+await mustReject("reagendar sem chave de idempotência", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(
+      `select public.reschedule_lesson($1,$2::timestamptz,$3::timestamptz,'Sem chave')`,
+      [replacement.id, RESCHED_MON_B_10H, RESCHED_MON_B_11H],
+    ),
+  ),
+);
+
+const lessonsAfterNullKey = Number(
+  (await one(`select count(*)::int as total from public.lessons`)).total,
+);
+check(
+  lessonsAfterNullKey === lessonsBeforeRepeat,
+  "uma chamada sem chave não cria aula nenhuma",
+);
+
+// A mesma chave com OUTRA aula original é uma intenção diferente.
+const otherOriginal = await reschedulableLesson({
+  title: "Outra original 6C.1A",
+  start: "2026-11-16 15:00+00",
+  end: "2026-11-16 16:00+00",
+  students: [[ana.id, reschedAnaPack.id]],
+});
+await mustReject("mesma chave com outra aula original", () =>
+  rescheduleAs(TEACHER_UID, {
+    lessonId: otherOriginal.id,
+    start: RESCHED_MON_B_10H,
+    end: RESCHED_MON_B_11H,
+    idempotencyKey: reschedKey,
+  }),
+);
+
+// A mesma chave com a mesma original mas outro destino também é.
+await mustReject("mesma chave com outro destino", () =>
+  rescheduleAs(TEACHER_UID, {
+    lessonId: reschedLesson.id,
+    start: "2026-11-16 09:00+00",
+    end: "2026-11-16 10:00+00",
+    idempotencyKey: reschedKey,
+  }),
+);
+
+// Uma chave já usada por `create_lesson()` vive noutro namespace e não pode
+// fazer o reagendamento devolver a aula criada.
+const sharedKey = randomUUID();
+const createdWithSharedKey = await createLessonAs(TEACHER_UID, {
+  studentId: ana.id,
+  title: "Criada com chave partilhada 6C.1A",
+  start: "2026-11-23 15:00+00",
+  end: "2026-11-23 16:00+00",
+  idempotencyKey: sharedKey,
+});
+const reschedWithSharedKey = await rescheduleAs(TEACHER_UID, {
+  lessonId: otherOriginal.id,
+  start: "2026-11-23 09:00+00",
+  end: "2026-11-23 10:00+00",
+  idempotencyKey: sharedKey,
+});
+check(
+  reschedWithSharedKey.id !== createdWithSharedKey.id,
+  "uma chave de criação não é lida como intenção de reagendamento",
+);
+
+const namespaceRow = await one(
+  `select creation_idempotency_key, reschedule_idempotency_key, rescheduled_from_id
+     from public.lessons where id=$1`,
+  [reschedWithSharedKey.id],
+);
+check(
+  namespaceRow.creation_idempotency_key === null &&
+    namespaceRow.reschedule_idempotency_key === sharedKey &&
+    namespaceRow.rescheduled_from_id === otherOriginal.id,
+  "a substituta guarda a chave no namespace de reagendamento, ligada à sua origem",
+);
+
+// ── O estado da original é preservado (Etapa 6C.1A) ─────────────────────────
+//
+// Não existe fluxo de reconfirmação pelo aluno antes da Fase 7: baixar uma aula
+// confirmada para `scheduled` inventaria um passo que ninguém pode dar.
+
+const scheduledOrigin = await reschedulableLesson({
+  title: "Original agendada 6C.1A",
+  start: "2026-11-30 15:00+00",
+  end: "2026-11-30 16:00+00",
+  students: [[ana.id, reschedAnaPack.id]],
+});
+const scheduledReplacement = await rescheduleAs(TEACHER_UID, {
+  lessonId: scheduledOrigin.id,
+  start: "2026-11-30 09:00+00",
+  end: "2026-11-30 10:00+00",
+});
+check(
+  (await one(`select status from public.lessons where id=$1`, [scheduledReplacement.id]))
+    .status === "scheduled",
+  "uma original agendada produz uma substituta agendada",
+);
+
+const confirmedOrigin = await reschedulableLesson({
+  title: "Original confirmada 6C.1A",
+  start: "2026-12-07 15:00+00",
+  end: "2026-12-07 16:00+00",
+  students: [[ana.id, reschedAnaPack.id]],
+});
+await db.query(`update public.lessons set status='confirmed' where id=$1`, [
+  confirmedOrigin.id,
+]);
+const confirmedReplacement = await rescheduleAs(TEACHER_UID, {
+  lessonId: confirmedOrigin.id,
+  start: "2026-12-07 09:00+00",
+  end: "2026-12-07 10:00+00",
+});
+check(
+  (await one(`select status from public.lessons where id=$1`, [confirmedReplacement.id]))
+    .status === "confirmed",
+  "uma original confirmada produz uma substituta confirmada, sem reconfirmação inventada",
+);
+
+// ── A escrita direta continua fechada (Etapa 6C.1A) ─────────────────────────
+//
+// Toda a garantia de conflito vive num trigger que ignora a antecessora. Se o
+// cliente conseguisse escrever em `lessons`, bastaria forjar `rescheduled_from_id`
+// para uma aula sua a essa hora para atravessar a deteção de conflitos.
+
+const reschedLessonWriteGrants = await rows(
+  `select privilege_type, grantee from information_schema.role_table_grants
+    where table_schema='public' and table_name='lessons'
+      and grantee in ('authenticated','anon','PUBLIC')
+      and privilege_type in ('INSERT','UPDATE','DELETE')`,
+);
+check(
+  reschedLessonWriteGrants.length === 0,
+  "authenticated e anon não têm INSERT, UPDATE nem DELETE em lessons",
+);
+
+const reschedLessonWritePolicies = await rows(
+  `select policyname from pg_policies
+    where schemaname='public' and tablename='lessons' and cmd in ('INSERT','UPDATE','DELETE')`,
+);
+check(
+  reschedLessonWritePolicies.length === 0,
+  "nenhuma policy reabre a escrita de lessons pela porta das traseiras",
+);
+
+const forgedPredecessor = await reschedulableLesson({
+  title: "Antecessora forjada 6C.1A",
+  start: "2026-12-14 15:00+00",
+  end: "2026-12-14 16:00+00",
+  students: [[ana.id, reschedAnaPack.id]],
+});
+await mustReject("forjar rescheduled_from_id por escrita direta", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(
+      `insert into public.lessons
+         (organization_id, teacher_id, sport_id, title, starts_at, ends_at,
+          credit_cost, rescheduled_from_id, created_by)
+       values ($1,$2,$3,'Sobreposta forjada','2026-12-14 15:30+00','2026-12-14 16:30+00',
+               1,$4,$5)`,
+      [org, teacher.id, sport, forgedPredecessor.id, TEACHER_UID],
+    ),
+  ),
+);
+
+// E o trigger, mesmo numa ligação privilegiada, só perdoa a antecessora REAL:
+// uma aula que aponte para outra aula qualquer continua a colidir.
+const unrelatedLesson = await reschedulableLesson({
+  title: "Aula sem relação 6C.1A",
+  start: "2026-12-21 15:00+00",
+  end: "2026-12-21 16:00+00",
+  students: [[ana.id, reschedAnaPack.id]],
+});
+await mustReject("apontar para uma antecessora que não é a que ocupa o horário", () =>
+  db.query(
+    `insert into public.lessons
+       (organization_id, teacher_id, sport_id, title, starts_at, ends_at,
+        credit_cost, rescheduled_from_id, created_by)
+     values ($1,$2,$3,'Colide com outra','2026-12-21 15:30+00','2026-12-21 16:30+00',
+             1,$4,$5)`,
+    [org, teacher.id, sport, scheduledOrigin.id, TEACHER_UID],
+  ),
+);
+check(
+  Number(
+    (
+      await one(
+        `select count(*)::int as total from public.lessons
+          where starts_at = '2026-12-21 15:30+00'::timestamptz`,
+      )
+    ).total,
+  ) === 0 && unrelatedLesson.id !== null,
+  "a aula que tentou atravessar a deteção de conflitos não existe",
+);
+
 // ── Uma aula não colide com aquela que veio substituir ──────────────────────
 
 const overlapKey = randomUUID();

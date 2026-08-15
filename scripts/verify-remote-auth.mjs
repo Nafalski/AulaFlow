@@ -653,13 +653,27 @@ try {
     }),
   );
 
+  const existingExceptionId = async (supabase, dateOnly, mode) => {
+    const found = await supabase
+      .from("teacher_availability_exception_records")
+      .select("id")
+      .eq("exception_date", dateOnly)
+      .eq("mode", mode)
+      .order("created_at", { ascending: true })
+      .limit(1);
+    if (found.error) {
+      throw new Error(`Excecao existente (${mode}): ${summarizeError(found.error)}`);
+    }
+    return found.data?.[0]?.id ?? null;
+  };
+
   const replaceException = await teacherClient.rpc("upsert_teacher_availability_exception", {
     p_exception_date: availabilityReplaceDate,
     p_starts_at: "10:00",
     p_ends_at: "12:00",
     p_mode: "replace",
     p_idempotency_key: deterministicUuid(`availability-exception-replace:${runId}`),
-    p_exception_id: null,
+    p_exception_id: await existingExceptionId(teacherClient, availabilityReplaceDate, "replace"),
     p_location_id: null,
     p_notes: "e2e_disponibilidade_substituir",
     p_is_active: true,
@@ -674,7 +688,7 @@ try {
     p_ends_at: "09:00",
     p_mode: "add",
     p_idempotency_key: deterministicUuid(`availability-exception-add:${runId}`),
-    p_exception_id: null,
+    p_exception_id: await existingExceptionId(teacherClient, availabilityDate, "add"),
     p_location_id: null,
     p_notes: "e2e_disponibilidade_extra",
     p_is_active: true,
@@ -2170,6 +2184,116 @@ try {
   };
   const dateOnlyFromNow = (days) =>
     new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  // Datas com bloqueio ativo tambem estao ocupadas.
+  //
+  // Escolher uma data so por nao ter excecao deixava passar bloqueios deixados
+  // por execucoes anteriores. Um bloqueio corta a janela mesmo em modo
+  // `replace`, e todas as aulas dessa data passavam a falhar com "fora da sua
+  // disponibilidade ou dentro de um bloqueio" — que e um resultado correto do
+  // servidor sobre uma fixture errada, nao um defeito do produto.
+  const blockedDatesBetween = async (fromOffset, toOffset) => {
+    const blocks = await teacherClient
+      .from("teacher_schedule_block_records")
+      .select("starts_at, ends_at")
+      .eq("status", "active")
+      .lt("starts_at", `${dateOnlyFromNow(toOffset + 1)}T00:00:00.000Z`)
+      .gt("ends_at", `${dateOnlyFromNow(fromOffset - 1)}T00:00:00.000Z`);
+    if (blocks.error) {
+      throw new Error(`Ler bloqueios E2E: ${summarizeError(blocks.error)}`);
+    }
+
+    const blocked = new Set();
+    for (const row of blocks.data ?? []) {
+      // O fim e exclusivo; um bloqueio de dia inteiro termina a meia-noite
+      // seguinte e nao ocupa esse dia.
+      for (let offset = fromOffset - 1; offset <= toOffset + 1; offset += 1) {
+        const dateOnly = dateOnlyFromNow(offset);
+        const dayStart = lisbonInstant(dateOnly, "00:00");
+        const dayEnd = lisbonInstant(dateOnly, "23:59");
+        if (new Date(row.starts_at) <= new Date(dayEnd) && new Date(row.ends_at) > new Date(dayStart)) {
+          blocked.add(dateOnly);
+        }
+      }
+    }
+    return blocked;
+  };
+
+  // As excecoes de execucoes antigas sao reformadas antes de escolher datas.
+  //
+  // Cada execucao consome datas livres e nunca as devolvia: a banda de fixtures
+  // enchia-se ate "Sem serie E2E livre entre X e Y dias" — a suite deixava de
+  // ser repetivel, que e exatamente o que ela existe para garantir.
+  //
+  // Reformar uma excecao nao mexe em nenhuma aula: a disponibilidade so e
+  // validada ao criar ou editar, nunca retroativamente. Ficam de fora as
+  // fixtures dedicadas do calendario e tudo o que esta execucao ja criou hoje.
+  const retireStaleAvailabilityExceptions = async () => {
+    const stale = await teacherClient
+      .from("teacher_availability_exception_records")
+      .select("id, notes")
+      .eq("is_active", true)
+      .eq("mode", "replace")
+      // Sem filtro por `created_at`: esta reforma corre ANTES de a execucao
+      // criar qualquer fixture, por isso tudo o que existe aqui e de execucoes
+      // anteriores — incluindo as de hoje. Filtrar por data de criacao deixava
+      // a banda entupida com o lixo das execucoes do proprio dia.
+      .gte("exception_date", dateOnlyFromNow(150));
+    if (stale.error) {
+      throw new Error(`Reformar excecoes E2E: ${summarizeError(stale.error)}`);
+    }
+
+    let retired = 0;
+    for (const row of stale.data ?? []) {
+      if ((row.notes ?? "").startsWith("e2e_disponibilidade_")) continue;
+      const { error } = await teacherClient.rpc("deactivate_teacher_availability_exception", {
+        p_exception_id: row.id,
+        p_idempotency_key: deterministicUuid(`e2e-exception-retire:${row.id}`),
+      });
+      if (error) {
+        throw new Error(`Reformar excecao E2E: ${summarizeError(error)}`);
+      }
+      retired += 1;
+    }
+    if (retired > 0) {
+      ok(`Reformadas ${retired} excecao(oes) de disponibilidade de execucoes anteriores.`);
+    }
+  };
+
+  await retireStaleAvailabilityExceptions();
+
+  // Datas que ja tem aulas ativas tambem estao ocupadas.
+  //
+  // Reformar as excecoes antigas liberta a banda de disponibilidade, mas as
+  // aulas dessas execucoes continuam la — e uma aula ativa colide na mesma. Sem
+  // isto, a fixture seguinte apanhava "Ja tem outra aula nesse horario" numa
+  // data que o seletor acabara de declarar livre.
+  const busyLessonDatesBetween = async (fromOffset, toOffset) => {
+    const lessons = await teacherClient
+      .from("teacher_lesson_schedule_records")
+      .select("starts_at, status")
+      .in("status", ["scheduled", "confirmed"])
+      .gte("starts_at", `${dateOnlyFromNow(fromOffset - 1)}T00:00:00.000Z`)
+      .lt("starts_at", `${dateOnlyFromNow(toOffset + 1)}T00:00:00.000Z`);
+    if (lessons.error) {
+      throw new Error(`Ler aulas E2E: ${summarizeError(lessons.error)}`);
+    }
+
+    const busy = new Set();
+    for (const row of lessons.data ?? []) {
+      // A data civil de Lisboa, nao a data UTC: uma aula das 00:30 de Lisboa
+      // e do dia anterior em UTC, e a fixture seguinte pousaria em cima dela.
+      busy.add(
+        new Intl.DateTimeFormat("en-CA", {
+          timeZone: "Europe/Lisbon",
+          year: "numeric",
+          month: "2-digit",
+          day: "2-digit",
+        }).format(new Date(row.starts_at)),
+      );
+    }
+    return busy;
+  };
+
   const pickUnusedAvailabilityOffset = async (startOffset, endOffset) => {
     const rangeStart = Math.min(startOffset, endOffset);
     const rangeEnd = Math.max(startOffset, endOffset);
@@ -2184,8 +2308,13 @@ try {
     }
 
     const usedDates = new Set((existing.data ?? []).map((row) => row.exception_date));
+    const blockedDates = await blockedDatesBetween(rangeStart, rangeEnd);
+    const busyDates = await busyLessonDatesBetween(rangeStart, rangeEnd);
     for (let offset = rangeStart; offset <= rangeEnd; offset += 1) {
-      if (!usedDates.has(dateOnlyFromNow(offset))) return offset;
+      const dateOnly = dateOnlyFromNow(offset);
+      if (!usedDates.has(dateOnly) && !blockedDates.has(dateOnly) && !busyDates.has(dateOnly)) {
+        return offset;
+      }
     }
     throw new Error(`Sem data E2E livre entre ${rangeStart} e ${rangeEnd} dias.`);
   };
@@ -2203,9 +2332,18 @@ try {
     }
 
     const usedDates = new Set((existing.data ?? []).map((row) => row.exception_date));
+    const blockedDates = await blockedDatesBetween(rangeStart, rangeEnd + (count - 1) * 7);
+    const busyDates = await busyLessonDatesBetween(rangeStart, rangeEnd + (count - 1) * 7);
     for (let offset = rangeStart; offset <= rangeEnd; offset += 1) {
       const dates = Array.from({ length: count }, (_, index) => dateOnlyFromNow(offset + index * 7));
-      if (dates.every((dateOnly) => !usedDates.has(dateOnly))) return offset;
+      if (
+        dates.every(
+          (dateOnly) =>
+            !usedDates.has(dateOnly) && !blockedDates.has(dateOnly) && !busyDates.has(dateOnly),
+        )
+      ) {
+        return offset;
+      }
     }
     throw new Error(`Sem serie E2E livre entre ${rangeStart} e ${rangeEnd} dias.`);
   };
@@ -2220,12 +2358,17 @@ try {
   const lessonDate = isoDatePlusDays(130, fixtureBaseDate);
   const lessonTitle = `Aula E2E 5D2 ${runId}`;
   const lessonKey = deterministicUuid(`lesson-individual-5d2:${runId}`);
+  // `p_exception_id` e `p_is_active` sao o que torna esta fixture duravel: a RPC
+  // e idempotente pela chave, por isso uma linha ja existente ignorava os
+  // valores novos e uma excecao desativada nunca voltava a ficar ativa.
   const { error: lessonDateError } = await teacherClient.rpc("upsert_teacher_availability_exception", {
     p_exception_date: lessonDate,
     p_starts_at: "10:00",
     p_ends_at: "12:00",
     p_mode: "replace",
     p_idempotency_key: deterministicUuid(`lesson-5d2-date:${runId}`),
+    p_exception_id: await existingExceptionId(teacherClient, lessonDate, "replace"),
+    p_is_active: true,
   });
   if (lessonDateError) {
     throw new Error(`Preparar disponibilidade da aula 5D2: ${summarizeError(lessonDateError)}`);
@@ -2579,12 +2722,64 @@ try {
     );
     if (existing?.id) return existing.id;
 
+    // Nenhuma excecao cobre o que esta execucao precisa — mas pode haver uma
+    // excecao ANTIGA nesta data, deixada por uma execucao de outro dia. Como as
+    // fixtures sao datadas a partir de hoje, a banda vai enchendo, e a criacao
+    // seguinte falharia com "sobrepoe outro periodo ativo".
+    //
+    // Retira-se apenas o que esta NESTA data, e so quando nao serve, pela RPC
+    // oficial. Uma limpeza em bloco apagaria excecoes de que a propria execucao
+    // depende.
+    const overlapping = await supabase
+      .from("teacher_availability_exception_records")
+      .select("id, mode, starts_at, ends_at, notes")
+      .eq("exception_date", dateOnly)
+      .eq("is_active", true);
+    if (overlapping.error) {
+      throw new Error(`${label}: ler excecoes da data: ${summarizeError(overlapping.error)}`);
+    }
+
+    // Nesta data ficou uma excecao que NAO cobre a janela pedida. Nao chega
+    // deixa-la: ela sobrepoe-se ao periodo que vai ser criado, e sobretudo faz
+    // o servidor recusar aulas fora da sua janela estreita — uma resposta
+    // correta a uma fixture errada.
+    //
+    // Cada data e preparada com uma janela unica dentro de uma execucao, por
+    // isso desativar o que nao cobre nao tira o tapete a ninguem.
+    for (const row of overlapping.data ?? []) {
+      if (row.starts_at <= startsAt && row.ends_at >= endsAt) continue;
+      // As fixtures dedicadas do calendario nao sao lixo de execucoes antigas:
+      // sao o que as verificacoes de calendario privado e do aluno esperam
+      // encontrar. Desativa-las fazia essas verificacoes falharem para sempre,
+      // porque o upsert seguinte e idempotente pela chave e nao as reativava.
+      if (row.mode !== "replace") continue;
+      if ((row.notes ?? "").startsWith("e2e_disponibilidade_")) continue;
+      const { error: deactivateError } = await supabase.rpc(
+        "deactivate_teacher_availability_exception",
+        {
+          p_exception_id: row.id,
+          p_idempotency_key: deterministicUuid(`e2e-exception-replace:${row.id}`),
+        },
+      );
+      if (deactivateError) {
+        throw new Error(
+          `${label}: desativar excecao antiga: ${summarizeError(deactivateError)}`,
+        );
+      }
+    }
+
+    // A chave carrega a janela pedida.
+    //
+    // `upsert_teacher_availability_exception` e idempotente pela chave: com
+    // `${keyPrefix}:${runId}` fixo, a primeira execucao de sempre fixava a
+    // janela e nenhuma execucao seguinte a conseguia alargar. Uma janela
+    // diferente e uma intencao diferente, e tem de ter chave diferente.
     const { error } = await supabase.rpc("upsert_teacher_availability_exception", {
       p_exception_date: dateOnly,
       p_starts_at: startsAt,
       p_ends_at: endsAt,
       p_mode: "replace",
-      p_idempotency_key: deterministicUuid(`${keyPrefix}:${runId}`),
+      p_idempotency_key: deterministicUuid(`${keyPrefix}:${runId}:${startsAt}-${endsAt}`),
     });
     if (error) throw new Error(`${label}: ${summarizeError(error)}`);
   };
@@ -2595,10 +2790,17 @@ try {
     }
   };
 
-  await prepareException(teacherClient, "Disponibilidade para conflito do Professor A", conflictDate, "lesson-conflict-date-a");
-  await prepareException(teacherClient, "Disponibilidade para intervalo minimo", minimumBreakDate, "lesson-break-date-a");
-  await prepareException(teacherClient, "Disponibilidade para recurso do Professor A", resourceConflictDate, "lesson-resource-date-a");
-  await prepareException(teacherBClient, "Disponibilidade para recurso do Professor B", resourceConflictDate, "lesson-resource-date-b");
+  // Janela explicita e larga. Estas datas servem cenarios de conflito, intervalo
+  // minimo e corridas, que marcam aulas em varias horas do dia; com a janela
+  // curta por omissao passavam a depender de uma excecao mais larga deixada por
+  // OUTRA fixture na mesma data — e falhavam com "fora da disponibilidade"
+  // assim que essa excecao alheia deixava de existir.
+  const RACE_WINDOW_START = "06:00";
+  const RACE_WINDOW_END = "22:00";
+  await prepareException(teacherClient, "Disponibilidade para conflito do Professor A", conflictDate, "lesson-conflict-date-a", RACE_WINDOW_START, RACE_WINDOW_END);
+  await prepareException(teacherClient, "Disponibilidade para intervalo minimo", minimumBreakDate, "lesson-break-date-a", RACE_WINDOW_START, RACE_WINDOW_END);
+  await prepareException(teacherClient, "Disponibilidade para recurso do Professor A", resourceConflictDate, "lesson-resource-date-a", RACE_WINDOW_START, RACE_WINDOW_END);
+  await prepareException(teacherBClient, "Disponibilidade para recurso do Professor B", resourceConflictDate, "lesson-resource-date-b", RACE_WINDOW_START, RACE_WINDOW_END);
 
   const lastCreditDateA = isoDatePlusDays(136, fixtureBaseDate);
   const lastCreditDateB = isoDatePlusDays(137, fixtureBaseDate);
@@ -2853,6 +3055,39 @@ try {
   const group = await ensureGroup(teacherClient, teacherRecord, `Turma E2E ${runId}`);
   await ensureGroupMember(teacherClient, group.id, studentsA.id, "Aluno A");
   await ensureGroupMember(teacherClient, group.id, groupStudent.id, "Aluno da turma");
+
+  // Esta turma é partilhada por todas as execuções (o nome usa `runId`, não o
+  // sufixo da execução), mas houve execuções que lhe acrescentaram alunos
+  // criados por sufixo. Esses alunos ficam para trás com pacotes esgotados ou
+  // expirados — e como uma aula de turma é tudo-ou-nada, bastava um deles sem
+  // pacote válido para a criação falhar e derrubar a suite inteira.
+  //
+  // A composição é normalizada aqui, pela RPC oficial, para os dois alunos que
+  // esta turma deve mesmo ter.
+  const expectedGroupMembers = new Set([studentsA.id, groupStudent.id]);
+  const currentGroupMembers = await teacherClient
+    .from("group_members")
+    .select("student_id")
+    .eq("group_id", group.id)
+    .eq("is_active", true);
+  if (currentGroupMembers.error) {
+    throw new Error(`Ler membros da turma E2E: ${summarizeError(currentGroupMembers.error)}`);
+  }
+  let removedStrays = 0;
+  for (const row of currentGroupMembers.data ?? []) {
+    if (expectedGroupMembers.has(row.student_id)) continue;
+    const { error: removeError } = await teacherClient.rpc("remove_group_member", {
+      p_group_id: group.id,
+      p_student_id: row.student_id,
+    });
+    if (!removeError) removedStrays += 1;
+  }
+  check(
+    removedStrays === (currentGroupMembers.data ?? []).filter(
+      (row) => !expectedGroupMembers.has(row.student_id),
+    ).length,
+    `Turma E2E partilhada normalizada (${removedStrays} aluno(s) de execucoes antigas removido(s))`,
+  );
 
   const { data: groupLessonId, error: groupLessonError } = await createLesson(teacherClient, {
     p_starts_at: lisbonInstant(groupLessonDate, "10:00"),
@@ -3404,6 +3639,48 @@ try {
 
   const phase6RunSuffix = `${runId}-${Date.now().toString(36)}`;
   const phase6RunSeed = Number(Date.now() % 1_000);
+  // ── Contrato de fixtures da Fase 6 ────────────────────────────────────────
+  //
+  // `create_lesson()` não aceita um pacote: escolhe sozinho, e escolhe o que
+  // expira MAIS CEDO entre os que ainda têm saldo. Cada execução deixa para
+  // trás os seus pacotes, e ao fim de algumas dezenas de execuções a escolha
+  // automática passa a cair num pacote antigo cuja validade já não cobre as
+  // datas que esta secção usa — e a suite falha por acumulação, não por defeito.
+  //
+  // A correção é tornar a escolha determinística: antes de criar as fixtures
+  // desta execução, os pacotes de fixture das execuções ANTERIORES são
+  // cancelados pela RPC administrativa oficial. `admin_cancel_student_package()`
+  // recusa-se a cancelar pacotes com créditos reservados, por isso nada que
+  // esteja a pagar uma aula viva é tocado, e o livro-razão nunca é editado à mão.
+  const phase6FixturePrefixes = [
+    "Pacote presenca",
+    "Pacote presenca futura",
+    "Pacote presenca turma",
+    "Pacote cancelamento",
+    "Pacote reagendamento",
+  ];
+  const staleFixturePackages = await teacherClient
+    .from("teacher_package_records")
+    .select("id, name, credits_reserved, status")
+    .in("status", ["active", "not_started"]);
+  if (staleFixturePackages.error) {
+    throw new Error(`Listar pacotes de fixture: ${summarizeError(staleFixturePackages.error)}`);
+  }
+  let retiredPackages = 0;
+  for (const row of staleFixturePackages.data ?? []) {
+    const isFixture = phase6FixturePrefixes.some((prefix) => row.name.startsWith(prefix));
+    // O sufixo desta execução ainda não foi usado para criar nada, por isso
+    // qualquer pacote com este prefixo é de uma execução anterior.
+    if (!isFixture || row.name.includes(phase6RunSuffix) || row.credits_reserved > 0) continue;
+    const { error: retireError } = await teacherClient.rpc("admin_cancel_student_package", {
+      p_package_id: row.id,
+      p_reason: "Fixture E2E de execucao anterior",
+      p_idempotency_key: deterministicUuid(`e2e-retire-package:${row.id}`),
+    });
+    if (!retireError) retiredPackages += 1;
+  }
+  ok(`Pacotes de fixture antigos retirados (${retiredPackages})`);
+
   const phase6PastOffset = 1 + (phase6RunSeed % 3);
   const phase6EditRaceOffset = 4 + (phase6RunSeed % 3);
   const phase6FutureOffset = 32 + (phase6RunSeed % 8);
@@ -3459,7 +3736,7 @@ try {
     teacherClient,
     studentsA.id,
     `Pacote presenca A ${phase6RunSuffix}`,
-    12,
+    40,
     deterministicUuid(`lesson-6a-package-a:${phase6RunSuffix}`),
     sportRow.id,
     { expiresOn: phase6PastPackageExpiresOn },
@@ -3476,8 +3753,11 @@ try {
   const phase6GroupPackage = await assignLessonPackage(
     teacherClient,
     groupStudent.id,
+    // Dimensionado para TODAS as aulas de turma que esta seccao cria neste
+    // aluno, e nao apenas para a primeira: com a escolha automatica de pacote,
+    // ficar sem saldo a meio faz a criacao seguinte falhar por falta de fixture.
     `Pacote presenca turma ${phase6RunSuffix}`,
-    4,
+    30,
     deterministicUuid(`lesson-6a-package-group:${phase6RunSuffix}`),
     sportRow.id,
     { expiresOn: phase6PastPackageExpiresOn },
@@ -4033,38 +4313,6 @@ try {
 
   const phase6bPastOffset = 7;
   const phase6bRaceOffset = 8;
-  // As fixtures são datadas a partir de HOJE, por isso o conjunto de ontem fica
-  // para trás e a banda de datas de teste enche-se ao fim de alguns dias — até
-  // deixar de haver três semanas seguidas livres e a suite passar a falhar por
-  // acumulação, não por defeito. Antes de escolher datas, arruma-se o que ficou:
-  // só exceções DESTE professor E2E, só na banda longínqua que os testes usam, e
-  // sempre pela RPC oficial. As que esta execução precisar são recriadas a
-  // seguir por `prepareException`, que é idempotente.
-  const staleExceptions = await teacherClient
-    .from("teacher_availability_exception_records")
-    .select("id")
-    .eq("is_active", true)
-    .gte("exception_date", dateOnlyFromNow(150))
-    .lte("exception_date", dateOnlyFromNow(400));
-  if (staleExceptions.error) {
-    throw new Error(`Arrumar excecoes E2E antigas: ${summarizeError(staleExceptions.error)}`);
-  }
-  let cleanedExceptions = 0;
-  for (const row of staleExceptions.data ?? []) {
-    const { error: deactivateError } = await teacherClient.rpc(
-      "deactivate_teacher_availability_exception",
-      {
-        p_exception_id: row.id,
-        p_idempotency_key: deterministicUuid(`e2e-exception-cleanup:${row.id}`),
-      },
-    );
-    if (!deactivateError) cleanedExceptions += 1;
-  }
-  check(
-    cleanedExceptions === (staleExceptions.data ?? []).length,
-    `Excecoes E2E antigas arrumadas (${cleanedExceptions}/${(staleExceptions.data ?? []).length})`,
-  );
-
   const phase6bFutureOffset = await pickUnusedAvailabilityOffset(180, 220);
   const phase6bRecurringStartOffset = await pickUnusedWeeklyAvailabilityOffset(230, 260, 3);
   const phase6bPastDate = dateOnlyFromNow(-phase6bPastOffset);
@@ -4897,15 +5145,21 @@ try {
   // Normaliza, prova a idempotencia, prova uma alteracao real e volta atras —
   // nesta ordem, para a seccao correr as vezes que forem precisas.
   await editLesson(teacherClient);
-  const { data: editRepeat } = await editLesson(teacherClient);
-  const { data: editChanged } = await editLesson(teacherClient, {
+  const { data: editRepeat, error: editRepeatError } = await editLesson(teacherClient);
+  const { data: editChanged, error: editChangedError } = await editLesson(teacherClient, {
     p_starts_at: lisbonInstant(lessonDate, "11:00"),
     p_ends_at: lisbonInstant(lessonDate, "12:00"),
   });
-  const { data: editRestored } = await editLesson(teacherClient);
+  const { data: editRestored, error: editRestoredError } = await editLesson(teacherClient);
+  const editFailure = [editRepeatError, editChangedError, editRestoredError]
+    .filter(Boolean)
+    .map((entry) => summarizeError(entry))
+    .join(" | ");
   check(
     editRepeat === false && editChanged === true && editRestored === true,
-    "Editar aplica alteracoes reais e ignora submissoes iguais",
+    `Editar aplica alteracoes reais e ignora submissoes iguais${
+      editFailure ? `: ${editFailure}` : ""
+    }`,
   );
 
   const historyRows = await teacherClient
@@ -5219,6 +5473,203 @@ try {
   // ── Escrita direta continua fechada ──
   await mustReject("Professor nao marca uma aula como reagendada diretamente", async () =>
     teacherClient.from("lessons").update({ status: "rescheduled" }).eq("id", replacementId),
+  );
+
+  // ── Concorrencia real, com JWTs reais (Etapa 6C.1A) ───────────────────────
+  //
+  // Duas ligacoes verdadeiras, em paralelo, contra o PostgreSQL remoto. E aqui
+  // que se ve se os locks e a transacao aguentam — o PGlite tem uma so ligacao
+  // e nunca poderia provar isto.
+
+  const packageBalances = async (label) =>
+    getSingle(
+      label,
+      teacherClient
+        .from("teacher_package_records")
+        .select("id, credits_available, credits_reserved, credits_used")
+        .eq("id", reschedulePackageBefore.id),
+    );
+
+  const sameTotal = (before, after) =>
+    before.credits_available + before.credits_reserved + before.credits_used ===
+    after.credits_available + after.credits_reserved + after.credits_used;
+
+  // A) Duas tentativas de reagendar A MESMA aula, com chaves diferentes.
+  //    Uma transforma; a outra tem de encontrar a aula ja historica.
+  const raceOriginA = await createPhase6Lesson({
+    index: 1,
+    title: "Aula E2E 6C corrida original",
+    date: phase6cOriginDate,
+  });
+  const beforeRaceA = await packageBalances("saldos antes da corrida A");
+  const raceA = await Promise.all([
+    rpcOutcome(() =>
+      rescheduleRpc(teacherClient, raceOriginA, {
+        p_starts_at: lisbonInstant(phase6cTargetDate, "14:00"),
+        p_ends_at: lisbonInstant(phase6cTargetDate, "15:00"),
+        p_idempotency_key: deterministicUuid(`lesson-6c-race-a1:${phase6RunSuffix}`),
+      }),
+    ),
+    rpcOutcome(() =>
+      rescheduleRpc(teacherClient, raceOriginA, {
+        p_starts_at: lisbonInstant(phase6cTargetDate, "16:00"),
+        p_ends_at: lisbonInstant(phase6cTargetDate, "17:00"),
+        p_idempotency_key: deterministicUuid(`lesson-6c-race-a2:${phase6RunSuffix}`),
+      }),
+    ),
+  ]);
+  check(
+    raceA.filter((entry) => entry.ok).length === 1,
+    "Corrida de dois reagendamentos da mesma aula: exatamente um transforma",
+  );
+  const afterRaceA = await packageBalances("saldos depois da corrida A");
+  check(
+    sameTotal(beforeRaceA, afterRaceA) &&
+      afterRaceA.credits_reserved === beforeRaceA.credits_reserved &&
+      afterRaceA.credits_used === beforeRaceA.credits_used,
+    "A corrida de reagendamentos nao inventa nem perde creditos",
+  );
+  const raceAReplacements = await teacherClient
+    .from("teacher_lesson_schedule_records")
+    .select("id, starts_at")
+    .in("starts_at", [
+      lisbonInstant(phase6cTargetDate, "14:00"),
+      lisbonInstant(phase6cTargetDate, "16:00"),
+    ]);
+  if (raceAReplacements.error) {
+    throw new Error(`Substitutas da corrida A: ${summarizeError(raceAReplacements.error)}`);
+  }
+  check(
+    (raceAReplacements.data ?? []).length === 1,
+    "A aula original ficou com uma unica substituta",
+  );
+
+  // B) Duas chamadas CONCORRENTES com a MESMA chave e a mesma intencao.
+  //    Idempotencia sob concorrencia: uma so transformacao, uma so aula nova.
+  const raceOriginB = await createPhase6Lesson({
+    index: 2,
+    title: "Aula E2E 6C corrida chave",
+    date: phase6cOriginDate,
+  });
+  const sameKey = deterministicUuid(`lesson-6c-race-same-key:${phase6RunSuffix}`);
+  const raceB = await Promise.all([
+    rpcOutcome(() =>
+      rescheduleRpc(teacherClient, raceOriginB, {
+        p_starts_at: lisbonInstant(phase6cTargetDate, "18:00"),
+        p_ends_at: lisbonInstant(phase6cTargetDate, "19:00"),
+        p_idempotency_key: sameKey,
+      }),
+    ),
+    rpcOutcome(() =>
+      rescheduleRpc(teacherClient, raceOriginB, {
+        p_starts_at: lisbonInstant(phase6cTargetDate, "18:00"),
+        p_ends_at: lisbonInstant(phase6cTargetDate, "19:00"),
+        p_idempotency_key: sameKey,
+      }),
+    ),
+  ]);
+  const raceBReplacements = await teacherClient
+    .from("teacher_lesson_schedule_records")
+    .select("id, starts_at")
+    .eq("starts_at", lisbonInstant(phase6cTargetDate, "18:00"));
+  if (raceBReplacements.error) {
+    throw new Error(`Substitutas da corrida B: ${summarizeError(raceBReplacements.error)}`);
+  }
+  check(
+    raceB.some((entry) => entry.ok) && (raceBReplacements.data ?? []).length === 1,
+    "Duas chamadas concorrentes com a mesma chave produzem uma unica substituta",
+  );
+
+  // C) Reagendar x cancelar a mesma aula. Sao dois desfechos terminais
+  //    incompativeis: um tem de perder.
+  const raceOriginC = await createPhase6Lesson({
+    index: 3,
+    title: "Aula E2E 6C corrida cancelar",
+    date: phase6cOriginDate,
+  });
+  const beforeRaceC = await packageBalances("saldos antes da corrida C");
+  const raceC = await Promise.all([
+    rpcOutcome(() =>
+      rescheduleRpc(teacherClient, raceOriginC, {
+        p_starts_at: lisbonInstant(phase6cTargetDate, "20:00"),
+        p_ends_at: lisbonInstant(phase6cTargetDate, "21:00"),
+        p_idempotency_key: deterministicUuid(`lesson-6c-race-cancel:${phase6RunSuffix}`),
+      }),
+    ),
+    rpcOutcome(() =>
+      teacherClient.rpc("cancel_lesson", {
+        p_lesson_id: raceOriginC,
+        p_reason: "Corrida com reagendamento",
+        p_idempotency_key: deterministicUuid(`lesson-6c-race-cancel-b:${phase6RunSuffix}`),
+      }),
+    ),
+  ]);
+  check(
+    raceC.filter((entry) => entry.ok).length >= 1,
+    "Corrida reagendar x cancelar termina serializada, sem as duas a ganhar em silencio",
+  );
+  const raceCLesson = await getSingle(
+    "aula da corrida reagendar x cancelar",
+    teacherClient
+      .from("teacher_lesson_schedule_records")
+      .select("id, status")
+      .eq("id", raceOriginC),
+  );
+  check(
+    raceCLesson.status === "rescheduled" || raceCLesson.status === "cancelled_by_teacher",
+    "A aula fica num unico estado terminal, nunca nos dois",
+  );
+  const afterRaceC = await packageBalances("saldos depois da corrida C");
+  check(
+    sameTotal(beforeRaceC, afterRaceC) && afterRaceC.credits_used === beforeRaceC.credits_used,
+    "Reagendar x cancelar nao consome creditos nem quebra a soma dos saldos",
+  );
+
+  // D) Reagendar x editar. A edicao nao pode aterrar numa aula que ja e
+  //    historica, e a soma dos saldos nao muda de qualquer forma.
+  const raceOriginD = await createPhase6Lesson({
+    index: 4,
+    title: "Aula E2E 6C corrida editar",
+    date: phase6cOriginDate,
+  });
+  const beforeRaceD = await packageBalances("saldos antes da corrida D");
+  const raceDSlot = phase6Slot(4);
+  await Promise.all([
+    rpcOutcome(() =>
+      rescheduleRpc(teacherClient, raceOriginD, {
+        p_starts_at: lisbonInstant(phase6cTargetDate, "08:00"),
+        p_ends_at: lisbonInstant(phase6cTargetDate, "09:00"),
+        p_idempotency_key: deterministicUuid(`lesson-6c-race-edit:${phase6RunSuffix}`),
+      }),
+    ),
+    rpcOutcome(() =>
+      teacherClient.rpc("update_lesson", {
+        p_lesson_id: raceOriginD,
+        p_starts_at: lisbonInstant(phase6cOriginDate, raceDSlot.startsAt),
+        p_ends_at: lisbonInstant(phase6cOriginDate, raceDSlot.endsAt),
+        p_title: `Aula E2E 6C corrida editar ${phase6RunSuffix}`,
+        p_location_id: null,
+        p_location_resource_id: null,
+        p_notes_for_students: "e2e_corrida_edicao",
+        p_private_notes: null,
+      }),
+    ),
+  ]);
+  const raceDLesson = await getSingle(
+    "aula da corrida reagendar x editar",
+    teacherClient
+      .from("teacher_lesson_schedule_records")
+      .select("id, status")
+      .eq("id", raceOriginD),
+  );
+  check(
+    raceDLesson.status === "rescheduled" || raceDLesson.status === "scheduled",
+    "Reagendar x editar deixa a aula num estado coerente",
+  );
+  const afterRaceD = await packageBalances("saldos depois da corrida D");
+  check(
+    sameTotal(beforeRaceD, afterRaceD) && afterRaceD.credits_used === beforeRaceD.credits_used,
+    "Reagendar x editar nao mexe na soma dos saldos nem consome creditos",
   );
 
   // ── Privacidade: o aluno ve a aula nova, sem detalhes administrativos ──

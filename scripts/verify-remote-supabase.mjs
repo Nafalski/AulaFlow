@@ -1257,6 +1257,73 @@ checks as (
 
   union all
   select
+    'estrutura',
+    'a chave de reagendamento tem namespace proprio',
+    exists (
+      select 1
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'lessons'
+        and column_name = 'reschedule_idempotency_key'
+    ),
+    'ok'
+
+  union all
+  select
+    'integridade',
+    'a mesma intencao de reagendamento nao pode gerar duas substitutas',
+    exists (
+      select 1
+      from pg_indexes
+      where schemaname = 'public'
+        and tablename = 'lessons'
+        and indexname = 'lessons_reschedule_idempotency_unique'
+    ),
+    'ok'
+
+  union all
+  select
+    'integridade',
+    'a cadeia de reagendamento nao bifurca',
+    (
+      select count(*) = 2
+      from pg_indexes
+      where schemaname = 'public'
+        and tablename = 'lessons'
+        and indexname in ('lessons_rescheduled_to_unique', 'lessons_rescheduled_from_unique')
+    ),
+    'ok'
+
+  union all
+  select
+    'integridade',
+    'uma chave de reagendamento exige aula de origem',
+    exists (
+      select 1
+      from pg_constraint
+      where conrelid = 'public.lessons'::regclass
+        and conname = 'lessons_reschedule_key_needs_origin'
+        and contype = 'c'
+    ),
+    'ok'
+
+  union all
+  select
+    'estrutura',
+    'reschedule_lesson tem assinatura unica e search_path fixo',
+    (
+      select count(*) = 1
+      from pg_proc proc
+      join pg_namespace ns on ns.oid = proc.pronamespace
+      where ns.nspname = 'public'
+        and proc.proname = 'reschedule_lesson'
+        and proc.prosecdef
+        and array_to_string(coalesce(proc.proconfig, array[]::text[]), ',') like '%search_path=public, pg_temp%'
+    ),
+    'ok'
+
+  union all
+  select
     'seguranca',
     'anon nao executa o reagendamento',
     not exists (
