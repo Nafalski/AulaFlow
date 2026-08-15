@@ -7,7 +7,7 @@ import { useActionState, useState } from "react";
 import { Alert } from "@/components/ui/alert";
 import { Button, buttonClasses } from "@/components/ui/button";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
-import { SelectField, TextareaField, TextField } from "@/components/ui/field";
+import { CheckboxField, SelectField, TextareaField, TextField } from "@/components/ui/field";
 import {
   FORM_ACTION_IDLE_STATE,
   preserveFormValuesOnReset,
@@ -238,6 +238,7 @@ export function LessonForm({
   const [privateNotes, setPrivateNotes] = useState(values.privateNotes ?? "");
   const [recurrenceMode, setRecurrenceMode] = useState<LessonRecurrenceMode>("none");
   const [recurrenceCount, setRecurrenceCount] = useState("4");
+  const [requiresConfirmation, setRequiresConfirmation] = useState(false);
 
   // Na edição o contexto está fixo na aula, e é ELE que decide os locais
   // válidos. Oferecer a lista toda mostraria o pavilhão do clube numa aula
@@ -512,6 +513,26 @@ export function LessonForm({
               lessonDate={lessonDate}
               data={data}
             />
+
+          {/* Pedir confirmação nasce desligado, e só existe na criação: ligá-lo
+              numa aula já criada obrigaria a decidir o que fazer com as
+              respostas que já existem. */}
+          <fieldset className="flex flex-col gap-1">
+            <legend className="text-sm font-bold text-ink">Confirmação</legend>
+            <CheckboxField
+              name="requiresConfirmation"
+              label="Pedir confirmação aos participantes"
+              checked={requiresConfirmation}
+              onChange={(event) => setRequiresConfirmation(event.target.checked)}
+              error={state.fieldErrors?.requiresConfirmation}
+            />
+            <p className="text-sm text-muted">
+              Os alunos poderão confirmar que vão participar antes do início da aula.
+              {recurrenceMode === "weekly" && requiresConfirmation
+                ? " Cada aula da série será confirmada separadamente."
+                : ""}
+            </p>
+          </fieldset>
 
           {/* Local → recurso: mudar de local limpa o campo escolhido, porque um
               campo do local anterior deixaria de existir ali. */}

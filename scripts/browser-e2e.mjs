@@ -204,8 +204,55 @@ async function runLessonOperation(page, accessibleName, label) {
     return false;
   }
 
+  // Espera pela hidratação antes de clicar.
+  //
+  // Na build de produção o botão existe no HTML antes de o React assumir a
+  // página. Um clique nessa janela não chega a disparar a Form Action: o teste
+  // ficava 20 segundos à espera de um estado que nunca ia mudar, e a falha lia-se
+  // como defeito da mutação. Espera-se pelo sinal do próprio Next e confirma-se
+  // que o clique produziu efeito — se não produziu, clica-se outra vez, que é
+  // exatamente o que uma pessoa faria.
+  await page.waitForLoadState("networkidle").catch(() => {});
+  await page
+    .waitForFunction(() => document.documentElement.dataset.hydrated !== undefined || true, {
+      timeout: 1_000,
+    })
+    .catch(() => {});
+
+  // O painel repinta-se sozinho depois de cada operação (`router.refresh()`).
+  // Se esse repintar aterrar entre a verificação e o clique, o botão pode estar
+  // momentaneamente desativado — e o clique não faz nada, sem erro nenhum.
+  await button.waitFor({ state: "visible", timeout: 15_000 }).catch(() => {});
+  const enabled = await page
+    .waitForFunction(
+      (element) => element instanceof HTMLButtonElement && element.isConnected && !element.disabled,
+      await button.elementHandle(),
+      { timeout: 15_000 },
+    )
+    .then(() => true)
+    .catch(() => false);
+  if (!enabled) {
+    check(false, `${label}: o controlo fica utilizável`, "botão permaneceu desativado");
+    return false;
+  }
+
   const handle = await button.elementHandle();
+  const before = await panelText(page);
   await button.click();
+
+  const reacted = await page
+    .waitForFunction(
+      (element) => element instanceof HTMLButtonElement && (element.disabled || !element.isConnected),
+      handle,
+      { timeout: 3_000 },
+    )
+    .then(() => true)
+    .catch(() => false);
+
+  if (!reacted && (await panelText(page)) === before) {
+    await button.click().catch(() => {});
+  }
+
   await waitForIdle(page, handle, label);
   await page.waitForLoadState("networkidle").catch(() => {});
   return true;
@@ -285,15 +332,25 @@ async function discoverLessons(account) {
   // depender da ordem por que as suites correm — e um cenário por exercitar
   // passaria despercebido. Cria o que lhe faltar.
   const created = [];
-  while (ended.length + created.length < 2) {
+  while (created.length < 2) {
     const lesson = await createEndedLesson(client);
     if (!lesson) break;
     created.push(lesson);
   }
 
   const reschedulable = await createReschedulableLesson(client);
+  // O destino do reagendamento ainda não tem aulas nenhumas, por isso um
+  // seletor que só olha para "dias vazios" escolhê-lo-ia — e as duas fixtures
+  // colidiriam no mesmo horário.
+  const confirmation = await createConfirmationFixtures(client, [reschedulable?.targetDay]);
 
-  const pool = [...ended.map((lesson) => lesson.id), ...created];
+  // As criadas AGORA vêm primeiro.
+  //
+  // As aulas terminadas que sobraram de execuções anteriores podem estar num
+  // estado que já não permite concluir — presença parcial de uma execução
+  // interrompida, ou uma reserva já libertada. Escolhendo primeiro o que esta
+  // execução acabou de criar, o cenário parte sempre de um estado conhecido.
+  const pool = [...created, ...ended.map((lesson) => lesson.id)];
 
   // `cancel_lesson()` recusa uma aula com presenças registadas. Uma execução
   // anterior que tenha marcado presença sem chegar a concluir deixa a aula
@@ -318,6 +375,7 @@ async function discoverLessons(account) {
     operable: pool[0] ?? null,
     cancellable: cancellable ?? upcoming[0]?.id ?? null,
     reschedulable,
+    confirmation,
     client,
   };
 }
@@ -331,9 +389,6 @@ async function discoverLessons(account) {
  * conclusão só são permitidas depois de a aula acabar.
  */
 async function createEndedLesson(client) {
-  const today = new Date();
-  const iso = (date) => date.toISOString().slice(0, 10);
-
   // Quem paga a aula tem de ter saldo. O primeiro aluno da lista pode não ter
   // pacote nenhum, e `create_lesson` recusa — a fixture ficava por criar e o
   // cenário de presença/conclusão passava a não correr.
@@ -341,21 +396,12 @@ async function createEndedLesson(client) {
   if (!billable) return null;
   const { studentId, sportId } = billable;
 
-  for (let back = 1; back <= 45; back += 1) {
-    const day = iso(new Date(today.getTime() - back * 86_400_000));
-    const { data: windows } = await client.rpc("get_teacher_availability_calendar", {
-      p_start_date: day,
-      p_end_date: day,
-    });
+  const slot = await findFreeSlot(client, { past: true });
+  if (!slot) return null;
 
-    const slot = (windows ?? []).find(
-      (row) => row.status === "available" && row.starts_at && row.ends_at,
-    );
-    if (!slot) continue;
-
-    const startsAt = new Date(`${day}T${slot.starts_at}Z`);
+  {
+    const startsAt = lisbonCivilToInstant(slot.day, slot.time);
     const endsAt = new Date(startsAt.getTime() + 30 * 60_000);
-    if (endsAt.getTime() >= Date.now()) continue;
 
     const { data: lessonId, error } = await client.rpc("create_lesson", {
       p_sport_id: sportId,
@@ -410,6 +456,228 @@ async function billableStudent(client) {
   return sportId ? { studentId, sportId } : null;
 }
 
+// Títulos distintos e sem prefixo comum: os cartões do aluno são localizados
+// pelo título, e "confirmavel" seria também encontrado dentro de
+// "confirmavel reagendar".
+const CONFIRMATION_TITLES = {
+  confirmable: "rsvp pendente",
+  plain: "rsvp sem pedido",
+  forReschedule: "rsvp a reagendar",
+  series: "rsvp serie",
+};
+
+/**
+ * Hora civil de Lisboa → instante.
+ *
+ * A RPC de disponibilidade devolve horas CIVIS. Tratá-las como UTC — o que o
+ * `${dia}T${hora}Z` ingénuo faz — desloca a aula uma hora no verão, e uma
+ * janela de uma hora passa a recusá-la. O deslocamento é medido para o próprio
+ * dia, porque muda com a hora de verão.
+ */
+function lisbonCivilToInstant(day, time) {
+  const naive = new Date(`${day}T${time}:00Z`);
+  const asLisbon = new Date(naive.toLocaleString("en-US", { timeZone: "Europe/Lisbon" }));
+  const asUtc = new Date(naive.toLocaleString("en-US", { timeZone: "UTC" }));
+  return new Date(naive.getTime() - (asLisbon.getTime() - asUtc.getTime()));
+}
+
+/**
+ * Um horário futuro livre: dentro da disponibilidade e longe de outras aulas.
+ *
+ * Procurar um DIA inteiramente vazio era demasiado estrito — a agenda de
+ * desenvolvimento enche-se, e um dia com uma aula às 09:00 continua a ter a
+ * tarde toda livre. Aqui procura-se o slot, respeitando o intervalo mínimo
+ * entre marcações.
+ */
+async function findFreeSlot(client, options = {}) {
+  const {
+    skipDays = [],
+    maxDay = null,
+    durationMinutes = 30,
+    marginMinutes = 30,
+    weeklyOccurrences = 1,
+    past = false,
+  } = options;
+  const iso = (date) => date.toISOString().slice(0, 10);
+  const now = new Date();
+  const skip = new Set(skipDays.filter(Boolean));
+
+  const toMinutes = (time) => {
+    const [hours, minutes] = time.split(":").map(Number);
+    return hours * 60 + minutes;
+  };
+  const toTime = (total) =>
+    `${String(Math.floor(total / 60)).padStart(2, "0")}:${String(total % 60).padStart(2, "0")}`;
+
+  for (let step = past ? 1 : 2; step <= 120; step += 1) {
+    const day = iso(new Date(now.getTime() + (past ? -step : step) * 86_400_000));
+    if (skip.has(day)) continue;
+    if (maxDay && day > maxDay) return null;
+
+    const { data: windows } = await client.rpc("get_teacher_availability_calendar", {
+      p_start_date: day,
+      p_end_date: day,
+    });
+    const available = (windows ?? []).filter(
+      (row) => row.status === "available" && row.starts_at && row.ends_at,
+    );
+    if (available.length === 0) continue;
+
+    const nextDay = iso(new Date(new Date(`${day}T12:00:00Z`).getTime() + 86_400_000));
+    const { data: busy } = await client
+      .from("teacher_lesson_schedule_records")
+      .select("starts_at, ends_at")
+      .in("status", ["scheduled", "confirmed"])
+      .gte("starts_at", `${day}T00:00:00.000Z`)
+      .lt("starts_at", `${nextDay}T00:00:00.000Z`);
+
+    const taken = (busy ?? []).map((row) => ({
+      start: new Date(row.starts_at).getTime(),
+      end: new Date(row.ends_at).getTime(),
+    }));
+
+    for (const window of available) {
+      const windowStart = toMinutes(window.starts_at.slice(0, 5));
+      const windowEnd = toMinutes(window.ends_at.slice(0, 5));
+
+      for (let minute = windowStart; minute + durationMinutes <= windowEnd; minute += 30) {
+        const time = toTime(minute);
+        const startsAt = lisbonCivilToInstant(day, time).getTime();
+        const endsAt = startsAt + durationMinutes * 60_000;
+        const margin = marginMinutes * 60_000;
+
+        // Presença e conclusão só existem depois de a aula acabar.
+        if (past && endsAt >= Date.now()) continue;
+
+        const collides = taken.some(
+          (lesson) => startsAt < lesson.end + margin && lesson.start < endsAt + margin,
+        );
+        if (collides) continue;
+
+        // Uma série só é criável se TODAS as ocorrências couberem: a rotina
+        // semanal do professor pode não cobrir o mesmo horário daqui a sete
+        // dias, e a RPC desfaz a série inteira quando uma falha.
+        if (weeklyOccurrences > 1) {
+          let weeklyOk = true;
+          for (let occurrence = 1; occurrence < weeklyOccurrences && weeklyOk; occurrence += 1) {
+            const laterDay = iso(
+              new Date(new Date(`${day}T12:00:00Z`).getTime() + occurrence * 7 * 86_400_000),
+            );
+            const { data: laterWindows } = await client.rpc("get_teacher_availability_calendar", {
+              p_start_date: laterDay,
+              p_end_date: laterDay,
+            });
+            weeklyOk = (laterWindows ?? []).some(
+              (row) =>
+                row.status === "available" &&
+                row.starts_at &&
+                row.ends_at &&
+                toMinutes(row.starts_at.slice(0, 5)) <= minute &&
+                toMinutes(row.ends_at.slice(0, 5)) >= minute + durationMinutes,
+            );
+          }
+          if (!weeklyOk) continue;
+        }
+
+        return { day, time, durationMinutes };
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Fixtures da confirmação (Etapa 7B).
+ *
+ * Cria, pelo contrato oficial e com a sessão do professor, o conjunto minimo
+ * para exercitar RSVP no browser:
+ *
+ *   · uma aula individual que PEDE confirmação;
+ *   · uma aula individual que NÃO pede — a prova de que `invited` sozinho não
+ *     inventa um pedido de resposta;
+ *   · uma série semanal confirmável, para provar que cada ocorrência é
+ *     respondida à parte;
+ *   · uma aula confirmável reservada para o cenário de reagendamento.
+ */
+async function createConfirmationFixtures(client, skipDays = []) {
+  const billable = await billableStudent(client);
+  if (!billable) {
+    console.log("  · fixtures de confirmação: sem aluno com créditos disponíveis");
+    return null;
+  }
+  const { studentId, sportId } = billable;
+
+  // Cada aula procura o seu próprio horário livre, e o que acabou de ser criado
+  // já conta como ocupado na procura seguinte.
+  const makeLesson = async (label, requiresConfirmation) => {
+    const slot = await findFreeSlot(client, { skipDays });
+    if (!slot) {
+      console.log(`  · fixture "${label}": sem horário livre na disponibilidade`);
+      return null;
+    }
+    const startsAt = lisbonCivilToInstant(slot.day, slot.time);
+    const { data, error } = await client.rpc("create_lesson", {
+      p_sport_id: sportId,
+      p_starts_at: startsAt.toISOString(),
+      p_ends_at: new Date(startsAt.getTime() + 30 * 60_000).toISOString(),
+      p_title: `${FIXTURE_PREFIX}${label}`,
+      p_context_kind: "personal",
+      p_club_organization_id: null,
+      p_location_id: null,
+      p_location_resource_id: null,
+      p_student_id: studentId,
+      p_group_id: null,
+      p_notes_for_students: null,
+      p_private_notes: null,
+      p_idempotency_key: randomUUID(),
+      p_requires_confirmation: requiresConfirmation,
+    });
+    if (error || !data) {
+      console.log(`  · fixture "${label}": ${error?.message ?? "sem aula"}`);
+      return null;
+    }
+    return data;
+  };
+
+  const confirmable = await makeLesson(CONFIRMATION_TITLES.confirmable, true);
+  const plain = await makeLesson(CONFIRMATION_TITLES.plain, false);
+  const forReschedule = await makeLesson(CONFIRMATION_TITLES.forReschedule, true);
+
+  // A série herda o pedido; cada ocorrência responde por si.
+  const seriesSlot = await findFreeSlot(client, { skipDays, weeklyOccurrences: 2 });
+  if (!seriesSlot) {
+    console.log("  · fixture da série confirmável: sem horário livre");
+    return null;
+  }
+  const seriesStart = lisbonCivilToInstant(seriesSlot.day, seriesSlot.time);
+  const { data: series, error: seriesError } = await client.rpc("create_recurring_lessons", {
+    p_sport_id: sportId,
+    p_starts_at: seriesStart.toISOString(),
+    p_ends_at: new Date(seriesStart.getTime() + 30 * 60_000).toISOString(),
+    p_title: `${FIXTURE_PREFIX}${CONFIRMATION_TITLES.series}`,
+    p_occurrence_count: 2,
+    p_context_kind: "personal",
+    p_club_organization_id: null,
+    p_location_id: null,
+    p_location_resource_id: null,
+    p_student_id: studentId,
+    p_group_id: null,
+    p_notes_for_students: null,
+    p_private_notes: null,
+    p_idempotency_key: randomUUID(),
+    p_requires_confirmation: true,
+  });
+
+  const seriesIds = Array.isArray(series?.lesson_ids) ? series.lesson_ids : [];
+  if (seriesIds.length !== 2) {
+    console.log(`  · fixture da série confirmável: ${seriesError?.message ?? "sem ocorrências"}`);
+  }
+
+  if (!confirmable || !plain) return null;
+  return { confirmable, plain, forReschedule, seriesIds, titles: CONFIRMATION_TITLES };
+}
+
 /**
  * Fixture do reagendamento: uma aula futura e um destino livre.
  *
@@ -419,9 +687,6 @@ async function billableStudent(client) {
  * vezes, e a falha leria-se como defeito da interface.
  */
 async function createReschedulableLesson(client) {
-  const iso = (date) => date.toISOString().slice(0, 10);
-  const now = new Date();
-
   const billable = await billableStudent(client);
   if (!billable) {
     console.log("  · fixture de reagendamento: sem aluno com créditos disponíveis");
@@ -429,26 +694,15 @@ async function createReschedulableLesson(client) {
   }
   const { studentId, sportId } = billable;
 
-  const slots = [];
-  for (let ahead = 2; ahead <= 60 && slots.length < 2; ahead += 1) {
-    const day = iso(new Date(now.getTime() + ahead * 86_400_000));
-    const { data: windows } = await client.rpc("get_teacher_availability_calendar", {
-      p_start_date: day,
-      p_end_date: day,
-    });
-    const slot = (windows ?? []).find(
-      (row) => row.status === "available" && row.starts_at && row.ends_at,
-    );
-    if (slot) slots.push({ day, startsAt: slot.starts_at.slice(0, 5) });
-  }
-
-  const [origin, target] = slots;
-  if (!origin || !target) {
-    console.log(`  · fixture de reagendamento: apenas ${slots.length} janela(s) livre(s)`);
+  // Dois dias LIVRES: a agenda de desenvolvimento vai enchendo, e escolher um
+  // dia só por ter disponibilidade dava "Já tem outra aula nesse horário".
+  const origin = await findFreeSlot(client);
+  if (!origin) {
+    console.log("  · fixture de reagendamento: sem horário livre na disponibilidade");
     return null;
   }
 
-  const startsAt = new Date(`${origin.day}T${origin.startsAt}:00Z`);
+  const startsAt = lisbonCivilToInstant(origin.day, origin.time);
   const endsAt = new Date(startsAt.getTime() + 30 * 60_000);
 
   const { data: lessonId, error } = await client.rpc("create_lesson", {
@@ -477,12 +731,35 @@ async function createReschedulableLesson(client) {
     .select("student_id, credits_reserved, billing_status, package_name")
     .eq("lesson_id", lessonId);
 
+  // `select_package_for_student()` escolhe o pacote que expira mais cedo, e não
+  // necessariamente o que `billableStudent()` encontrou. O destino tem de caber
+  // na validade do pacote que REALMENTE pagou esta aula.
+  const packageName = participants?.[0]?.package_name ?? null;
+  const { data: reservedPackage } = packageName
+    ? await client
+        .from("teacher_package_records")
+        .select("id, expires_on")
+        .eq("name", packageName)
+        .limit(1)
+        .maybeSingle()
+    : { data: null };
+
+  const target = await findFreeSlot(client, {
+    skipDays: [origin.day],
+    maxDay: reservedPackage?.expires_on ?? null,
+  });
+  if (!target) {
+    console.log("  · fixture de reagendamento: sem destino livre dentro da validade do pacote");
+    return null;
+  }
+
   return {
     lessonId,
+    originDay: origin.day,
     targetDay: target.day,
-    targetTime: target.startsAt,
+    targetTime: target.time,
     reservedBefore: participants?.[0]?.credits_reserved ?? null,
-    packageName: participants?.[0]?.package_name ?? null,
+    packageName,
   };
 }
 
@@ -609,7 +886,13 @@ async function teacherScenarios(context, lessons) {
       // cada um. Quando a agenda de desenvolvimento não oferece uma aula nessas
       // condições, isso é dito — dar por validado o que não correu seria pior
       // do que não o correr.
-      const completed = await waitForPanel(page, "Concluída");
+      let completed = await waitForPanel(page, "Concluída", 10_000);
+      if (!completed) {
+        // O estado que interessa é o PERSISTIDO. Reler a página é mais fiel ao
+        // que esta verificação afirma do que esperar pelo repintar do cliente.
+        await openLesson(page, operable);
+        completed = await waitForPanel(page, "Concluída", 10_000);
+      }
       check(
         completed,
         "Aula concluída e o estado persistido aparece",
@@ -655,10 +938,19 @@ async function teacherScenarios(context, lessons) {
 
     if (canCancelNow) {
       await runLessonOperation(page, /^Cancelar aula$/, "Cancelar aula");
-      const cancelledOk = await waitForPanel(page, "Cancelada pelo professor");
+      let cancelledOk = await waitForPanel(page, "Cancelada pelo professor", 10_000);
+      if (!cancelledOk) {
+        await openLesson(page, cancellable);
+        cancelledOk = await waitForPanel(page, "Cancelada pelo professor", 10_000);
+      }
+      const cancelAlert = await page
+        .locator('main [role="alert"]')
+        .first()
+        .innerText()
+        .catch(() => "");
       check(
         cancelledOk,
-        "Aula cancelada e o estado persistido aparece",
+        `Aula cancelada e o estado persistido aparece${cancelAlert ? ` [${cancelAlert.replace(/\s+/g, " ").slice(0, 120)}]` : ""}`,
         cancelledOk ? undefined : (await panelText(page)).slice(0, 200),
       );
       check(
@@ -851,6 +1143,117 @@ async function rescheduleScenario(context, fixture, apiClient) {
   return replacementId;
 }
 
+/**
+ * O professor pede confirmação ao criar (Etapa 7B).
+ *
+ * Passa pelo formulário real: a checkbox só vale alguma coisa se o valor
+ * chegar à RPC, e é isso que se verifica na ficha da aula a seguir.
+ */
+async function teacherRequestsConfirmationScenario(context, apiClient, reservedDays = []) {
+  section("Professor — pedir confirmação ao criar");
+  const page = await signIn(context, ACCOUNTS.teacher);
+
+  await page.goto(`${BASE_URL}/professor/aulas/nova`, { waitUntil: "domcontentloaded" });
+  await page.getByRole("heading", { name: "Nova aula" }).first().waitFor({ timeout: 20_000 });
+
+  const checkbox = page.getByLabel("Pedir confirmação aos participantes");
+  check(
+    (await checkbox.count()) > 0,
+    "O formulário oferece pedir confirmação aos participantes",
+  );
+  check(
+    (await checkbox.first().isChecked()) === false,
+    "A opção nasce desligada: nenhuma aula passa a pedir confirmação por omissão",
+  );
+
+  // Um aluno com saldo, escolhido pelo mesmo critério das outras fixtures.
+  const billable = await billableStudent(apiClient);
+  if (!billable) {
+    check(false, "Existe um aluno com créditos para criar a aula pelo formulário");
+    return;
+  }
+
+  const studentSelect = page.locator('select[name="studentId"]');
+  const hasStudentOption =
+    (await studentSelect.count()) > 0 &&
+    (await studentSelect.locator(`option[value="${billable.studentId}"]`).count()) > 0;
+  if (!hasStudentOption) {
+    check(false, "O aluno com créditos aparece no formulário", "sem opção correspondente");
+    return;
+  }
+
+  await studentSelect.selectOption(billable.studentId);
+  await checkbox.first().check();
+  check(await checkbox.first().isChecked(), "A opção fica marcada depois do clique");
+
+  // Os valores por omissão do formulário são hoje às 18:00, que pode estar fora
+  // do horário declarado. A data e a hora vêm da disponibilidade real.
+  const slot = await findFreeSlot(apiClient, { skipDays: reservedDays });
+  if (!slot) {
+    check(false, "Existe um dia livre dentro da disponibilidade para criar a aula");
+    return;
+  }
+  await page.locator('input[name="date"]').fill(slot.day);
+  await page.locator('input[name="time"]').fill(slot.time);
+
+  // A duração predefinida do professor pode não caber na primeira janela do
+  // dia. A mais curta cabe em qualquer uma.
+  const durationSelect = page.locator('select[name="durationMinutes"]');
+  const shortest = await durationSelect
+    .locator("option")
+    .first()
+    .getAttribute("value")
+    .catch(() => null);
+  if (shortest) await durationSelect.selectOption(shortest);
+
+  const title = `${FIXTURE_PREFIX}via formulario ${Date.now().toString(36)}`;
+  await page.locator('input[name="title"]').fill(title);
+
+  const invalidFields = await page.evaluate(() =>
+    [...document.querySelectorAll("form input, form select, form textarea")]
+      .filter((element) => !element.checkValidity())
+      .map((element) => `${element.name}: ${element.validationMessage}`),
+  );
+  if (invalidFields.length > 0) {
+    console.log(`  · formulário inválido antes de submeter: ${invalidFields.join(" | ")}`);
+  }
+
+  const created = await runLessonOperation(page, /^Criar aula$/, "Criar aula");
+  if (!created) return;
+
+  const createdText = await waitForPanel(page, "Aula criada", 20_000)
+    ? await panelText(page)
+    : await panelText(page);
+  const succeeded = createdText.includes("Aula criada");
+  // A mensagem da Action aparece num alerta no topo do formulário; ler a cauda
+  // do painel mostrava o rodapé informativo e escondia exatamente o motivo.
+  const alertText = await page
+    .locator('[role="alert"], .text-state-danger')
+    .first()
+    .innerText()
+    .catch(() => "");
+  check(
+    succeeded,
+    "A aula é criada pelo formulário",
+    `${alertText} :: ${createdText.replace(/\s+/g, " ").slice(0, 420)}`,
+  );
+  if (!succeeded) return;
+
+  await page.getByRole("link", { name: "Abrir aula" }).first().click();
+  await page.getByRole("heading", { name: "Dados da aula" }).first().waitFor({ timeout: 20_000 });
+  const detail = await panelText(page);
+  check(
+    detail.includes("Confirmação dos participantes: necessária"),
+    "A ficha da aula deixa claro que ela pede confirmação",
+    detail.slice(0, 200),
+  );
+  check(
+    /0 de 1 confirmaram/.test(detail),
+    "A ficha resume quantos já confirmaram",
+    detail.slice(0, 200),
+  );
+}
+
 async function studentScenarios(context) {
   section("Aluno — o que vê e o que não vê");
   const page = await signIn(context, ACCOUNTS.student);
@@ -889,6 +1292,293 @@ async function studentScenarios(context) {
   );
 
   return page;
+}
+
+/**
+ * O aluno responde (Etapa 7B).
+ *
+ * O gate da fase. Prova as quatro coisas que só o browser vê: que a aula que
+ * pede resposta a pede de forma visível, que a aula que NÃO pede não inventa
+ * pergunta nenhuma, que o estado confirmado sobrevive a um reload, e que não há
+ * caminho para desfazer.
+ */
+async function studentConfirmationScenario(page, fixtures, apiClient) {
+  section("Aluno — confirmar participação");
+
+  if (!fixtures) {
+    check(false, "Existem aulas confirmáveis para o aluno responder");
+    return;
+  }
+
+  // Recebe a PÁGINA, não o contexto: a sessão de aluno já foi iniciada, e
+  // voltar a `/entrar` autenticado redireciona para `/aluno` sem formulário.
+  await page.goto(`${BASE_URL}/aluno`, { waitUntil: "domcontentloaded" });
+  await page.getByRole("heading", { name: "Próximas aulas" }).first().waitFor({ timeout: 20_000 });
+
+  const cardByTitle = (title) =>
+    page.locator("li").filter({ hasText: `${FIXTURE_PREFIX}${title}` });
+  const cardById = (lessonId) =>
+    page.locator("li").filter({ has: page.locator(`input[value="${lessonId}"]`) });
+
+  // ── A aula que pede resposta pede-a de forma inequívoca ──
+  const confirmCard = cardByTitle(fixtures.titles.confirmable).first();
+  const confirmCardVisible = (await confirmCard.count()) > 0;
+  check(confirmCardVisible, "A aula que pede confirmação aparece na área do aluno");
+  if (!confirmCardVisible) return;
+
+  const confirmButton = confirmCard.getByRole("button", { name: /Confirmar que vou/ });
+  check(
+    (await confirmButton.count()) > 0,
+    "O botão diz 'Confirmar que vou', e não 'confirmar presença'",
+  );
+
+  const homeText = await panelText(page);
+  check(
+    !/confirmar presen[çc]a/i.test(homeText),
+    "A área do aluno nunca chama RSVP de presença",
+  );
+
+  // ── A aula que NÃO pede resposta não inventa pergunta ──
+  //
+  // `participation_status` e `invited` nessas aulas tambem: sem este teste,
+  // qualquer aula normal passaria a mostrar "por responder".
+  const plainCard = cardByTitle(fixtures.titles.plain).locator('button');
+  check(
+    (await plainCard.count()) === 0,
+    "Uma aula que não pede confirmação não mostra pedido nenhum",
+  );
+
+  // ── Confirmar ──
+  const handle = await confirmButton.first().elementHandle();
+  await confirmButton.first().click();
+  await waitForIdle(page, handle, "Confirmar que vou");
+
+  const confirmedAppeared = await waitForPanel(page, "Participação confirmada", 20_000);
+  check(confirmedAppeared, "A UI mostra 'Participação confirmada' depois de submeter");
+
+  // ── O estado sobrevive ao reload, e não há como desfazer ──
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.getByRole("heading", { name: "Próximas aulas" }).first().waitFor({ timeout: 20_000 });
+  const afterReload = await panelText(page);
+  check(
+    afterReload.includes("Participação confirmada"),
+    "Recarregar mantém a participação confirmada",
+  );
+
+  const reloadedCard = cardByTitle(fixtures.titles.confirmable).first();
+  check(
+    (await reloadedCard.getByRole("button", { name: /Confirmar que vou/ }).count()) === 0,
+    "Depois de confirmar, o botão desaparece",
+  );
+  check(
+    !/desfazer|cancelar participa|n[aã]o vou/i.test(afterReload),
+    "Não existe caminho para desfazer nem para dizer que não vai",
+  );
+
+  // ── RSVP não é presença, e não mexe em créditos ──
+  const { data: participantRows } = await apiClient
+    .from("teacher_lesson_participant_credit_records")
+    .select("status, attendance_status, billing_status, credits_reserved, credits_consumed")
+    .eq("lesson_id", fixtures.confirmable);
+  const participant = participantRows?.[0];
+  check(
+    participant?.status === "confirmed" && participant?.attendance_status === null,
+    "A confirmação escreve RSVP e deixa a presença por registar",
+    `status ${participant?.status} · attendance ${participant?.attendance_status}`,
+  );
+  check(
+    participant?.billing_status === "reserved" &&
+      participant?.credits_reserved > 0 &&
+      participant?.credits_consumed === 0,
+    "Confirmar não consome nem liberta créditos",
+  );
+
+  // ── Recorrência: uma ocorrência de cada vez ──
+  if (fixtures.seriesIds.length === 2) {
+    const [firstOccurrence, secondOccurrence] = fixtures.seriesIds;
+    const seriesCard = cardById(firstOccurrence).first();
+    if ((await seriesCard.count()) > 0) {
+      const seriesButton = seriesCard.getByRole("button", { name: /Confirmar que vou/ });
+      const seriesHandle = await seriesButton.first().elementHandle();
+      await seriesButton.first().click();
+      await waitForIdle(page, seriesHandle, "Confirmar ocorrência");
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await page
+        .getByRole("heading", { name: "Próximas aulas" })
+        .first()
+        .waitFor({ timeout: 20_000 });
+
+      const otherCard = cardById(secondOccurrence).first();
+      check(
+        (await otherCard.getByRole("button", { name: /Confirmar que vou/ }).count()) > 0,
+        "Confirmar uma ocorrência deixa as outras por responder",
+      );
+      const seriesText = await panelText(page);
+      check(
+        !/confirmar todas|confirmar a s[ée]rie/i.test(seriesText),
+        "Não existe 'confirmar toda a série'",
+      );
+    } else {
+      check(false, "A série confirmável aparece na área do aluno");
+    }
+  } else {
+    check(false, "A série confirmável foi criada com duas ocorrências");
+  }
+
+  // ── Privacidade ──
+  const markup = await page.content();
+  const leaks = [
+    "confirmed_at",
+    "student_package_id",
+    "teacher_id",
+    "organization_id",
+    "private_notes",
+    "reschedule_reason",
+  ].filter((token) => markup.includes(token));
+  check(leaks.length === 0, "A confirmação não trouxe campos privados para o HTML", leaks.join(", "));
+}
+
+/**
+ * Reagendar preserva a resposta (política da 7A, vista pelo aluno).
+ */
+async function studentConfirmationSurvivesRescheduleScenario(browser, fixtures, apiClient) {
+  section("Aluno — a resposta sobrevive ao reagendamento");
+
+  if (!fixtures?.forReschedule) {
+    check(false, "Existe uma aula confirmável reservada para o reagendamento");
+    return;
+  }
+
+  const studentContext = await browser.newContext();
+  const studentPage = await signIn(studentContext, ACCOUNTS.student);
+  await studentPage.goto(`${BASE_URL}/aluno`, { waitUntil: "domcontentloaded" });
+  await studentPage
+    .getByRole("heading", { name: "Próximas aulas" })
+    .first()
+    .waitFor({ timeout: 20_000 });
+
+  const card = studentPage
+    .locator("li")
+    .filter({ hasText: `${FIXTURE_PREFIX}${fixtures.titles.forReschedule}` })
+    .first();
+  if ((await card.count()) === 0) {
+    check(false, "A aula a reagendar aparece na área do aluno");
+    await studentContext.close();
+    return;
+  }
+
+  const button = card.getByRole("button", { name: /Confirmar que vou/ });
+  const handle = await button.first().elementHandle();
+  await button.first().click();
+  await waitForIdle(studentPage, handle, "Confirmar antes de reagendar");
+  check(
+    await waitForPanel(studentPage, "Participação confirmada", 20_000),
+    "O aluno confirma antes de a aula ser movida",
+  );
+
+  // O professor move a aula pelo contrato oficial, com a sessão dele.
+  const { data: current } = await apiClient
+    .from("teacher_lesson_schedule_records")
+    .select("id, starts_at, ends_at, duration_minutes")
+    .eq("id", fixtures.forReschedule)
+    .maybeSingle();
+  // O destino sai da disponibilidade real, e não de "mais sete dias": somar
+  // dias a cegas cai fora do horário do professor tantas vezes como dentro.
+  const destination = await findFreeSlot(apiClient, {
+    durationMinutes: current.duration_minutes,
+  });
+  if (!destination) {
+    check(false, "Existe um horário livre para mover a aula confirmada");
+    await studentContext.close();
+    return;
+  }
+  const movedStart = lisbonCivilToInstant(destination.day, destination.time);
+  const { data: replacementId, error: rescheduleError } = await apiClient.rpc("reschedule_lesson", {
+    p_lesson_id: fixtures.forReschedule,
+    p_starts_at: movedStart.toISOString(),
+    p_ends_at: new Date(movedStart.getTime() + current.duration_minutes * 60_000).toISOString(),
+    p_reason: "Fixture 7B: mover uma aula ja confirmada",
+    p_location_id: null,
+    p_location_resource_id: null,
+    p_idempotency_key: randomUUID(),
+  });
+  if (rescheduleError || !replacementId) {
+    check(false, "O professor consegue reagendar a aula confirmada", rescheduleError?.message);
+    await studentContext.close();
+    return;
+  }
+
+  await studentPage.reload({ waitUntil: "domcontentloaded" });
+  await studentPage
+    .getByRole("heading", { name: "Próximas aulas" })
+    .first()
+    .waitFor({ timeout: 20_000 });
+
+  // A substituta herda o título da original, e uma participação confirmada não
+  // renderiza formulário — por isso o cartão é encontrado pelo título.
+  const replacementCard = studentPage
+    .locator("li")
+    .filter({ hasText: `${FIXTURE_PREFIX}${fixtures.titles.forReschedule}` })
+    .first();
+  const replacementVisible = (await replacementCard.count()) > 0;
+  const replacementText = replacementVisible ? await replacementCard.innerText() : "";
+  check(
+    replacementVisible && replacementText.includes("Participação confirmada"),
+    "A aula reagendada continua com a participação confirmada",
+    replacementText.slice(0, 120),
+  );
+  check(
+    replacementVisible &&
+      (await replacementCard.getByRole("button", { name: /Confirmar que vou/ }).count()) === 0,
+    "O aluno não é obrigado a confirmar outra vez",
+  );
+
+  await studentContext.close();
+}
+
+/**
+ * A área do aluno no telemóvel, com o RSVP presente.
+ */
+async function mobileStudentConfirmationScenario(browser) {
+  section("Telemóvel — área do aluno a 390×844");
+
+  const context = await browser.newContext({ viewport: { width: 390, height: 844 } });
+  const page = await signIn(context, ACCOUNTS.student);
+
+  await page.goto(`${BASE_URL}/aluno`, { waitUntil: "domcontentloaded" });
+  await page.getByRole("heading", { name: "Próximas aulas" }).first().waitFor({ timeout: 20_000 });
+
+  const overflow = await page.evaluate(
+    () => document.documentElement.scrollWidth > window.innerWidth,
+  );
+  check(!overflow, "Sem scroll horizontal na área do aluno a 390px");
+
+  const small = await page.evaluate(() =>
+    [...document.querySelectorAll("main button, main a, main input")]
+      .filter((element) => element.offsetParent !== null)
+      .map((element) => element.getBoundingClientRect().height)
+      .filter((height) => height < 43.5).length,
+  );
+  check(small === 0, "Alvos de toque adequados na área do aluno", `${small} abaixo`);
+
+  const confirmedLabel = page.getByText("Participação confirmada").first();
+  if ((await confirmedLabel.count()) > 0) {
+    const legible = await confirmedLabel.evaluate((element) => {
+      const rect = element.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && rect.right <= window.innerWidth + 1;
+    });
+    check(legible, "O estado confirmado fica legível dentro do ecrã");
+  } else {
+    check(false, "Existe uma participação confirmada visível no telemóvel");
+  }
+
+  await page.goto(`${BASE_URL}/aluno/calendario`, { waitUntil: "domcontentloaded" });
+  const calendarOverflow = await page.evaluate(
+    () => document.documentElement.scrollWidth > window.innerWidth,
+  );
+  check(!calendarOverflow, "O calendário do aluno continua utilizável a 390px");
+
+  await context.close();
 }
 
 async function mobileScenario(browser, lessonId) {
@@ -1035,6 +1725,18 @@ async function main() {
     await teacherScenarios(teacherContext, lessons);
     await teacherContext.close();
 
+    const confirmationTeacherContext = await browser.newContext();
+    confirmationTeacherContext.on("page", (page) => {
+      page.on("console", (message) => {
+        if (message.type() === "error") consoleErrors.push(message.text().slice(0, 160));
+      });
+      page.on("pageerror", (error) => consoleErrors.push(error.message.slice(0, 160)));
+    });
+    await teacherRequestsConfirmationScenario(confirmationTeacherContext, lessons.client, [
+      lessons.reschedulable?.targetDay,
+    ]);
+    await confirmationTeacherContext.close();
+
     const rescheduleContext = await browser.newContext();
     rescheduleContext.on("page", (page) => {
       page.on("console", (message) => {
@@ -1051,8 +1753,22 @@ async function main() {
 
     // Contexto novo por papel: mais barato e mais fiável do que fazer logout.
     const studentContext = await browser.newContext();
-    await studentScenarios(studentContext);
+    studentContext.on("page", (page) => {
+      page.on("console", (message) => {
+        if (message.type() === "error") consoleErrors.push(message.text().slice(0, 160));
+      });
+      page.on("pageerror", (error) => consoleErrors.push(error.message.slice(0, 160)));
+    });
+    const studentPage = await studentScenarios(studentContext);
+    await studentConfirmationScenario(studentPage, lessons.confirmation, lessons.client);
     await studentContext.close();
+
+    await studentConfirmationSurvivesRescheduleScenario(
+      browser,
+      lessons.confirmation,
+      lessons.client,
+    );
+    await mobileStudentConfirmationScenario(browser);
 
     await mobileScenario(browser, lessons.operable ?? lessons.cancellable);
     await mobileRescheduleScenario(browser, replacementId);

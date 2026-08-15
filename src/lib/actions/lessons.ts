@@ -2,6 +2,7 @@
 
 
 import {
+  authorizeActiveStudent,
   authorizeActiveTeacher,
   persistenceState,
   type TeacherManagementActionState,
@@ -13,6 +14,7 @@ import { createSupabaseServerClient } from "@/lib/supabase/server";
 import {
   LESSON_ATTENDANCE_FIELDS,
   LESSON_CANCEL_FIELDS,
+  LESSON_CONFIRM_PARTICIPATION_FIELDS,
   LESSON_CREATE_FIELDS,
   LESSON_COMPLETE_FIELDS,
   LESSON_PARTICIPANT_CANCEL_FIELDS,
@@ -20,6 +22,7 @@ import {
   LESSON_UPDATE_FIELDS,
   lessonAttendanceSchema,
   lessonCancelSchema,
+  lessonConfirmParticipationSchema,
   lessonCompleteSchema,
   lessonCreateSchema,
   lessonParticipantCancelSchema,
@@ -27,6 +30,7 @@ import {
   lessonUpdateSchema,
   readLessonAttendanceFormData,
   readLessonCancelFormData,
+  readLessonConfirmParticipationFormData,
   readLessonCompleteFormData,
   readLessonCreateFormData,
   readLessonParticipantCancelFormData,
@@ -143,6 +147,10 @@ export async function createLessonAction(
       p_notes_for_students: parsed.data.notesForStudents,
       p_private_notes: parsed.data.privateNotes,
       p_idempotency_key: parsed.data.idempotencyKey,
+      // Fica na aula desde o momento em que ela nasce. A 7A não abriu caminho
+      // para o ligar depois: mudar isto numa aula já criada obrigaria a decidir
+      // o que fazer com as respostas que já existem.
+      p_requires_confirmation: parsed.data.requiresConfirmation,
     };
 
     if (parsed.data.recurrenceMode === "weekly") {
@@ -320,6 +328,66 @@ export async function rescheduleLessonAction(
     };
   } catch (error) {
     return persistenceState("Erro inesperado ao reagendar uma aula.", error);
+  }
+}
+
+/**
+ * O aluno confirma a SUA participação (Etapa 7B).
+ *
+ * RSVP, não presença. Responde a "vou a esta aula", nunca a "estive nesta
+ * aula" — e por isso não toca em `attendance` nem em créditos. Quem regista a
+ * presença factual continua a ser o professor, depois da aula.
+ *
+ * Recebe apenas a aula: aluno e participação saem da sessão dentro do
+ * PostgreSQL. Como em toda a Fase 6B.2, a Action responde sozinha — sem
+ * `revalidatePath()` e sem `redirect()` — e o repintar é pedido a seguir pelo
+ * cliente.
+ */
+export async function confirmLessonParticipationAction(
+  _previousState: TeacherManagementActionState,
+  formData: FormData,
+): Promise<TeacherManagementActionState> {
+  void _previousState;
+
+  const extraFields = unexpectedLessonFields(formData, LESSON_CONFIRM_PARTICIPATION_FIELDS);
+  if (extraFields.length > 0) return unexpectedFieldsState(extraFields);
+
+  const parsed = lessonConfirmParticipationSchema.safeParse(
+    readLessonConfirmParticipationFormData(formData),
+  );
+  if (!parsed.success) return validationState(parsed.error);
+
+  const authorization = await authorizeActiveStudent();
+  if (authorization.state) return authorization.state;
+
+  try {
+    const supabase = await createSupabaseServerClient();
+    const { data, error } = await supabase.rpc("confirm_lesson_participation", {
+      p_lesson_id: parsed.data.lessonId,
+    });
+
+    if (error) {
+      return persistenceState(
+        "Falha ao confirmar participação.",
+        error,
+        lessonMessage(
+          error.message,
+          "Não foi possível confirmar a sua participação. Tente novamente.",
+        ),
+      );
+    }
+
+    // A RPC devolve `false` quando já estava confirmada. Para quem carregou no
+    // botão o estado final é o mesmo, e distinguir os dois casos só serviria
+    // para transformar um retry numa mensagem de erro.
+    void data;
+    return {
+      status: "success",
+      message: "Participação confirmada.",
+      confirmed: { operation: "participation_confirmed", changed: data !== false },
+    };
+  } catch (error) {
+    return persistenceState("Erro inesperado ao confirmar participação.", error);
   }
 }
 

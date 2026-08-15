@@ -448,7 +448,7 @@ A estrutura fica pronta para notificações push (Fase 8).
 | **4** | Pacotes: modelos, atribuição, ajustes, painel de saldo | **Concluído** — Etapas 1A, 1B, 1C, 1D e 1E validadas |
 | **5** | Calendário e criação de aulas, com reserva de créditos | **Concluído** — disponibilidade, calendário, clubes, locais, recursos, criação/edição de aulas, conflitos atómicos, reserva atómica de créditos, recorrência semanal segura e revisão integrada |
 | **6** | Cancelamento, reagendamento, presenças, histórico | **Concluída** — 6A/6B: presença, falta/no-show, conclusão normal/mista e cancelamentos com `reserved -> available` ou `reserved -> used` seguros. 6C.1/1A/1B: contrato transacional de reagendamento, chave de idempotência obrigatória e concorrência real provada. 6C.2: interface operacional, com editar conteúdo e reagendar colocação separados no PostgreSQL |
-| **7** | Área do aluno: aulas, saldo, confirmação da participação | **7A concluída** — contrato de confirmação individual: `requires_confirmation` deixou de estar dormente, a escrita direta na resposta do aluno foi fechada, e RSVP ficou separado de presença. Falta a 7B: interfaces de pedir e de responder |
+| **7** | Área do aluno: aulas, saldo, confirmação da participação | **Concluída** — 7A: contrato de confirmação individual, com `requires_confirmation` ligado, escrita direta fechada e RSVP separado de presença. 7B: o professor pede ao criar, o aluno responde pela própria participação, provado em browser e mobile |
 | **8** | Notificações, lembretes e expiração agendada | **Planeado** |
 | **9** | Supabase real, concorrência, acessibilidade, deployment | **Parcialmente concluído** — Supabase/Auth reais validados até à 7A (506 verificações, repetíveis em execuções consecutivas); browser automatizado com sessão GoTrue real, em dev e em build de produção; deployment pendente |
 
@@ -1218,6 +1218,24 @@ cancelar primeiro  → invited → declined/released → confirmação encontra 
 O estado final é o mesmo nos dois: `declined`, `released`, `credits_reserved = 0`, `declined_at` carimbado pelo cancelamento. A confirmação nunca sobrevive como estado final, nunca cria presença e nunca escreve no livro-razão — a única movimentação é a libertação do cancelamento, exatamente uma. O colega de turma e o pacote dele ficam intocados, e a aula continua operacional por ter outro participante ativo.
 
 Na corrida com o reagendamento, a suite deixou de se contentar com "a substituta existe": verifica o estado da participação **na substituta**, e exige que ele corresponda a quem venceu. Se a confirmação foi aceite, a substituta tem de estar `confirmed` com `confirmed_at` preenchido; se foi recusada porque o reagendamento chegou primeiro, tem de estar `invited` sem `confirmed_at`. O par impossível — confirmação aceite e substituta `invited` — significaria perder a resposta do aluno durante a transferência, e é precisamente o que a asserção anterior deixava passar.
+
+### Concluído na Etapa 7B — as duas interfaces
+
+**O professor pede ao criar.** Uma checkbox no formulário de criação, desligada por omissão. Não existe forma de a mudar numa aula já criada: fazê-lo obrigaria a decidir o destino das respostas existentes, e isso não está decidido.
+
+**O aluno responde pela sua participação.** `confirmLessonParticipationAction` recebe apenas `lessonId`; aluno e participação saem da sessão dentro do PostgreSQL. A Action mantém o contrato da 6B.2 — sem `revalidatePath()`, sem `redirect()`, sem Route Handler — e o `router.refresh()` acontece depois de o sucesso já estar à vista.
+
+**A palavra escolhida é "Confirmar que vou".** "Confirmar presença" leria como o registo factual do professor, e a distinção entre as duas coisas é precisamente o que a 7A protegeu no esquema. Há uma verificação de browser que falha se a área do aluno alguma vez disser "confirmar presença".
+
+**Uma aula que não pede confirmação não mostra pedido nenhum.** `invited` é também o estado inicial dessas aulas; o componente devolve `null` quando `requires_confirmation` é falso, e o browser prova-o com uma aula criada de propósito sem pedido.
+
+**Alcance na home.** A lista curta mostra 8 aulas. A secção "Aulas que pedem confirmação" apanha as restantes — e mostra também as **já confirmadas**. A primeira versão filtrava só as pendentes, e a aula desaparecia no instante em que era confirmada: quem carregava no botão ficava sem ver o resultado. Foi apanhado pelo teste de recarregar a página.
+
+#### Uma correção no guião de browser, encontrada aqui
+
+Duas verificações da 6B — concluir e cancelar — alternavam entre verde e vermelho na build de produção. A causa não era o produto: elas afirmam ver o estado **persistido**, mas liam-no do repintar que o cliente pede a seguir à mutação (`router.refresh()`). Quando esse repintar chegava tarde, a verificação falhava com a base de dados já correta. Passaram a reler a página — que é o que a afirmação delas sempre significou. As três execuções seguintes, duas em produção e uma em desenvolvimento, ficaram verdes.
+
+**Ainda não implementado depois da 7B:** dizer que não vai, self-cancel, reconfirmação obrigatória depois de reagendar, confirmação de série inteira, lista de espera, janela e multas, e notificações. Nenhum email, push ou lembrete é enviado.
 
 **Ainda não implementado na 7A:** interface de pedir confirmação, interface de responder, decline/self-cancel do aluno, janela e multas, lista de espera, confirmação de série inteira e notificações.
 

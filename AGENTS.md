@@ -548,7 +548,23 @@ Quando a aula já tem presenças registadas, o caminho não é oferecido e a raz
 
 **Projeção:** `student_lesson_records` ganhou apenas `requires_confirmation`. `confirmed_at` ficou de fora — a interface precisa de saber se já respondeu, e isso está em `participation_status`.
 
-**Ainda não implementado (7B):** interface do professor para pedir confirmação, interface do aluno para responder, e o gate de browser/mobile.
+### As duas interfaces (Etapa 7B)
+
+**O professor pede ao criar.** A checkbox "Pedir confirmação aos participantes" vive no formulário de criação e nasce **desligada** — nenhuma aula existente passou a pedir resposta. Numa série semanal marcada, o formulário avisa que cada aula é confirmada separadamente.
+
+Não existe forma de ligar ou desligar o pedido numa aula **já criada**, e é deliberado: mudá-lo obrigaria a decidir o que acontece às respostas já dadas, se desligar as apaga, se reativar volta a perguntar, e como isso interage com o reagendamento. Nada disso está decidido.
+
+**A palavra importa.** O botão do aluno diz **"Confirmar que vou"**, nunca "Confirmar presença" — a presença é o registo factual que o professor faz depois da aula. Depois de responder, o cartão mostra "Participação confirmada", sem caminho para desfazer. Uma verificação de browser falha se a área do aluno alguma vez disser "confirmar presença".
+
+**Uma aula que não pede confirmação não mostra nada.** `participation_status` é `invited` também nessas aulas; mostrar "por responder" inventaria uma pergunta que ninguém fez. `StudentLessonConfirmation` devolve `null` quando `requires_confirmation` é falso, e também quando a participação é `declined` ou `removed`.
+
+**Alcance.** A home mostra as próximas 8 aulas. A secção "Aulas que pedem confirmação" mostra as que pedem resposta e ficaram de fora dessa lista — **incluindo as já confirmadas**, porque filtrar só as pendentes fazia a aula desaparecer no instante em que era confirmada, e quem carregou no botão ficava sem ver o resultado.
+
+**O professor vê o pedido e o resumo** na ficha da aula: "Confirmação dos participantes: necessária" e "X de Y confirmaram", derivados dos dados que a página já lê. O estado por participante continua no painel de presença, que já mostrava `PARTICIPANT_STATUS_META`. Não há projeção nova.
+
+**A Action mantém o contrato da 6B.2:** sem `revalidatePath()`, sem `redirect()`, sem Route Handler. Responde sozinha, o cartão passa a confirmado com o que o servidor devolveu, e o `router.refresh()` vem depois — se demorar, o estado confirmado já está à vista.
+
+**Ainda não implementado:** dizer que não vai, self-cancel, reconfirmação obrigatória depois de reagendar, confirmar a série inteira, lista de espera e notificações. **Nenhum email, push ou lembrete é enviado** — a interface não o promete em lado nenhum.
 
 ### Ao criar uma tabela nova
 
@@ -898,7 +914,7 @@ Interface em `/professor/clubes/[id]/calendario`, com filtro por professor no UR
 
 **Não implementado:** aulas, participantes, locais, campos, recursos, conflitos, reservas e créditos. Os únicos estados são disponível e indisponível — não escrever "ocupado", "reservado", "lotado", "vagas" ou "conflito", porque nada disso existe ainda para ser verdade.
 
-Ordem atual: Fase 6 concluída. Fase 7A fechada (backend da confirmação individual); segue a 7B, com as interfaces de pedir e responder.
+Ordem atual: Fases 6 e 7 concluídas. Segue a Fase 8: notificações, lembretes e expiração agendada.
 
 ### `src/types/database.ts`
 
@@ -935,7 +951,7 @@ Não existe um comando de formatação separado. Use `npm run lint:fix` apenas p
 | 4 | Interfaces de modelos, atribuição, ajustes e saldos | **Concluído** — Etapas 1A, 1B, 1C, 1D e 1E validadas com Auth/PostgREST reais e browser desktop/mobile |
 | 5 | Calendário e criação de aulas com reserva | **Concluído** — disponibilidade, projeção segura, refinamento visual, clubes/membros, calendário partilhado, locais com moradas manuais, campos/salas/áreas, criação/edição de aulas, conflitos atómicos, reserva atómica de créditos, recorrência semanal segura e revisão integrada |
 | 6 | Cancelamento, reagendamento, presenças e histórico | **Concluído** — 6A/6B: presença, falta/no-show, conclusão normal/mista, cancelamento de aula e de participação com `reserved -> available` ou `reserved -> used` seguros. 6C.1/6C.1A/6C.1B: contrato transacional de reagendamento, chave de idempotência obrigatória em namespace próprio e sete corridas de concorrência com JWTs reais. 6C.2: interface operacional, com a fronteira entre editar conteúdo e reagendar colocação imposta no PostgreSQL |
-| 7 | Área do aluno: aulas, créditos e confirmação | **Em curso** — 7A: contrato de confirmação individual, com `requires_confirmation` ligado, escrita direta na resposta fechada e RSVP separado de presença. Falta a 7B: interfaces de pedir e responder |
+| 7 | Área do aluno: aulas, créditos e confirmação | **Concluído** — 7A: contrato de confirmação individual, com `requires_confirmation` ligado, escrita direta na resposta fechada e RSVP separado de presença. 7B: o professor pede confirmação ao criar, o aluno responde pela sua própria participação, validado em browser e mobile |
 | 8 | Notificações, lembretes e expiração agendada | **Planeado** |
 | 9 | Supabase real, concorrência, acessibilidade e deployment | **Parcialmente concluído** — RLS em PGlite e validação real das Fases 4, 5, 6A e 6B feitas; concorrência real de aulas/créditos/recorrência/conclusão coberta; deployment pendente |
 

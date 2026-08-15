@@ -10,6 +10,7 @@ import {
   WEEKLY_RECURRENCE_LIMITS,
 } from "@/lib/domain/lesson-scheduling";
 import {
+  formChecked,
   formString,
   normalizeOptionalInteger,
   normalizeOptionalMultiline,
@@ -146,6 +147,13 @@ export const lessonCreateSchema = requireLocationForResource(
           .default("none"),
       ),
       recurrenceCount,
+      // Uma checkbox ausente NÃO envia campo. `formChecked()` traduz a presença
+      // em booleano antes de chegar aqui, por isso o schema recebe sempre um
+      // booleano de verdade — e um valor forjado que não seja `on`/`true`/`1`
+      // resolve para `false`, nunca para `true` por acidente.
+      requiresConfirmation: z.boolean({
+        error: "A opção de pedir confirmação é inválida.",
+      }),
     })
     // XOR real, e não "pelo menos um": uma aula com aluno E turma seria duas
     // aulas diferentes a fingir que são uma.
@@ -261,6 +269,7 @@ export const LESSON_CREATE_FIELDS = [
   "idempotencyKey",
   "recurrenceMode",
   "recurrenceCount",
+  "requiresConfirmation",
 ] as const;
 
 export const LESSON_UPDATE_FIELDS = [
@@ -305,6 +314,7 @@ export function readLessonCreateFormData(formData: FormData) {
     idempotencyKey: formString(formData, "idempotencyKey"),
     recurrenceMode: formString(formData, "recurrenceMode"),
     recurrenceCount: formString(formData, "recurrenceCount"),
+    requiresConfirmation: formChecked(formData, "requiresConfirmation"),
   };
 }
 
@@ -360,6 +370,17 @@ export const lessonAttendanceSchema = z.strictObject({
 
 export type LessonAttendanceInput = z.infer<typeof lessonAttendanceSchema>;
 
+/**
+ * Confirmação da participação pelo aluno (Etapa 7B).
+ *
+ * Só a aula. O aluno e a participação são derivados da sessão pelo PostgreSQL —
+ * aceitar `studentId` ou `participationId` daqui deixaria alguém responder pela
+ * pessoa ao lado, e nenhum dos dois é preciso.
+ */
+export const lessonConfirmParticipationSchema = lessonIdSchema;
+
+export const LESSON_CONFIRM_PARTICIPATION_FIELDS = ["lessonId"] as const;
+
 export const lessonCompleteSchema = lessonIdSchema;
 export const lessonCancelSchema = lessonIdSchema;
 export const lessonParticipantCancelSchema = z.strictObject({
@@ -394,6 +415,7 @@ export function readLessonCompleteFormData(formData: FormData) {
 }
 
 export const readLessonCancelFormData = readLessonCompleteFormData;
+export const readLessonConfirmParticipationFormData = readLessonCompleteFormData;
 
 export function readLessonParticipantCancelFormData(formData: FormData) {
   return {

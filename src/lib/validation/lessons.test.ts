@@ -13,6 +13,8 @@ import {
   lessonIdSchema,
   lessonParticipantCancelSchema,
   LESSON_RESCHEDULE_FIELDS,
+  LESSON_CONFIRM_PARTICIPATION_FIELDS,
+  lessonConfirmParticipationSchema,
   lessonRescheduleSchema,
   lessonUpdateSchema,
   readLessonAttendanceFormData,
@@ -35,6 +37,7 @@ const KEY = "88888888-8888-4888-8888-888888888888";
 const PARTICIPANT = "99999999-9999-4999-8999-999999999999";
 
 const base = {
+  requiresConfirmation: false,
   sportId: SPORT,
   date: "2026-08-24",
   time: "18:00",
@@ -65,6 +68,7 @@ describe("lessonCreateSchema", () => {
       idempotencyKey: KEY,
       recurrenceMode: "none",
       recurrenceCount: null,
+      requiresConfirmation: false,
     });
   });
 
@@ -283,6 +287,102 @@ describe("lessonUpdateSchema", () => {
     for (const field of ["contextKind", "clubOrganizationId", "sportId", "status"]) {
       expect(lessonUpdateSchema.safeParse({ ...update, [field]: "club" }).success).toBe(false);
     }
+  });
+});
+
+describe("lessonCreateSchema · pedido de confirmação", () => {
+  it("aceita pedir e não pedir confirmação", () => {
+    expect(lessonCreateSchema.parse({ ...base, requiresConfirmation: true }).requiresConfirmation).toBe(
+      true,
+    );
+    expect(
+      lessonCreateSchema.parse({ ...base, requiresConfirmation: false }).requiresConfirmation,
+    ).toBe(false);
+  });
+
+  // Uma checkbox ausente não envia campo. `readLessonCreateFormData` traduz a
+  // ausência em `false` antes do schema, e é isso que este teste fixa.
+  it("uma checkbox ausente vale false", () => {
+    const formData = new FormData();
+    formData.set("sportId", SPORT);
+    formData.set("date", "2026-08-24");
+    formData.set("time", "18:00");
+    formData.set("durationMinutes", "60");
+    formData.set("title", "Beach Tennis · Ana");
+    formData.set("mode", "student");
+    formData.set("studentId", STUDENT);
+    formData.set("idempotencyKey", KEY);
+
+    const read = readLessonCreateFormData(formData);
+    expect(read.requiresConfirmation).toBe(false);
+    expect(lessonCreateSchema.parse(read).requiresConfirmation).toBe(false);
+  });
+
+  it("uma checkbox marcada vale true", () => {
+    const formData = new FormData();
+    formData.set("requiresConfirmation", "on");
+    expect(readLessonCreateFormData(formData).requiresConfirmation).toBe(true);
+  });
+
+  // O que o browser envia numa checkbox é `on`. Qualquer outra coisa é lixo, e
+  // lixo nunca pode virar `true` em silêncio — seria pedir confirmação a alunos
+  // sem o professor ter escolhido isso.
+  it("um valor malformado não vira true", () => {
+    for (const value of ["", "yes", "sim", "0", "off", "verdadeiro"]) {
+      const formData = new FormData();
+      formData.set("requiresConfirmation", value);
+      expect(readLessonCreateFormData(formData).requiresConfirmation).toBe(false);
+    }
+  });
+
+  it("não aceita um booleano fora do formato", () => {
+    expect(
+      lessonCreateSchema.safeParse({ ...base, requiresConfirmation: "talvez" }).success,
+    ).toBe(false);
+  });
+});
+
+describe("lessonConfirmParticipationSchema", () => {
+  it("aceita apenas a aula", () => {
+    expect(lessonConfirmParticipationSchema.parse({ lessonId: LESSON })).toEqual({
+      lessonId: LESSON,
+    });
+  });
+
+  it("recusa um identificador inválido", () => {
+    expect(lessonConfirmParticipationSchema.safeParse({ lessonId: "aula-1" }).success).toBe(false);
+  });
+
+  // O aluno e a participação saem da sessão dentro do PostgreSQL. Aceitá-los
+  // daqui deixaria alguém responder pela pessoa ao lado.
+  it("não aceita aluno, participação, estado nem presença", () => {
+    for (const field of [
+      "studentId",
+      "participationId",
+      "participantId",
+      "status",
+      "confirmedAt",
+      "attendanceStatus",
+      "studentPackageId",
+      "teacherId",
+      "organizationId",
+    ]) {
+      expect(
+        lessonConfirmParticipationSchema.safeParse({ lessonId: LESSON, [field]: STUDENT }).success,
+      ).toBe(false);
+    }
+  });
+
+  it("assinala campos que o formulário não devia enviar", () => {
+    const formData = new FormData();
+    formData.set("lessonId", LESSON);
+    formData.set("studentId", STUDENT);
+    formData.set("attendanceStatus", "present");
+
+    expect(unexpectedLessonFields(formData, LESSON_CONFIRM_PARTICIPATION_FIELDS).sort()).toEqual([
+      "attendanceStatus",
+      "studentId",
+    ]);
   });
 });
 

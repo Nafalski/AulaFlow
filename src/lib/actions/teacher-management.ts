@@ -32,7 +32,8 @@ export type LessonOperationOutcome =
   | { operation: "lesson_cancelled"; changed: boolean }
   | { operation: "participation_cancelled"; changed: boolean }
   | { operation: "lesson_completed"; changed: boolean }
-  | { operation: "lesson_rescheduled"; changed: boolean };
+  | { operation: "lesson_rescheduled"; changed: boolean }
+  | { operation: "participation_confirmed"; changed: boolean };
 
 type TeacherAuthorization =
   | { user: SessionUser & { teacherId: string }; state?: never }
@@ -72,6 +73,60 @@ export async function authorizeActiveTeacher(): Promise<TeacherAuthorization> {
     return { user: user as SessionUser & { teacherId: string } };
   } catch (error) {
     console.error("[AulaFlow] Falha ao validar o professor numa ação da Fase 3.", error);
+    return {
+      state: {
+        status: "error",
+        message: "Não foi possível validar a sua sessão. Tente novamente dentro de instantes.",
+      },
+    };
+  }
+}
+
+type StudentAuthorization =
+  | { user: SessionUser & { studentId: string }; state?: never }
+  | { user?: never; state: TeacherManagementActionState };
+
+/**
+ * A mesma guarda, do lado do aluno (Etapa 7B).
+ *
+ * `studentId` só existe depois de a conta ser ligada à ficha criada pelo
+ * professor. Sem ligação não há participação para confirmar, e o PostgreSQL
+ * recusaria de qualquer forma — mas a mensagem daqui explica porquê.
+ */
+export async function authorizeActiveStudent(): Promise<StudentAuthorization> {
+  try {
+    const user = await getSessionUser();
+
+    if (!user) {
+      return {
+        state: {
+          status: "error",
+          message: "A sua sessão expirou. Volte a entrar e tente novamente.",
+        },
+      };
+    }
+
+    if (user.profile.role !== "student" || !user.studentId) {
+      return {
+        state: {
+          status: "error",
+          message: "Não tem autorização para efetuar esta operação.",
+        },
+      };
+    }
+
+    if (user.profile.status !== "active") {
+      return {
+        state: {
+          status: "error",
+          message: "A sua conta não está ativa.",
+        },
+      };
+    }
+
+    return { user: user as SessionUser & { studentId: string } };
+  } catch (error) {
+    console.error("[AulaFlow] Falha ao validar o aluno numa ação da Fase 7.", error);
     return {
       state: {
         status: "error",

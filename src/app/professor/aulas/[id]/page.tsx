@@ -1,4 +1,4 @@
-import { ArrowLeft, Building2, CalendarClock, Clock, MapPin, Repeat2 } from "lucide-react";
+import { ArrowLeft, Building2, CalendarCheck, CalendarClock, Clock, MapPin, Repeat2 } from "lucide-react";
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
@@ -40,7 +40,7 @@ export default async function LessonDetailPage({ params }: { params: Promise<{ i
   const [lessonResult, participantsResult] = await Promise.all([
       supabase
       .from("teacher_lesson_schedule_records")
-        .select("id, title, starts_at, ends_at, duration_minutes, status, context_kind, club_organization_id, club_name, sport_name, location_id, location_name, location_resource_id, location_resource_name, group_id, group_name, notes_for_students, private_notes, participant_count, credit_cost, is_recurring, recurrence_frequency, recurrence_occurrence_index, recurrence_occurrence_count")
+        .select("id, title, starts_at, ends_at, duration_minutes, status, requires_confirmation, context_kind, club_organization_id, club_name, sport_name, location_id, location_name, location_resource_id, location_resource_name, group_id, group_name, notes_for_students, private_notes, participant_count, credit_cost, is_recurring, recurrence_frequency, recurrence_occurrence_index, recurrence_occurrence_count")
         .eq("id", parsed.data.lessonId)
         .maybeSingle(),
       supabase
@@ -61,6 +61,15 @@ export default async function LessonDetailPage({ params }: { params: Promise<{ i
   // `reschedule_lesson()` recusa uma aula com presencas registadas. Antecipar
   // aqui evita oferecer um caminho que termina em erro; a autoridade continua a
   // ser a RPC.
+  // Resumo do RSVP a partir do que a página já lê. `declined`/`removed` saem da
+  // conta: quem já não vem não está por responder.
+  const rsvpParticipants = participants.filter(
+    (participant) => participant.status === "invited" || participant.status === "confirmed",
+  );
+  const confirmedCount = rsvpParticipants.filter(
+    (participant) => participant.status === "confirmed",
+  ).length;
+
   const canReschedule =
     isLessonEditable(lesson.status) &&
     !participants.some((participant) => participant.attendance_status !== null);
@@ -137,6 +146,24 @@ export default async function LessonDetailPage({ params }: { params: Promise<{ i
                     )}
                   </div>
                 </div>
+                {lesson.requires_confirmation && (
+                  <div className="flex items-start gap-2">
+                    <CalendarCheck
+                      className="mt-0.5 size-4 shrink-0 text-muted"
+                      aria-hidden="true"
+                    />
+                    <div className="min-w-0">
+                      <dt className="font-semibold text-ink">
+                        Confirmação dos participantes: necessária
+                      </dt>
+                      <dd className="text-muted">
+                        {rsvpParticipants.length > 0
+                          ? `${confirmedCount} de ${rsvpParticipants.length} confirmaram que vão participar.`
+                          : "Ainda não há participantes para responder."}
+                      </dd>
+                    </div>
+                  </div>
+                )}
                 {recurrenceLabel && (
                   <div className="flex items-start gap-2">
                     <Repeat2 className="mt-0.5 size-4 shrink-0 text-muted" aria-hidden="true" />
