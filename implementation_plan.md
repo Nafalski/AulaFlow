@@ -1119,9 +1119,30 @@ A integridade da cadeia também deixou de depender de boa vontade: índices úni
 |---|---|
 | `npm run db:verify` | 836 verificações, incluindo as seis semânticas da chave (mesma intenção, outra original, outro destino, chave de criação, chave nula, namespace separado), preservação de estado `scheduled`/`confirmed`, ausência de GRANT e de policy de escrita em `lessons`, e recusa de uma antecessora forjada |
 | `db:verify:remote` | coluna, índices únicos, constraint de origem, assinatura única e `search_path` fixo de `reschedule_lesson()` |
-| `db:verify:auth` | 435 verificações com JWTs reais, **duas execuções completas consecutivas verdes**, incluindo concorrência real: dois reagendamentos da mesma aula, duas chamadas com a mesma chave, reagendar × cancelar e reagendar × editar, com os saldos verificados depois de cada corrida |
+| `db:verify:auth` | 460 verificações com JWTs reais, **duas execuções completas consecutivas verdes**, com as sete corridas de concorrência listadas abaixo |
 
 A concorrência só é demonstrável no PostgreSQL remoto: o PGlite tem uma única ligação e nunca poderia provar que os locks e a transação aguentam.
+
+#### As sete corridas (6C.1B)
+
+| Corrida | O que fica provado |
+|---|---|
+| reagendar × reagendar (mesma original) | exatamente um transforma; uma única substituta |
+| mesma chave em simultâneo | uma única transformação, quer as duas chamadas devolvam a mesma substituta pelo atalho de idempotência, quer a segunda encontre a original já histórica |
+| reagendar × cancelar | um único estado terminal, nunca os dois |
+| reagendar × editar | estado coerente e soma dos saldos intacta |
+| reagendar × concluir, sem presença | reagendar vence; reserva viaja; zero consumo; zero linha nova no livro-razão |
+| reagendar × concluir, com presença | concluir vence; `reserved → used` exatamente pelo custo; **um** `credit_consumed`; nenhuma substituta órfã |
+| disputa de recurso e conflito de professor | uma única ocupação ativa; o perdedor perde pelo motivo certo; intervalo mínimo continua a valer |
+
+**Nenhuma alteração de SQL foi precisa.** As sete corridas passaram contra o contrato já aplicado — os *advisory locks* por professor e recurso, o `for update` na linha da aula e a exceção da antecessora já estavam corretos. Não se criou migração só para haver migração nesta etapa.
+
+**Porque é que a exceção da antecessora continua segura.** `ensure_lesson_has_no_conflict()` resolve `v_predecessor` a partir de `new.rescheduled_from_id` **e** de `lesson.teacher_id = new.teacher_id`. Ignora, portanto, exatamente uma aula — a origem declarada — e só se for do mesmo professor. Numa disputa entre dois professores, nenhum consegue mascarar a aula do outro; numa disputa entre duas origens do mesmo professor, cada substituta ignora apenas a sua. O caso forjado está coberto em `db:verify`, e a escrita direta em `lessons` continua sem GRANT e sem policy.
+
+#### Duas armadilhas de fixture apanhadas ao fechar esta etapa
+
+- **`cancel_lesson` estava a ser chamada com parâmetros que não existem.** A assinatura real é `cancel_lesson(p_lesson_id uuid)`; a corrida reagendar × cancelar passava também motivo e chave, o lado do cancelamento nunca chegava a correr, e a asserção passava só porque o reagendamento vencia. Uma corrida valida-se pelo estado final, não por quantas promises resolveram.
+- **`db:verify` falhava consoante a hora do dia.** As fixtures operacionais da 6A/6B nascem de `now() + intervalo`; as de escala diária herdavam a hora atual e, à medida que o relógio avançava, deslizavam para cima das datas civis fixas da 6C.1 — a mesma suite passava de manhã e falhava a meio da tarde. As de escala diária passaram a ser ancoradas a uma hora fixa; as de escala horária continuam relativas a `now()`, porque a semântica delas depende disso.
 
 #### Fixtures E2E: durabilidade e repetibilidade
 

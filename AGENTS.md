@@ -480,6 +480,10 @@ Ao reencontrar a chave, a função confirma que a substituta é mesmo **desta** 
 
 **A substituta herda o estado da original.** Uma aula `confirmed` produz uma substituta `confirmed`. Não existe no produto nenhum fluxo de reconfirmação pelo aluno — a Fase 7 é que o traz —, por isso baixar para `scheduled` inventaria um passo que ninguém pode dar.
 
+**A concorrência real está coberta pela via do reagendamento (6C.1B).** Com JWTs reais e chamadas em paralelo: reagendar × reagendar (mesma original), mesma chave em simultâneo, reagendar × cancelar, reagendar × editar, reagendar × concluir, disputa de recurso e conflito de professor com intervalo mínimo. Cada corrida verifica o **estado final** — estado da original, número de substitutas, participação, os três baldes de créditos, livro-razão e histórico —, nunca apenas quantas chamadas devolveram sucesso.
+
+`reschedule_lesson()` e `complete_lesson()` bloqueiam a **mesma linha** de `lessons` com `for update`, por isso serializam. O que as separa não é o lock, é a presença: concluir exige desfecho final para todos os participantes ativos, reagendar recusa se existir qualquer registo de presença. São mutuamente exclusivas por construção, e as duas metades estão testadas.
+
 **Ainda não existe interface** (6C.2), nem reagendamento de série inteira, "esta e futuras" ou self-reschedule do aluno.
 
 ### Ao criar uma tabela nova

@@ -1355,6 +1355,29 @@ try {
     throw new Error(`Disponibilidade do Professor B: ${summarizeError(teacherBRuleError)}`);
   }
 
+  const clubCalendarStrayExceptions = await teacherBClient
+    .from("teacher_availability_exception_records")
+    .select("id")
+    .eq("exception_date", clubCalendarDate)
+    .eq("is_active", true);
+  if (clubCalendarStrayExceptions.error) {
+    throw new Error(
+      `Excecoes na data do calendario do clube: ${summarizeError(clubCalendarStrayExceptions.error)}`,
+    );
+  }
+  for (const stray of clubCalendarStrayExceptions.data ?? []) {
+    const { error: strayError } = await teacherBClient.rpc(
+      "deactivate_teacher_availability_exception",
+      {
+        p_exception_id: stray.id,
+        p_idempotency_key: deterministicUuid(`club-calendar-stray:${stray.id}`),
+      },
+    );
+    if (strayError) {
+      throw new Error(`Limpar excecao na data do clube: ${summarizeError(strayError)}`);
+    }
+  }
+
   const directoryBefore = await teacherClient
     .from("club_calendar_member_directory")
     .select("membership_id, teacher_name, calendar_sharing_enabled, is_self")
@@ -2294,7 +2317,7 @@ try {
     return busy;
   };
 
-  const pickUnusedAvailabilityOffset = async (startOffset, endOffset) => {
+  const pickUnusedAvailabilityOffset = async (startOffset, endOffset, extraBusyDates = null) => {
     const rangeStart = Math.min(startOffset, endOffset);
     const rangeEnd = Math.max(startOffset, endOffset);
     const existing = await teacherClient
@@ -2312,7 +2335,12 @@ try {
     const busyDates = await busyLessonDatesBetween(rangeStart, rangeEnd);
     for (let offset = rangeStart; offset <= rangeEnd; offset += 1) {
       const dateOnly = dateOnlyFromNow(offset);
-      if (!usedDates.has(dateOnly) && !blockedDates.has(dateOnly) && !busyDates.has(dateOnly)) {
+      if (
+        !usedDates.has(dateOnly) &&
+        !blockedDates.has(dateOnly) &&
+        !busyDates.has(dateOnly) &&
+        !(extraBusyDates?.has(dateOnly) ?? false)
+      ) {
         return offset;
       }
     }
@@ -3791,14 +3819,40 @@ try {
   const completeLessonRpc = (client, lessonIdValue) =>
     client.rpc("complete_lesson", { p_lesson_id: lessonIdValue });
 
+  // As aulas de clube do Professor B so podem ser canceladas pela sessao dele.
+  const retireStalePhase6TeacherBLessons = async () => {
+    const staleLessons = await teacherBClient
+      .from("teacher_lesson_schedule_records")
+      .select("id, title, status")
+      .in("status", ["scheduled", "confirmed"])
+      .ilike("title", "Aula E2E 6C%");
+    if (staleLessons.error) {
+      throw new Error(`Limpar fixtures 6C do Professor B: ${summarizeError(staleLessons.error)}`);
+    }
+
+    let retired = 0;
+    for (const staleLesson of staleLessons.data ?? []) {
+      const { error } = await cancelLessonRpc(teacherBClient, staleLesson.id);
+      if (error) {
+        throw new Error(
+          `Cancelar fixture 6C do Professor B ${staleLesson.id}: ${summarizeError(error)}`,
+        );
+      }
+      retired += 1;
+    }
+    if (retired > 0) {
+      ok(`Fixtures 6C do Professor B retiradas (${retired})`);
+    }
+  };
+
   const retireStalePhase6OperationalLessons = async () => {
     const staleLessons = await teacherClient
       .from("teacher_lesson_schedule_records")
       .select("id, title, status")
       .in("status", ["scheduled", "confirmed"])
-      .or("title.ilike.Aula E2E 6A%,title.ilike.Serie E2E 6A%,title.ilike.Aula E2E 6B%,title.ilike.Serie E2E 6B%");
+      .or("title.ilike.Aula E2E 6A%,title.ilike.Serie E2E 6A%,title.ilike.Aula E2E 6B%,title.ilike.Serie E2E 6B%,title.ilike.Aula E2E 6C%");
     if (staleLessons.error) {
-      throw new Error(`Limpar fixtures 6A/6B: ${summarizeError(staleLessons.error)}`);
+      throw new Error(`Limpar fixtures 6A/6B/6C: ${summarizeError(staleLessons.error)}`);
     }
 
     for (const staleLesson of staleLessons.data ?? []) {
@@ -3836,6 +3890,7 @@ try {
   };
 
   await retireStalePhase6OperationalLessons();
+  await retireStalePhase6TeacherBLessons();
 
   const createPhase6Lesson = async ({ index, title, date = phase6PastDate, studentId = studentsA.id, groupId = null }) => {
     const slot = phase6Slot(index);
@@ -5532,6 +5587,7 @@ try {
   const raceAReplacements = await teacherClient
     .from("teacher_lesson_schedule_records")
     .select("id, starts_at")
+    .in("status", ["scheduled", "confirmed"])
     .in("starts_at", [
       lisbonInstant(phase6cTargetDate, "14:00"),
       lisbonInstant(phase6cTargetDate, "16:00"),
@@ -5541,7 +5597,7 @@ try {
   }
   check(
     (raceAReplacements.data ?? []).length === 1,
-    "A aula original ficou com uma unica substituta",
+    `A aula original ficou com uma unica substituta (${(raceAReplacements.data ?? []).length})`,
   );
 
   // B) Duas chamadas CONCORRENTES com a MESMA chave e a mesma intencao.
@@ -5571,13 +5627,19 @@ try {
   const raceBReplacements = await teacherClient
     .from("teacher_lesson_schedule_records")
     .select("id, starts_at")
+    .in("status", ["scheduled", "confirmed"])
     .eq("starts_at", lisbonInstant(phase6cTargetDate, "18:00"));
   if (raceBReplacements.error) {
     throw new Error(`Substitutas da corrida B: ${summarizeError(raceBReplacements.error)}`);
   }
+  const raceBIds = new Set(raceB.filter((entry) => entry.ok).map((entry) => entry.data));
   check(
-    raceB.some((entry) => entry.ok) && (raceBReplacements.data ?? []).length === 1,
-    "Duas chamadas concorrentes com a mesma chave produzem uma unica substituta",
+    raceB.some((entry) => entry.ok) &&
+      raceBIds.size === 1 &&
+      (raceBReplacements.data ?? []).length === 1,
+    `Duas chamadas concorrentes com a mesma chave produzem uma unica substituta (${
+      (raceBReplacements.data ?? []).length
+    }; ${raceB.map((entry) => (entry.ok ? "ok" : summarizeError(entry.error))).join(" | ")})`,
   );
 
   // C) Reagendar x cancelar a mesma aula. Sao dois desfechos terminais
@@ -5596,17 +5658,11 @@ try {
         p_idempotency_key: deterministicUuid(`lesson-6c-race-cancel:${phase6RunSuffix}`),
       }),
     ),
-    rpcOutcome(() =>
-      teacherClient.rpc("cancel_lesson", {
-        p_lesson_id: raceOriginC,
-        p_reason: "Corrida com reagendamento",
-        p_idempotency_key: deterministicUuid(`lesson-6c-race-cancel-b:${phase6RunSuffix}`),
-      }),
-    ),
+    rpcOutcome(() => cancelLessonRpc(teacherClient, raceOriginC)),
   ]);
   check(
-    raceC.filter((entry) => entry.ok).length >= 1,
-    "Corrida reagendar x cancelar termina serializada, sem as duas a ganhar em silencio",
+    raceC.filter((entry) => entry.ok).length === 1,
+    "Corrida reagendar x cancelar: exatamente uma das duas operacoes vence",
   );
   const raceCLesson = await getSingle(
     "aula da corrida reagendar x cancelar",
@@ -5634,7 +5690,7 @@ try {
   });
   const beforeRaceD = await packageBalances("saldos antes da corrida D");
   const raceDSlot = phase6Slot(4);
-  await Promise.all([
+  const raceD = await Promise.all([
     rpcOutcome(() =>
       rescheduleRpc(teacherClient, raceOriginD, {
         p_starts_at: lisbonInstant(phase6cTargetDate, "08:00"),
@@ -5663,13 +5719,577 @@ try {
       .eq("id", raceOriginD),
   );
   check(
-    raceDLesson.status === "rescheduled" || raceDLesson.status === "scheduled",
+    raceD.some((entry) => entry.ok) &&
+      (raceDLesson.status === "rescheduled" || raceDLesson.status === "scheduled"),
     "Reagendar x editar deixa a aula num estado coerente",
   );
   const afterRaceD = await packageBalances("saldos depois da corrida D");
   check(
     sameTotal(beforeRaceD, afterRaceD) && afterRaceD.credits_used === beforeRaceD.credits_used,
     "Reagendar x editar nao mexe na soma dos saldos nem consome creditos",
+  );
+
+  // ── As tres corridas que faltavam (Etapa 6C.1B) ───────────────────────────
+
+  // Estado final completo de uma corrida de reagendamento. Uma corrida nao se
+  // valida pelo numero de promises resolvidas — valida-se pelo que ficou na
+  // base de dados.
+  const reschedRaceState = async (label, originId) => {
+    const original = await getSingle(
+      `${label}: aula original`,
+      teacherClient
+        .from("teacher_lesson_schedule_records")
+        .select("id, status, starts_at, ends_at")
+        .eq("id", originId),
+    );
+    const history = await teacherClient
+      .from("lesson_change_history")
+      .select("change_type")
+      .eq("lesson_id", originId);
+    if (history.error) throw new Error(`${label}: historico: ${summarizeError(history.error)}`);
+    const ledger = await teacherClient
+      .from("package_credit_transactions")
+      .select("id, type")
+      .eq("lesson_id", originId);
+    if (ledger.error) throw new Error(`${label}: livro-razao: ${summarizeError(ledger.error)}`);
+    return {
+      original,
+      history: (history.data ?? []).map((row) => row.change_type),
+      ledger: ledger.data ?? [],
+    };
+  };
+
+  const activeLessonsAtFor = async (label, client, startsAtInstant) => {
+    const found = await client
+      .from("teacher_lesson_schedule_records")
+      .select("id, status, location_resource_id")
+      .eq("starts_at", startsAtInstant)
+      .in("status", ["scheduled", "confirmed"]);
+    if (found.error) throw new Error(`${label}: ocupacao: ${summarizeError(found.error)}`);
+    return found.data ?? [];
+  };
+
+  const activeLessonsAt = (label, startsAtInstant) =>
+    activeLessonsAtFor(label, teacherClient, startsAtInstant);
+
+  // Cada professor so ve as suas aulas: a ocupacao real de um campo partilhado
+  // e a uniao das duas projecoes.
+  const activeResourceOccupantsAt = async (label, startsAtInstant) => {
+    const [mine, theirs] = await Promise.all([
+      activeLessonsAtFor(label, teacherClient, startsAtInstant),
+      activeLessonsAtFor(label, teacherBClient, startsAtInstant),
+    ]);
+    return [...mine, ...theirs];
+  };
+
+  const fullBalances = async (label, packageId) =>
+    getSingle(
+      label,
+      teacherClient
+        .from("teacher_package_records")
+        .select("id, credits_available, credits_reserved, credits_used, credits_total")
+        .eq("id", packageId),
+    );
+
+  const balancesAddUp = (row) =>
+    row.credits_available + row.credits_reserved + row.credits_used === row.credits_total;
+
+  // ── Corrida #1 — REAGENDAR x CONCLUIR ─────────────────────────────────────
+  //
+  // As duas operacoes bloqueiam a MESMA linha de `lessons` com `for update`,
+  // por isso serializam. O que as separa nao e o lock, e a presenca:
+  //
+  //   `complete_lesson()`    exige desfecho final (present/absent) para TODOS
+  //                          os participantes ativos;
+  //   `reschedule_lesson()`  recusa se existir QUALQUER registo de presenca.
+  //
+  // Sao mutuamente exclusivas por construcao, e as duas metades sao provadas
+  // abaixo: sem presenca vence o reagendamento; com presenca vence a conclusao.
+  // Nenhuma regra temporal foi enfraquecida para fabricar o cenario — as aulas
+  // sao criadas numa data passada real, como as fixtures 6A/6B ja fazem.
+
+  const phase6c1bPastOffset = 8 + (phase6RunSeed % 4);
+  const phase6c1bPastDate = dateOnlyFromNow(-phase6c1bPastOffset);
+  await prepareException(
+    teacherClient,
+    "Disponibilidade passada 6C.1B",
+    phase6c1bPastDate,
+    `lesson-6c1b-past-${phase6RunSuffix}`,
+    "06:00",
+    "22:00",
+  );
+
+  // 1A) Sem presenca: reagendar vence, concluir e recusado por falta de desfecho.
+  const raceCompleteAId = await createPhase6Lesson({
+    index: 5,
+    title: "Aula E2E 6C corrida concluir livre",
+    date: phase6c1bPastDate,
+  });
+  const raceCompleteAParticipant = await readParticipant(raceCompleteAId, studentsA.id);
+  const raceCompleteAPackage = await getSingle(
+    "pacote da corrida concluir livre",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id")
+      .eq("name", raceCompleteAParticipant.package_name),
+  );
+  const beforeCompleteA = await fullBalances(
+    "saldos antes de reagendar x concluir (sem presenca)",
+    raceCompleteAPackage.id,
+  );
+  const ledgerBeforeCompleteA = (
+    await reschedRaceState("livro-razao antes de reagendar x concluir", raceCompleteAId)
+  ).ledger.length;
+
+  const raceCompletePackageDates = await getSingle(
+    "validade do pacote da corrida 6C.1B",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, starts_on, expires_on")
+      .eq("id", raceCompleteAPackage.id),
+  );
+  check(
+    raceCompletePackageDates.starts_on <= phase6c1bPastDate &&
+      (raceCompletePackageDates.expires_on ?? "9999-12-31") >= phase6c1bPastDate,
+    "O pacote da corrida cobre a data usada como destino",
+  );
+  const phase6c1bTargetDate = phase6c1bPastDate;
+  // Slots livres na data de destino distante: a 6C.1A ocupa 08:00, 10:00,
+  // 14:00/16:00, 18:00 e 20:00, sempre em janelas de uma hora.
+  const phase6c1bFarTargetDate = phase6cTargetDate;
+  const raceCompleteA = await Promise.all([
+    rpcOutcome(() =>
+      rescheduleRpc(teacherClient, raceCompleteAId, {
+        p_starts_at: lisbonInstant(phase6c1bTargetDate, "06:00"),
+        p_ends_at: lisbonInstant(phase6c1bTargetDate, "07:00"),
+        p_idempotency_key: deterministicUuid(`lesson-6c1b-complete-a:${phase6RunSuffix}`),
+      }),
+    ),
+    rpcOutcome(() => completeLessonRpc(teacherClient, raceCompleteAId)),
+  ]);
+  const stateCompleteA = await reschedRaceState("reagendar x concluir sem presenca", raceCompleteAId);
+  const afterCompleteA = await fullBalances(
+    "saldos depois de reagendar x concluir (sem presenca)",
+    raceCompleteAPackage.id,
+  );
+  const replacementCompleteA = raceCompleteA[0].ok ? raceCompleteA[0].data : null;
+
+  check(
+    raceCompleteA[0].ok === true &&
+      raceCompleteA[1].ok === false &&
+      stateCompleteA.original.status === "rescheduled",
+    `Sem presenca marcada, reagendar vence e concluir e recusado${
+      raceCompleteA[0].ok ? "" : `: ${summarizeError(raceCompleteA[0].error)}`
+    }`,
+  );
+  check(
+    replacementCompleteA !== null &&
+      (await activeLessonsAt(
+        "substituta de reagendar x concluir",
+        lisbonInstant(phase6c1bTargetDate, "06:00"),
+      )).length === 1,
+    "A corrida deixa exatamente uma substituta ativa",
+  );
+  check(
+    balancesAddUp(afterCompleteA) &&
+      afterCompleteA.credits_available === beforeCompleteA.credits_available &&
+      afterCompleteA.credits_reserved === beforeCompleteA.credits_reserved &&
+      afterCompleteA.credits_used === beforeCompleteA.credits_used &&
+      afterCompleteA.credits_total === beforeCompleteA.credits_total,
+    "Reagendar a vencer nao move nenhum dos tres baldes de creditos",
+  );
+  check(
+    stateCompleteA.ledger.length === ledgerBeforeCompleteA &&
+      stateCompleteA.ledger.every((row) => row.type !== "credit_consumed"),
+    "Reagendar a vencer nao acrescenta nenhuma linha ao livro-razao nem consome",
+  );
+  check(
+    stateCompleteA.history.includes("rescheduled") &&
+      !stateCompleteA.history.includes("attendance_recorded"),
+    "O historico regista o reagendamento e nenhuma presenca",
+  );
+  const replacementParticipantA = replacementCompleteA
+    ? await readParticipant(replacementCompleteA, studentsA.id)
+    : null;
+  const originalParticipantA = await readParticipant(raceCompleteAId, studentsA.id);
+  check(
+    replacementParticipantA !== null &&
+      replacementParticipantA.billing_status === "reserved" &&
+      replacementParticipantA.credits_reserved === raceCompleteAParticipant.credits_reserved &&
+      replacementParticipantA.credits_consumed === 0 &&
+      originalParticipantA.billing_status === "released" &&
+      originalParticipantA.credits_reserved === 0 &&
+      originalParticipantA.credits_consumed === 0,
+    "A reserva viaja para a substituta e nada e consumido",
+  );
+
+  // 1B) Com presenca: concluir vence, reagendar e recusado pelos registos de presenca.
+  const raceCompleteBId = await createPhase6Lesson({
+    index: 6,
+    title: "Aula E2E 6C corrida concluir presenca",
+    date: phase6c1bPastDate,
+  });
+  const raceCompleteBParticipant = await readParticipant(raceCompleteBId, studentsA.id);
+  const raceCompleteBPackage = await getSingle(
+    "pacote da corrida concluir com presenca",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id")
+      .eq("name", raceCompleteBParticipant.package_name),
+  );
+  const markPresence = await setAttendanceStatus(
+    teacherClient,
+    raceCompleteBId,
+    raceCompleteBParticipant.lesson_participant_id,
+    "present",
+  );
+  if (markPresence.error) {
+    throw new Error(`Marcar presenca 6C.1B: ${summarizeError(markPresence.error)}`);
+  }
+  const beforeCompleteB = await fullBalances(
+    "saldos antes de reagendar x concluir (com presenca)",
+    raceCompleteBPackage.id,
+  );
+  const raceCompleteB = await Promise.all([
+    rpcOutcome(() =>
+      rescheduleRpc(teacherClient, raceCompleteBId, {
+        p_starts_at: lisbonInstant(phase6c1bTargetDate, "07:30"),
+        p_ends_at: lisbonInstant(phase6c1bTargetDate, "08:30"),
+        p_idempotency_key: deterministicUuid(`lesson-6c1b-complete-b:${phase6RunSuffix}`),
+      }),
+    ),
+    rpcOutcome(() => completeLessonRpc(teacherClient, raceCompleteBId)),
+  ]);
+  const stateCompleteB = await reschedRaceState("reagendar x concluir com presenca", raceCompleteBId);
+  const afterCompleteB = await fullBalances(
+    "saldos depois de reagendar x concluir (com presenca)",
+    raceCompleteBPackage.id,
+  );
+  const participantCompleteB = await readParticipant(raceCompleteBId, studentsA.id);
+
+  check(
+    raceCompleteB[0].ok === false &&
+      raceCompleteB[1].ok === true &&
+      stateCompleteB.original.status === "completed",
+    `Com presenca marcada, concluir vence e reagendar e recusado${
+      raceCompleteB[1].ok ? "" : `: ${summarizeError(raceCompleteB[1].error)}`
+    }`,
+  );
+  check(
+    (await activeLessonsAt(
+      "substituta impossivel de reagendar x concluir",
+      lisbonInstant(phase6c1bTargetDate, "07:30"),
+    )).length === 0,
+    "O reagendamento derrotado nao deixou nenhuma substituta",
+  );
+  check(
+    !stateCompleteB.history.includes("rescheduled"),
+    "O historico nao regista um reagendamento que nunca aconteceu",
+  );
+  check(
+    balancesAddUp(afterCompleteB) &&
+      afterCompleteB.credits_total === beforeCompleteB.credits_total &&
+      afterCompleteB.credits_available === beforeCompleteB.credits_available &&
+      afterCompleteB.credits_reserved ===
+        beforeCompleteB.credits_reserved - raceCompleteBParticipant.credits_reserved &&
+      afterCompleteB.credits_used ===
+        beforeCompleteB.credits_used + raceCompleteBParticipant.credits_reserved,
+    "Concluir a vencer move reservado para utilizado exatamente pelo custo",
+  );
+  check(
+    participantCompleteB.billing_status === "consumed" &&
+      participantCompleteB.credits_reserved === 0 &&
+      participantCompleteB.credits_consumed === raceCompleteBParticipant.credits_reserved,
+    "A participacao fica consumida uma unica vez",
+  );
+  check(
+    stateCompleteB.ledger.filter((row) => row.type === "credit_consumed").length === 1,
+    "O livro-razao recebe exatamente um consumo, sem duplicado",
+  );
+
+  // ── Corrida #2 — REAGENDAMENTO A DISPUTAR UM RECURSO ──────────────────────
+  //
+  // A criacao ja provava o conflito de recurso; isto prova a VIA DE
+  // REAGENDAMENTO, que tem uma particularidade que a criacao nao tem:
+  // `ensure_lesson_has_no_conflict()` ignora `rescheduled_from_id`.
+  //
+  // Sao dois professores diferentes de proposito. Com o mesmo professor, a
+  // sobreposicao de agenda dispara primeiro e o teste nunca chegaria a exercer
+  // a regra do recurso.
+
+  await prepareException(
+    teacherBClient,
+    "Disponibilidade de destino 6C.1B do Professor B",
+    phase6c1bFarTargetDate,
+    `lesson-6c1b-target-b-${phase6RunSuffix}`,
+    "06:00",
+    "22:00",
+  );
+
+  const releaseTeacherBTargetWindow = async () => {
+    const created = await teacherBClient
+      .from("teacher_availability_exception_records")
+      .select("id")
+      .eq("exception_date", phase6c1bFarTargetDate)
+      .eq("is_active", true);
+    if (created.error) {
+      throw new Error(`Excecao 6C.1B do Professor B: ${summarizeError(created.error)}`);
+    }
+    for (const row of created.data ?? []) {
+      const { error } = await teacherBClient.rpc("deactivate_teacher_availability_exception", {
+        p_exception_id: row.id,
+        p_idempotency_key: deterministicUuid(`lesson-6c1b-target-b-release:${row.id}`),
+      });
+      if (error) {
+        throw new Error(`Libertar excecao 6C.1B do Professor B: ${summarizeError(error)}`);
+      }
+    }
+  };
+
+  await assignLessonPackage(
+    teacherBClient,
+    studentsB.id,
+    `Pacote recurso 6C1B ${phase6RunSuffix}`,
+    10,
+    deterministicUuid(`lesson-6c1b-package-b:${phase6RunSuffix}`),
+    sportRow.id,
+    { startsOn: dateOnlyFromNow(-10), expiresOn: dateOnlyFromNow(400) },
+  );
+
+  const resourceRaceStart = lisbonInstant(phase6c1bFarTargetDate, "12:00");
+  const resourceRaceEnd = lisbonInstant(phase6c1bFarTargetDate, "13:00");
+
+  const resourceOriginSlot = phase6Slot(7);
+  const { data: resourceRescheduleOrigin, error: resourceOriginError } = await createLesson(
+    teacherClient,
+    {
+      p_starts_at: lisbonInstant(phase6cOriginDate, resourceOriginSlot.startsAt),
+      p_ends_at: lisbonInstant(phase6cOriginDate, resourceOriginSlot.endsAt),
+      p_title: `Aula E2E 6C corrida recurso origem ${phase6RunSuffix}`,
+      p_context_kind: "club",
+      p_club_organization_id: clubId,
+      p_location_id: clubLocationId,
+      p_location_resource_id: clubResourceId,
+      p_student_id: studentsA.id,
+      p_idempotency_key: deterministicUuid(`lesson-6c1b-resource-origin:${phase6RunSuffix}`),
+    },
+  );
+  if (resourceOriginError || !resourceRescheduleOrigin) {
+    throw new Error(`Origem da corrida de recurso: ${summarizeError(resourceOriginError)}`);
+  }
+  const resourceOriginParticipant = await readParticipant(resourceRescheduleOrigin, studentsA.id);
+  const resourceOriginPackage = await getSingle(
+    "pacote da corrida de recurso",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id")
+      .eq("name", resourceOriginParticipant.package_name),
+  );
+  const beforeResourceRace = await fullBalances(
+    "saldos antes da corrida de recurso",
+    resourceOriginPackage.id,
+  );
+
+  const resourceReschedRace = await Promise.all([
+    // Professor A reagenda para o campo do clube.
+    rpcOutcome(() =>
+      rescheduleRpc(teacherClient, resourceRescheduleOrigin, {
+        p_starts_at: resourceRaceStart,
+        p_ends_at: resourceRaceEnd,
+        p_location_id: clubLocationId,
+        p_location_resource_id: clubResourceId,
+        p_idempotency_key: deterministicUuid(`lesson-6c1b-resource:${phase6RunSuffix}`),
+      }),
+    ),
+    // Professor B cria uma aula no MESMO campo e no MESMO horario.
+    rpcOutcome(() =>
+      createLesson(teacherBClient, {
+        p_starts_at: resourceRaceStart,
+        p_ends_at: resourceRaceEnd,
+        p_title: `Aula E2E 6C corrida recurso terceiro ${phase6RunSuffix}`,
+        p_context_kind: "club",
+        p_club_organization_id: clubId,
+        p_location_id: clubLocationId,
+        p_location_resource_id: clubResourceId,
+        p_student_id: studentsB.id,
+        p_idempotency_key: deterministicUuid(`lesson-6c1b-resource-b:${phase6RunSuffix}`),
+      }),
+    ),
+  ]);
+  const resourceOccupants = await activeResourceOccupantsAt("campo disputado", resourceRaceStart);
+  const afterResourceRace = await fullBalances(
+    "saldos depois da corrida de recurso",
+    resourceOriginPackage.id,
+  );
+  const resourceOriginAfter = await getSingle(
+    "origem da corrida de recurso",
+    teacherClient
+      .from("teacher_lesson_schedule_records")
+      .select("id, status")
+      .eq("id", resourceRescheduleOrigin),
+  );
+
+  check(
+    resourceReschedRace.filter((entry) => entry.ok).length === 1,
+    `Corrida de recurso pela via do reagendamento: exatamente uma operacao vence (${
+      resourceReschedRace.map((entry) => (entry.ok ? "ok" : summarizeError(entry.error))).join(" | ")
+    })`,
+  );
+  check(
+    resourceOccupants.filter((row) => row.location_resource_id === clubResourceId).length === 1,
+    "So existe uma ocupacao ativa do campo disputado",
+  );
+  check(
+    resourceReschedRace[0].ok
+      ? resourceOriginAfter.status === "rescheduled"
+      : resourceOriginAfter.status === "scheduled",
+    "A origem so fica historica se o reagendamento tiver mesmo vencido",
+  );
+  check(
+    balancesAddUp(afterResourceRace) &&
+      afterResourceRace.credits_available === beforeResourceRace.credits_available &&
+      afterResourceRace.credits_reserved === beforeResourceRace.credits_reserved &&
+      afterResourceRace.credits_used === beforeResourceRace.credits_used,
+    "A disputa de recurso nao perde nem inventa reservas",
+  );
+  const resourceLoser = resourceReschedRace.find((entry) => !entry.ok);
+  check(
+    summarizeError(resourceLoser?.error).toLowerCase().includes("ocupado"),
+    `A operacao derrotada perde por ocupacao do campo (A=${
+      resourceReschedRace[0].ok ? "ok" : summarizeError(resourceReschedRace[0].error)
+    }; B=${resourceReschedRace[1].ok ? "ok" : summarizeError(resourceReschedRace[1].error)})`,
+  );
+
+  await releaseTeacherBTargetWindow();
+
+  // ── Corrida #3 — CONFLITO DE PROFESSOR E INTERVALO MINIMO ─────────────────
+  //
+  // Aqui os dois lados sao do MESMO professor, e ambos passam pela via de
+  // reagendamento. E o cenario onde a excecao da antecessora poderia ser
+  // perigosa: cada substituta ignora a SUA origem, e tem de continuar a ver a
+  // da outra.
+
+  const teacherRaceStart = lisbonInstant(phase6c1bFarTargetDate, "06:00");
+  const teacherRaceEnd = lisbonInstant(phase6c1bFarTargetDate, "07:00");
+
+  const teacherConflictOriginA = await createPhase6Lesson({
+    index: 8,
+    title: "Aula E2E 6C corrida professor A",
+    date: phase6cOriginDate,
+  });
+  const teacherConflictOriginB = await createPhase6Lesson({
+    index: 9,
+    title: "Aula E2E 6C corrida professor B",
+    date: phase6cOriginDate,
+  });
+  const teacherConflictParticipant = await readParticipant(teacherConflictOriginA, studentsA.id);
+  const teacherConflictPackage = await getSingle(
+    "pacote da corrida de professor",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id")
+      .eq("name", teacherConflictParticipant.package_name),
+  );
+  const beforeTeacherRace = await fullBalances(
+    "saldos antes da corrida de professor",
+    teacherConflictPackage.id,
+  );
+
+  const teacherConflictRace = await Promise.all([
+    rpcOutcome(() =>
+      rescheduleRpc(teacherClient, teacherConflictOriginA, {
+        p_starts_at: teacherRaceStart,
+        p_ends_at: teacherRaceEnd,
+        p_idempotency_key: deterministicUuid(`lesson-6c1b-teacher-a:${phase6RunSuffix}`),
+      }),
+    ),
+    rpcOutcome(() =>
+      rescheduleRpc(teacherClient, teacherConflictOriginB, {
+        p_starts_at: teacherRaceStart,
+        p_ends_at: teacherRaceEnd,
+        p_idempotency_key: deterministicUuid(`lesson-6c1b-teacher-b:${phase6RunSuffix}`),
+      }),
+    ),
+  ]);
+  const teacherRaceOccupants = await activeLessonsAt("horario disputado", teacherRaceStart);
+  const afterTeacherRace = await fullBalances(
+    "saldos depois da corrida de professor",
+    teacherConflictPackage.id,
+  );
+
+  check(
+    teacherConflictRace.filter((entry) => entry.ok).length === 1,
+    `Dois reagendamentos para o mesmo horario do professor: exatamente um vence (${
+      teacherConflictRace.map((entry) => (entry.ok ? "ok" : summarizeError(entry.error))).join(" | ")
+    })`,
+  );
+  check(
+    teacherRaceOccupants.length === 1,
+    "So existe uma aula ativa no horario disputado",
+  );
+  check(
+    summarizeError(
+      teacherConflictRace.find((entry) => !entry.ok)?.error,
+    ).toLowerCase().includes("outra aula"),
+    "O reagendamento derrotado perde por sobreposicao de agenda do professor",
+  );
+  check(
+    balancesAddUp(afterTeacherRace) &&
+      afterTeacherRace.credits_available === beforeTeacherRace.credits_available &&
+      afterTeacherRace.credits_reserved === beforeTeacherRace.credits_reserved &&
+      afterTeacherRace.credits_used === beforeTeacherRace.credits_used,
+    "O reagendamento derrotado nao provoca nenhum movimento financeiro",
+  );
+
+  // A origem derrotada continua agendada, e a cadeia nao ficou meia feita.
+  const defeatedOrigin =
+    teacherConflictRace[0].ok === true ? teacherConflictOriginB : teacherConflictOriginA;
+  const defeatedOriginAfter = await getSingle(
+    "origem derrotada",
+    teacherClient
+      .from("teacher_lesson_schedule_records")
+      .select("id, status")
+      .eq("id", defeatedOrigin),
+  );
+  const defeatedState = await reschedRaceState("origem derrotada", defeatedOrigin);
+  check(
+    defeatedOriginAfter.status === "scheduled" &&
+      !defeatedState.history.includes("rescheduled"),
+    "A origem derrotada continua agendada e sem evento de reagendamento",
+  );
+
+  // Intervalo minimo: `minimum_break_minutes` e 15 nesta fixture. Um destino que
+  // comeca 10 minutos depois do fim da aula vencedora respeita a agenda mas nao
+  // o intervalo — e tem de ser recusado tambem pela via do reagendamento.
+  const breakRescheduleTarget = lisbonInstant(phase6c1bFarTargetDate, "07:05");
+  const breakRescheduleEnd = lisbonInstant(phase6c1bFarTargetDate, "07:45");
+  const beforeBreak = await fullBalances(
+    "saldos antes do intervalo minimo",
+    teacherConflictPackage.id,
+  );
+  const breakOutcome = await rpcOutcome(() =>
+    rescheduleRpc(teacherClient, defeatedOrigin, {
+      p_starts_at: breakRescheduleTarget,
+      p_ends_at: breakRescheduleEnd,
+      p_idempotency_key: deterministicUuid(`lesson-6c1b-break:${phase6RunSuffix}`),
+    }),
+  );
+  const afterBreak = await fullBalances(
+    "saldos depois do intervalo minimo",
+    teacherConflictPackage.id,
+  );
+  check(
+    breakOutcome.ok === false &&
+      summarizeError(breakOutcome.error).toLowerCase().includes("intervalo m"),
+    `O intervalo minimo continua a valer pela via do reagendamento${
+      breakOutcome.ok ? ": foi aceite" : `: ${summarizeError(breakOutcome.error)}`
+    }`,
+  );
+  check(
+    (await activeLessonsAt("destino recusado por intervalo", breakRescheduleTarget)).length === 0 &&
+      afterBreak.credits_reserved === beforeBreak.credits_reserved &&
+      afterBreak.credits_used === beforeBreak.credits_used,
+    "A recusa por intervalo minimo nao deixa aula nem mexe em creditos",
   );
 
   // ── Privacidade: o aluno ve a aula nova, sem detalhes administrativos ──

@@ -8822,6 +8822,15 @@ await asDatabaseRole("authenticated", TEACHER_UID, () =>
 
 section("Presença e conclusão de aulas (Fase 6A)");
 
+// As fixtures operacionais da 6A/6B sao relativas a `now()` porque a semantica
+// delas depende disso: marcar presenca so depois do inicio, concluir so depois
+// do fim. Mas as que estao a dezenas de dias de distancia nao precisam da HORA
+// atual — e herda-la torna-as moveis ao longo do dia.
+//
+// A 6C.1 usa datas civis fixas, e uma fixture a `now() + 30 days` acabava por
+// deslizar para cima delas conforme o relogio avancava: a mesma suite passava de
+// manha e falhava a meio da tarde. As de escala diaria passam a ser ancoradas as
+// 03:00, longe da banda de horarios que as datas fixas usam.
 const createOperationalLesson = ({
   title,
   startOffset,
@@ -8829,16 +8838,20 @@ const createOperationalLesson = ({
   groupId = null,
   locationId = null,
   resourceId = null,
-}) =>
-  one(
+}) => {
+  const anchor = /day/.test(startOffset)
+    ? "date_trunc('day', now()) + interval '3 hours'"
+    : "now()";
+  return one(
     `insert into public.lessons
        (organization_id, teacher_id, sport_id, title, starts_at, ends_at,
         group_id, location_id, location_resource_id, credit_cost)
-     values ($1,$2,$3,$4, now() + $5::interval, now() + $6::interval,
+     values ($1,$2,$3,$4, ${anchor} + $5::interval, ${anchor} + $6::interval,
              $7::uuid, $8::uuid, $9::uuid, 1)
      returning id`,
     [org, teacher.id, sport, title, startOffset, endOffset, groupId, locationId, resourceId],
   );
+};
 
 const reserveParticipant = (lessonId, studentId, packageId) =>
   one(
