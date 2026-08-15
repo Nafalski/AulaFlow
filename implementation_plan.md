@@ -450,7 +450,7 @@ A estrutura fica pronta para notificações push (Fase 8).
 | **6** | Cancelamento, reagendamento, presenças, histórico | **Concluída** — 6A/6B: presença, falta/no-show, conclusão normal/mista e cancelamentos com `reserved -> available` ou `reserved -> used` seguros. 6C.1/1A/1B: contrato transacional de reagendamento, chave de idempotência obrigatória e concorrência real provada. 6C.2: interface operacional, com editar conteúdo e reagendar colocação separados no PostgreSQL |
 | **7** | Área do aluno: aulas, saldo, confirmação da participação | **7A concluída** — contrato de confirmação individual: `requires_confirmation` deixou de estar dormente, a escrita direta na resposta do aluno foi fechada, e RSVP ficou separado de presença. Falta a 7B: interfaces de pedir e de responder |
 | **8** | Notificações, lembretes e expiração agendada | **Planeado** |
-| **9** | Supabase real, concorrência, acessibilidade, deployment | **Parcialmente concluído** — Supabase/Auth reais validados até à 6B (405 verificações, repetíveis); browser automatizado com sessão GoTrue real; paridade dev/produção confirmada na 6B.2; deployment pendente |
+| **9** | Supabase real, concorrência, acessibilidade, deployment | **Parcialmente concluído** — Supabase/Auth reais validados até à 7A (506 verificações, repetíveis em execuções consecutivas); browser automatizado com sessão GoTrue real, em dev e em build de produção; deployment pendente |
 
 A ordem segue as prioridades pedidas: primeiro a área do professor ao computador, depois as regras seguras de créditos, depois o aluno no telemóvel.
 
@@ -1202,7 +1202,22 @@ Reconfirmação obrigatória depois de reagendar continua a ser uma decisão de 
 |---|---|
 | `npm run db:verify` | 870 verificações: pedido de confirmação, caminho feliz, retry, recusas por papel e por estado, turma, recorrência, escrita direta fechada, assinatura única e privacidade da projeção |
 | `db:verify:remote` | assinatura única das três RPCs, `p_requires_confirmation` presente, sem GRANT de escrita em `lesson_participants`, `anon` sem EXECUTE |
-| `db:verify:auth` | 492 verificações com JWTs reais, **duas execuções completas consecutivas verdes**, incluindo confirmar × confirmar, confirmar × cancelar e confirmar × reagendar |
+| `db:verify:auth` | 506 verificações com JWTs reais, **duas execuções completas consecutivas verdes**, incluindo confirmar × confirmar, confirmar × cancelar aula, confirmar × cancelar participação de turma e confirmar × reagendar |
+
+#### As corridas, e o que cada uma prova
+
+`confirm_lesson_participation()` e `cancel_lesson_participation()` bloqueiam `lessons` **primeiro** e só depois as participações — a segunda por `order by id`. É a aula que as serializa, e por isso não existe ordem de locks que possa entrar em deadlock. Nenhuma alteração de SQL foi precisa para o provar.
+
+Os dois interleavings são ambos legítimos e ambos foram observados em execuções reais:
+
+```text
+confirmar primeiro → invited → confirmed → cancelamento sobrepõe-se → declined/released
+cancelar primeiro  → invited → declined/released → confirmação encontra declined e recusa
+```
+
+O estado final é o mesmo nos dois: `declined`, `released`, `credits_reserved = 0`, `declined_at` carimbado pelo cancelamento. A confirmação nunca sobrevive como estado final, nunca cria presença e nunca escreve no livro-razão — a única movimentação é a libertação do cancelamento, exatamente uma. O colega de turma e o pacote dele ficam intocados, e a aula continua operacional por ter outro participante ativo.
+
+Na corrida com o reagendamento, a suite deixou de se contentar com "a substituta existe": verifica o estado da participação **na substituta**, e exige que ele corresponda a quem venceu. Se a confirmação foi aceite, a substituta tem de estar `confirmed` com `confirmed_at` preenchido; se foi recusada porque o reagendamento chegou primeiro, tem de estar `invited` sem `confirmed_at`. O par impossível — confirmação aceite e substituta `invited` — significaria perder a resposta do aluno durante a transferência, e é precisamente o que a asserção anterior deixava passar.
 
 **Ainda não implementado na 7A:** interface de pedir confirmação, interface de responder, decline/self-cancel do aluno, janela e multas, lista de espera, confirmação de série inteira e notificações.
 
@@ -1220,7 +1235,7 @@ Reconfirmação obrigatória depois de reagendar continua a ser uma decisão de 
 | Preferências de notificação | **Concluído** | Persistência de canais/eventos; entrega automática continua planeada para a Fase 8 |
 | Diretório administrativo | **Concluído** | Pesquisa, filtros, professores, detalhe, estados vazios/erro/loading e resposta mobile/desktop |
 | Bloqueio e reativação | **Concluído** | RPC exclusiva de admin, sem auto-bloqueio, motivo, auditoria e revogação efetiva por RLS |
-| Validação num Supabase remoto | **Concluído para as Fases 4, 5, 6A, 6B e 6C** | Migrações, catálogo remoto, GoTrue/Auth, JWT/PostgREST, contas reais, calendário seguro, aulas, conflitos, reserva, recorrência, presença, conclusão, privacidade e concorrência validados por RPC/Auth real |
+| Validação num Supabase remoto | **Concluído para as Fases 4, 5, 6 e 7A** | Migrações, catálogo remoto, GoTrue/Auth, JWT/PostgREST, contas reais, calendário seguro, aulas, conflitos, reserva, recorrência, presença, conclusão, privacidade e concorrência validados por RPC/Auth real |
 
 ### Concluído na Fase 2
 

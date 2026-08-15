@@ -6430,6 +6430,23 @@ try {
     { startsOn: dateOnlyFromNow(-10), expiresOn: dateOnlyFromNow(400) },
   );
 
+  // A corrida de turma precisa de colegas com saldo PRÓPRIO. Depender do que
+  // sobrou das fixtures da 6B tornaria o cenário sensível à ordem das secções.
+  for (const [colleague, label] of [
+    [groupStudent, "colega"],
+    [groupStudentB, "colega B"],
+  ]) {
+    await assignLessonPackage(
+      teacherClient,
+      colleague.id,
+      `Pacote confirmacao 7A ${label} ${phase6RunSuffix}`,
+      20,
+      deterministicUuid(`lesson-7a-package-${label}:${phase6RunSuffix}`),
+      sportRow.id,
+      { startsOn: dateOnlyFromNow(-10), expiresOn: dateOnlyFromNow(400) },
+    );
+  }
+
   // Grelha propria: `phase6Slot` avanca 80 minutos por indice e sai da janela
   // 06:00-22:00 ao oitavo. A 7A precisa de mais aulas no mesmo dia, e nenhuma
   // delas precisa de durar uma hora.
@@ -6438,7 +6455,12 @@ try {
     return { startsAt: timeFromMinutes(startsAt), endsAt: timeFromMinutes(startsAt + 30) };
   };
 
-  const createConfirmableLesson = async (label, slotIndex, requiresConfirmation) => {
+  const createConfirmableLesson = async (
+    label,
+    slotIndex,
+    requiresConfirmation,
+    groupId = null,
+  ) => {
     const slot = phase7aSlot(slotIndex);
     const { data, error } = await createLesson(teacherClient, {
       p_starts_at: lisbonInstant(phase7aDate, slot.startsAt),
@@ -6446,7 +6468,8 @@ try {
       p_title: `${label} ${phase6RunSuffix}`,
       p_location_id: null,
       p_location_resource_id: null,
-      p_student_id: studentsA.id,
+      p_student_id: groupId ? null : studentsA.id,
+      p_group_id: groupId,
       p_idempotency_key: deterministicUuid(`${label}:${phase6RunSuffix}`),
       p_requires_confirmation: requiresConfirmation,
     });
@@ -6698,6 +6721,240 @@ try {
   );
   await mustReject("A original reagendada ja nao aceita confirmacao", async () =>
     studentClient.rpc("confirm_lesson_participation", { p_lesson_id: reschedRaceLessonId }),
+  );
+
+  // O ESTADO FINAL DA PARTICIPACAO NA SUBSTITUTA.
+  //
+  // Terminar a corrida sem olhar para aqui deixaria passar o pior desfecho
+  // possivel: a confirmacao devolver `true` e a substituta nascer `invited` —
+  // ou seja, a resposta do aluno perdida no meio da transferencia.
+  const reschedRaceParticipant = await readParticipant(
+    reschedRaceReplacementId,
+    studentsA.id,
+  );
+  const reschedRaceDirectory = await getSingle(
+    "participacao da substituta 7A",
+    teacherClient
+      .from("lesson_participant_directory")
+      .select("lesson_id, student_id, status, confirmed_at")
+      .eq("lesson_id", reschedRaceReplacementId)
+      .eq("student_id", studentsA.id),
+  );
+  const confirmWonTheRace = confirmReschedRace[0].ok === true && confirmReschedRace[0].data === true;
+
+  ok(
+    `Interleaving observado no reagendamento: ${
+      confirmWonTheRace ? "confirmar venceu e a resposta viajou" : "reagendar venceu primeiro"
+    }`,
+  );
+  check(
+    confirmWonTheRace
+      ? reschedRaceParticipant.status === "confirmed" &&
+          reschedRaceDirectory.confirmed_at !== null
+      : reschedRaceParticipant.status === "invited" &&
+          reschedRaceDirectory.confirmed_at === null,
+    "A substituta reflete exatamente quem venceu a corrida",
+    `confirmacao ${confirmWonTheRace ? "venceu" : "perdeu"} · substituta ${
+      reschedRaceParticipant.status
+    } · confirmed_at ${reschedRaceDirectory.confirmed_at === null ? "vazio" : "preenchido"}`,
+  );
+  check(
+    reschedRaceParticipant.billing_status === "reserved" &&
+      reschedRaceParticipant.credits_reserved > 0 &&
+      reschedRaceParticipant.credits_consumed === 0 &&
+      reschedRaceParticipant.attendance_status === null,
+    "Qualquer que seja o vencedor, a reserva viaja intacta e sem presenca",
+  );
+
+  // ── Confirmar x cancelar a participacao numa turma ────────────────────────
+  //
+  // As duas RPCs bloqueiam `lessons` PRIMEIRO e so depois as participacoes —
+  // `cancel_lesson_participation()` por `order by id`. Serializam na aula, e por
+  // isso nao ha ordem de locks que possa entrar em deadlock. O que este teste
+  // prova e que qualquer dos dois interleavings termina no MESMO estado final:
+  //
+  //   confirmar primeiro → invited → confirmed → declined/released
+  //   cancelar primeiro  → invited → declined/released → confirmar recusa
+  const groupRaceLessonId = await createConfirmableLesson(
+    "Aula E2E 7A corrida turma",
+    18,
+    true,
+    phase6bGroup.id,
+  );
+
+  const groupRaceParticipantBefore = await readParticipant(groupRaceLessonId, studentsA.id);
+  const groupRaceColleagueBefore = await readParticipant(groupRaceLessonId, groupStudent.id);
+  const groupRacePackageBefore = await getSingle(
+    "pacote antes da corrida de turma",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_available, credits_reserved, credits_used, credits_total")
+      .eq("name", groupRaceParticipantBefore.package_name),
+  );
+  const groupRaceColleaguePackageBefore = await getSingle(
+    "pacote do colega antes da corrida",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_available, credits_reserved, credits_used, credits_total")
+      .eq("name", groupRaceColleagueBefore.package_name),
+  );
+  const groupRaceLedgerBefore = await teacherClient
+    .from("package_credit_transactions")
+    .select("id, type")
+    .eq("lesson_id", groupRaceLessonId);
+  if (groupRaceLedgerBefore.error) {
+    throw new Error(`Livro-razao da corrida de turma: ${summarizeError(groupRaceLedgerBefore.error)}`);
+  }
+  check(
+    groupRaceParticipantBefore.status === "invited" &&
+      groupRaceParticipantBefore.billing_status === "reserved" &&
+      groupRaceParticipantBefore.credits_reserved > 0 &&
+      groupRaceParticipantBefore.attendance_status === null,
+    "A fixture de turma comeca por responder, com reserva e sem presenca",
+  );
+
+  const groupRace = await Promise.all([
+    rpcOutcome(() =>
+      studentClient.rpc("confirm_lesson_participation", { p_lesson_id: groupRaceLessonId }),
+    ),
+    rpcOutcome(() =>
+      cancelLessonParticipationRpc(
+        teacherClient,
+        groupRaceLessonId,
+        groupRaceParticipantBefore.lesson_participant_id,
+      ),
+    ),
+  ]);
+
+  const groupRaceParticipantAfter = await readParticipant(groupRaceLessonId, studentsA.id);
+  const groupRaceDirectoryAfter = await getSingle(
+    "participacao cancelada da corrida de turma",
+    teacherClient
+      .from("lesson_participant_directory")
+      .select("lesson_id, student_id, status, confirmed_at")
+      .eq("lesson_id", groupRaceLessonId)
+      .eq("student_id", studentsA.id),
+  );
+
+  // O cancelamento e a operacao que decide o desfecho: a confirmacao nunca
+  // sobrevive como estado final.
+  check(
+    groupRace[1].ok === true &&
+      groupRaceParticipantAfter.status === "declined" &&
+      groupRaceParticipantAfter.billing_status === "released" &&
+      groupRaceParticipantAfter.credits_reserved === 0,
+    "A participacao termina cancelada e com o credito devolvido",
+    `confirmacao ${groupRace[0].ok ? "aceite" : "recusada"} · estado ${
+      groupRaceParticipantAfter.status
+    }/${groupRaceParticipantAfter.billing_status}`,
+  );
+  check(
+    groupRaceParticipantAfter.declined_at !== null,
+    "O cancelamento carimba declined_at",
+  );
+
+  // Qualquer dos dois interleavings e aceitavel; um terceiro nao seria.
+  const confirmAcceptedThenCancelled =
+    groupRace[0].ok === true && groupRaceDirectoryAfter.confirmed_at !== null;
+  const cancelledBeforeConfirming =
+    groupRace[0].ok === false && groupRaceDirectoryAfter.confirmed_at === null;
+  // Qual dos dois aconteceu depende do escalonador; registar qual foi torna a
+  // execucao legivel sem tornar a assercao dependente da ordem.
+  ok(
+    `Interleaving observado na turma: ${
+      confirmAcceptedThenCancelled
+        ? "confirmar venceu o lock e o cancelamento sobrepos-se"
+        : "cancelar venceu o lock e a confirmacao foi recusada"
+    }`,
+  );
+  check(
+    confirmAcceptedThenCancelled || cancelledBeforeConfirming,
+    "O desfecho observado corresponde a um dos dois interleavings possiveis",
+    `confirmacao ${groupRace[0].ok ? "aceite" : "recusada"} · confirmed_at ${
+      groupRaceDirectoryAfter.confirmed_at === null ? "vazio" : "preenchido"
+    }`,
+  );
+
+  check(
+    groupRaceParticipantAfter.attendance_status === null &&
+      groupRaceParticipantAfter.credits_consumed === 0,
+    "Nem a confirmacao nem o cancelamento criaram presenca ou consumo",
+  );
+
+  const groupRaceLesson = await getSingle(
+    "aula da corrida de turma",
+    teacherClient
+      .from("teacher_lesson_schedule_records")
+      .select("id, status")
+      .eq("id", groupRaceLessonId),
+  );
+  check(
+    groupRaceLesson.status === "scheduled",
+    "A aula continua operacional porque ha outro participante ativo",
+  );
+
+  const groupRacePackageAfter = await getSingle(
+    "pacote depois da corrida de turma",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_available, credits_reserved, credits_used, credits_total")
+      .eq("id", groupRacePackageBefore.id),
+  );
+  check(
+    groupRacePackageAfter.credits_reserved ===
+      groupRacePackageBefore.credits_reserved - groupRaceParticipantBefore.credits_reserved &&
+      groupRacePackageAfter.credits_available ===
+        groupRacePackageBefore.credits_available + groupRaceParticipantBefore.credits_reserved &&
+      groupRacePackageAfter.credits_used === groupRacePackageBefore.credits_used &&
+      groupRacePackageAfter.credits_total === groupRacePackageBefore.credits_total,
+    "O credito volta exatamente uma vez: reservado desce, disponivel sobe, utilizado nao mexe",
+  );
+
+  const groupRaceLedgerAfter = await teacherClient
+    .from("package_credit_transactions")
+    .select("id, type")
+    .eq("lesson_id", groupRaceLessonId);
+  if (groupRaceLedgerAfter.error) {
+    throw new Error(`Livro-razao depois da corrida: ${summarizeError(groupRaceLedgerAfter.error)}`);
+  }
+  const releasesForRace = (groupRaceLedgerAfter.data ?? []).filter(
+    (row) => row.type === "reservation_released",
+  );
+  check(
+    releasesForRace.length === 1 &&
+      (groupRaceLedgerAfter.data ?? []).length ===
+        (groupRaceLedgerBefore.data ?? []).length + 1,
+    "O livro-razao recebe uma unica libertacao, e nada vindo da confirmacao",
+    `${(groupRaceLedgerBefore.data ?? []).length} -> ${(groupRaceLedgerAfter.data ?? []).length}`,
+  );
+
+  const groupRaceColleagueAfter = await readParticipant(groupRaceLessonId, groupStudent.id);
+  const groupRaceColleaguePackageAfter = await getSingle(
+    "pacote do colega depois da corrida",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_available, credits_reserved, credits_used, credits_total")
+      .eq("id", groupRaceColleaguePackageBefore.id),
+  );
+  check(
+    groupRaceColleagueAfter.status === groupRaceColleagueBefore.status &&
+      groupRaceColleagueAfter.billing_status === groupRaceColleagueBefore.billing_status &&
+      groupRaceColleagueAfter.credits_reserved === groupRaceColleagueBefore.credits_reserved &&
+      groupRaceColleagueAfter.attendance_status === null,
+    "O colega de turma fica exatamente como estava",
+  );
+  check(
+    groupRaceColleaguePackageAfter.credits_available ===
+      groupRaceColleaguePackageBefore.credits_available &&
+      groupRaceColleaguePackageAfter.credits_reserved ===
+        groupRaceColleaguePackageBefore.credits_reserved &&
+      groupRaceColleaguePackageAfter.credits_used ===
+        groupRaceColleaguePackageBefore.credits_used,
+    "A corrida nao tocou no pacote de nenhum colega",
+  );
+
+  await mustReject("Uma participacao cancelada nao volta atras por confirmacao", async () =>
+    studentClient.rpc("confirm_lesson_participation", { p_lesson_id: groupRaceLessonId }),
   );
 
   // Reagendar preserva a resposta do aluno: quem ja tinha dito que ia continua

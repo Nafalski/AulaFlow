@@ -544,6 +544,8 @@ Quando a aula já tem presenças registadas, o caminho não é oferecido e a raz
 
 **Recorrência:** cada ocorrência herda o pedido de confirmação e é respondida isoladamente. Não existe confirmar a série inteira nem "esta e futuras".
 
+**Concorrência coberta:** confirmar × confirmar, confirmar × cancelar a aula, confirmar × cancelar a participação de turma e confirmar × reagendar, todas com JWTs reais. `confirm_lesson_participation()` e `cancel_lesson_participation()` bloqueiam `lessons` primeiro e só depois as participações, por isso serializam na aula. Os dois interleavings possíveis terminam no mesmo estado — `declined` e `released` —, e a confirmação nunca sobrevive a um cancelamento, nunca cria presença e nunca escreve no livro-razão.
+
 **Projeção:** `student_lesson_records` ganhou apenas `requires_confirmation`. `confirmed_at` ficou de fora — a interface precisa de saber se já respondeu, e isso está em `participation_status`.
 
 **Ainda não implementado (7B):** interface do professor para pedir confirmação, interface do aluno para responder, e o gate de browser/mobile.
