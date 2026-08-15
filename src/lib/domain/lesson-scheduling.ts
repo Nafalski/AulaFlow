@@ -43,6 +43,15 @@ export const PARTICIPANT_MODE_LABELS: Record<LessonParticipantMode, string> = {
 export const LESSON_DURATION_LIMITS = { min: 10, max: 720 } as const;
 export const LESSON_TITLE_LIMITS = { min: 2, max: 120 } as const;
 
+/**
+ * Motivo do reagendamento (Etapa 6C.2).
+ *
+ * O mínimo é o do PostgreSQL: a constraint da Fase 1 exige pelo menos 3
+ * caracteres depois de aparar. O máximo é escolha do produto — o motivo é uma
+ * linha de histórico operacional, não um relatório.
+ */
+export const LESSON_RESCHEDULE_REASON_LIMITS = { min: 3, max: 500 } as const;
+
 export const LESSON_RECURRENCE_MODES = ["none", "weekly"] as const;
 export type LessonRecurrenceMode = (typeof LESSON_RECURRENCE_MODES)[number];
 

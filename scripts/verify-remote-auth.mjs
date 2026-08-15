@@ -4848,36 +4848,65 @@ try {
     mixedGroupLessonId,
     mixedStudentGroupB.lesson_participant_id,
   );
+  // A fixture precisa de uma turma mista JA acontecida, mas cancelar uma
+  // participacao so e possivel antes do inicio. Desde a 6C.2, mover a aula
+  // deixou de ser trabalho da edicao: quem move e o reagendamento, e o que ele
+  // devolve e uma aula NOVA — a original fica no historico com os participantes
+  // que tinha.
   const moveMixedToPast = phase6Slot(2);
-  const moveMixed = await teacherClient.rpc("update_lesson", {
+  const moveMixed = await teacherClient.rpc("reschedule_lesson", {
     p_lesson_id: mixedGroupLessonId,
     p_starts_at: lisbonInstant(phase6bPastDate, moveMixedToPast.startsAt),
     p_ends_at: lisbonInstant(phase6bPastDate, moveMixedToPast.endsAt),
-    p_title: `Aula E2E 6B turma mista passada ${phase6RunSuffix}`,
+    p_reason: "Fixture 6B: turma mista passa a ser passada",
     p_location_id: null,
     p_location_resource_id: null,
-    p_notes_for_students: "e2e_6b_mista",
-    p_private_notes: "e2e_6b_mista_privada",
+    p_idempotency_key: deterministicUuid(`lesson-6b-mixed-move:${phase6RunSuffix}`),
   });
-  if (moveMixed.error) throw new Error(`Mover turma mista 6B: ${summarizeError(moveMixed.error)}`);
+  if (moveMixed.error || !moveMixed.data) {
+    throw new Error(`Mover turma mista 6B: ${summarizeError(moveMixed.error)}`);
+  }
+  const mixedPastLessonId = moveMixed.data;
+
+  // A substituta tem participacoes proprias: os identificadores anteriores
+  // pertencem a aula que ficou no historico.
+  const mixedPastRows = await teacherClient
+    .from("teacher_lesson_participant_credit_records")
+    .select("lesson_participant_id, student_id, status, billing_status, credits_reserved, credits_consumed, package_name")
+    .eq("lesson_id", mixedPastLessonId);
+  if (mixedPastRows.error) {
+    throw new Error(`Participantes da turma mista movida: ${summarizeError(mixedPastRows.error)}`);
+  }
+  const mixedPastStudentA = mixedPastRows.data?.find((row) => row.student_id === studentsA.id);
+  const mixedPastStudentGroup = mixedPastRows.data?.find(
+    (row) => row.student_id === groupStudent.id,
+  );
+  if (!mixedPastStudentA || !mixedPastStudentGroup) {
+    throw new Error("Turma mista movida sem os participantes esperados");
+  }
+  check(
+    (mixedPastRows.data ?? []).find((row) => row.student_id === groupStudentB.id)?.status ===
+      "declined",
+    "A participacao cancelada acompanha a turma mista reagendada",
+  );
   await setAttendanceStatus(
     teacherClient,
-    mixedGroupLessonId,
-    mixedStudentA.lesson_participant_id,
+    mixedPastLessonId,
+    mixedPastStudentA.lesson_participant_id,
     "present",
   );
   await setAttendanceStatus(
     teacherClient,
-    mixedGroupLessonId,
-    mixedStudentGroup.lesson_participant_id,
+    mixedPastLessonId,
+    mixedPastStudentGroup.lesson_participant_id,
     "absent",
   );
-  const mixedComplete = await completeLessonRpc(teacherClient, mixedGroupLessonId);
+  const mixedComplete = await completeLessonRpc(teacherClient, mixedPastLessonId);
   if (mixedComplete.error) throw new Error(`Concluir turma mista 6B: ${summarizeError(mixedComplete.error)}`);
   const mixedAfter = await teacherClient
     .from("teacher_lesson_participant_credit_records")
     .select("student_id, status, attendance_status, billing_status, credits_reserved, credits_consumed")
-    .eq("lesson_id", mixedGroupLessonId);
+    .eq("lesson_id", mixedPastLessonId);
   if (mixedAfter.error) throw new Error(`Ler turma mista 6B: ${summarizeError(mixedAfter.error)}`);
   check(
     mixedComplete.data === true &&
@@ -4907,7 +4936,7 @@ try {
     studentClient
       .from("student_lesson_records")
       .select("id, participation_status, attendance_status, billing_status, credits_reserved, credits_consumed")
-      .eq("id", mixedGroupLessonId),
+      .eq("id", mixedPastLessonId),
   );
   check(
     mixedStudentProjection.attendance_status === "present" &&
@@ -5184,26 +5213,27 @@ try {
 
   // ── Edicao ────────────────────────────────────────────────────────────────
 
+  // Colocacao a `null` e "nao mexer": e o que a interface de edicao envia desde
+  // a 6C.2. Um valor de colocacao diferente do atual e recusado pelo servidor.
   const editLesson = (client, overrides = {}) =>
     client.rpc("update_lesson", {
       p_lesson_id: lessonId,
-      p_starts_at: lisbonInstant(lessonDate, "10:00"),
-      p_ends_at: lisbonInstant(lessonDate, "11:00"),
+      p_starts_at: null,
+      p_ends_at: null,
       p_title: lessonTitle,
-      p_location_id: privateLocationId,
-      p_location_resource_id: courtId,
+      p_location_id: null,
+      p_location_resource_id: null,
       p_notes_for_students: "e2e_nota_publica",
       p_private_notes: "e2e_nota_privada",
       ...overrides,
     });
 
-  // Normaliza, prova a idempotencia, prova uma alteracao real e volta atras —
+  // Normaliza, prova a idempotencia e prova uma alteracao real de conteudo —
   // nesta ordem, para a seccao correr as vezes que forem precisas.
   await editLesson(teacherClient);
   const { data: editRepeat, error: editRepeatError } = await editLesson(teacherClient);
   const { data: editChanged, error: editChangedError } = await editLesson(teacherClient, {
-    p_starts_at: lisbonInstant(lessonDate, "11:00"),
-    p_ends_at: lisbonInstant(lessonDate, "12:00"),
+    p_notes_for_students: "e2e_nota_publica_revista",
   });
   const { data: editRestored, error: editRestoredError } = await editLesson(teacherClient);
   const editFailure = [editRepeatError, editChangedError, editRestoredError]
@@ -5212,9 +5242,66 @@ try {
     .join(" | ");
   check(
     editRepeat === false && editChanged === true && editRestored === true,
-    `Editar aplica alteracoes reais e ignora submissoes iguais${
+    `Editar conteudo aplica alteracoes reais e ignora submissoes iguais${
       editFailure ? `: ${editFailure}` : ""
     }`,
+  );
+
+  // ── A fronteira entre editar e reagendar (Etapa 6C.2) ─────────────────────
+  //
+  // Retirar os campos do formulario nao chega: `update_lesson()` tem EXECUTE
+  // para `authenticated`, e um PATCH direto contornaria a interface. A recusa
+  // vive no PostgreSQL, e e aqui que se prova com um JWT real.
+  const placementBeforeBoundary = await getSingle(
+    "colocacao antes da fronteira 6C.2",
+    teacherClient
+      .from("teacher_lesson_schedule_records")
+      .select("id, starts_at, ends_at, location_id, location_resource_id")
+      .eq("id", lessonId),
+  );
+
+  await mustReject("Editar nao muda a hora da aula", async () =>
+    editLesson(teacherClient, {
+      p_starts_at: lisbonInstant(lessonDate, "11:00"),
+      p_ends_at: lisbonInstant(lessonDate, "12:00"),
+    }),
+  );
+  await mustReject("Editar nao muda o local da aula", async () =>
+    editLesson(teacherClient, { p_location_id: clubLocationId }),
+  );
+  await mustReject("Editar nao muda o campo da aula", async () =>
+    editLesson(teacherClient, {
+      p_location_id: privateLocationId,
+      p_location_resource_id: clubResourceId,
+    }),
+  );
+
+  const placementAfterBoundary = await getSingle(
+    "colocacao depois da fronteira 6C.2",
+    teacherClient
+      .from("teacher_lesson_schedule_records")
+      .select("id, starts_at, ends_at, location_id, location_resource_id")
+      .eq("id", lessonId),
+  );
+  check(
+    placementAfterBoundary.starts_at === placementBeforeBoundary.starts_at &&
+      placementAfterBoundary.ends_at === placementBeforeBoundary.ends_at &&
+      placementAfterBoundary.location_id === placementBeforeBoundary.location_id &&
+      placementAfterBoundary.location_resource_id ===
+        placementBeforeBoundary.location_resource_id,
+    "Nenhuma tentativa de mover a aula pela edicao deixou marca",
+  );
+
+  // Reenviar a colocacao atual nao e uma tentativa de a mudar.
+  const { error: echoError } = await editLesson(teacherClient, {
+    p_starts_at: placementBeforeBoundary.starts_at,
+    p_ends_at: placementBeforeBoundary.ends_at,
+    p_location_id: placementBeforeBoundary.location_id,
+    p_location_resource_id: placementBeforeBoundary.location_resource_id,
+  });
+  check(
+    echoError === null,
+    `Reenviar a colocacao atual e aceite${echoError ? `: ${summarizeError(echoError)}` : ""}`,
   );
 
   const historyRows = await teacherClient

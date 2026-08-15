@@ -31,7 +31,8 @@ export type LessonOperationOutcome =
   | { operation: "attendance"; attendance: "present" | "absent" | null; changed: boolean }
   | { operation: "lesson_cancelled"; changed: boolean }
   | { operation: "participation_cancelled"; changed: boolean }
-  | { operation: "lesson_completed"; changed: boolean };
+  | { operation: "lesson_completed"; changed: boolean }
+  | { operation: "lesson_rescheduled"; changed: boolean };
 
 type TeacherAuthorization =
   | { user: SessionUser & { teacherId: string }; state?: never }

@@ -16,18 +16,21 @@ import {
   LESSON_CREATE_FIELDS,
   LESSON_COMPLETE_FIELDS,
   LESSON_PARTICIPANT_CANCEL_FIELDS,
+  LESSON_RESCHEDULE_FIELDS,
   LESSON_UPDATE_FIELDS,
   lessonAttendanceSchema,
   lessonCancelSchema,
   lessonCompleteSchema,
   lessonCreateSchema,
   lessonParticipantCancelSchema,
+  lessonRescheduleSchema,
   lessonUpdateSchema,
   readLessonAttendanceFormData,
   readLessonCancelFormData,
   readLessonCompleteFormData,
   readLessonCreateFormData,
   readLessonParticipantCancelFormData,
+  readLessonRescheduleFormData,
   readLessonUpdateFormData,
   unexpectedLessonFields,
 } from "@/lib/validation/lessons";
@@ -202,15 +205,17 @@ export async function updateLessonAction(
   if (authorization.state) return authorization.state;
 
   try {
-    const { startsAt, endsAt } = lessonWindow(parsed.data);
     const supabase = await createSupabaseServerClient();
+    // Colocação a `null` é "não mexer". Desde a 6C.2, `update_lesson()` recusa
+    // qualquer valor de colocação diferente do atual — mover uma aula é
+    // reagendar, e reagendar deixa rasto.
     const { data, error } = await supabase.rpc("update_lesson", {
       p_lesson_id: parsed.data.lessonId,
-      p_starts_at: startsAt.toISOString(),
-      p_ends_at: endsAt.toISOString(),
+      p_starts_at: null,
+      p_ends_at: null,
       p_title: parsed.data.title,
-      p_location_id: parsed.data.locationId,
-      p_location_resource_id: parsed.data.locationResourceId,
+      p_location_id: null,
+      p_location_resource_id: null,
       p_notes_for_students: parsed.data.notesForStudents,
       p_private_notes: parsed.data.privateNotes,
     });
@@ -231,6 +236,90 @@ export async function updateLessonAction(
     };
   } catch (error) {
     return persistenceState("Erro inesperado ao atualizar uma aula.", error);
+  }
+}
+
+/**
+ * Reagendar uma aula (Etapa 6C.2).
+ *
+ * O único caminho da interface para mover uma aula. Não chama `update_lesson()`,
+ * não cancela e volta a criar, e não mexe em créditos: `reschedule_lesson()`
+ * transfere a reserva entre participações na mesma transação.
+ *
+ * A DURAÇÃO NÃO VEM DO BROWSER. É lida da aula original e somada ao novo
+ * início, porque reagendar move a aula — não a encurta. Um `p_ends_at` vindo do
+ * cliente deixaria alterar a duração por um formulário que nem sequer a mostra.
+ *
+ * Como em toda a Fase 6B.2, a Action responde sozinha: sem `revalidatePath()` e
+ * sem `redirect()`. O cliente navega para a substituta depois de a Action
+ * resolver — assim a mutação nunca fica presa ao carregamento da rota seguinte.
+ */
+export async function rescheduleLessonAction(
+  _previousState: TeacherManagementActionState,
+  formData: FormData,
+): Promise<TeacherManagementActionState> {
+  void _previousState;
+
+  const extraFields = unexpectedLessonFields(formData, LESSON_RESCHEDULE_FIELDS);
+  if (extraFields.length > 0) return unexpectedFieldsState(extraFields);
+
+  const parsed = lessonRescheduleSchema.safeParse(readLessonRescheduleFormData(formData));
+  if (!parsed.success) return validationState(parsed.error);
+
+  const authorization = await authorizeActiveTeacher();
+  if (authorization.state) return authorization.state;
+
+  try {
+    const supabase = await createSupabaseServerClient();
+
+    // A duração é derivada da aula real. A projeção é a do professor da sessão,
+    // por isso ler daqui não abre nada: quem não é o dono não recebe linha
+    // nenhuma, e a RPC continua a ser a autoridade final sobre quem pode mover.
+    const { data: current, error: readError } = await supabase
+      .from("teacher_lesson_schedule_records")
+      .select("id, duration_minutes")
+      .eq("id", parsed.data.lessonId)
+      .maybeSingle();
+
+    if (readError || !current) {
+      return persistenceState(
+        "Falha ao ler a aula a reagendar.",
+        readError,
+        "Não foi possível carregar esta aula. Atualize a página e tente novamente.",
+      );
+    }
+
+    const startsAt = lisbonInputToInstant(parsed.data.date, parsed.data.time);
+    const endsAt = addMinutes(startsAt, current.duration_minutes);
+
+    const { data, error } = await supabase.rpc("reschedule_lesson", {
+      p_lesson_id: parsed.data.lessonId,
+      p_starts_at: startsAt.toISOString(),
+      p_ends_at: endsAt.toISOString(),
+      p_reason: parsed.data.reason,
+      p_location_id: parsed.data.locationId,
+      p_location_resource_id: parsed.data.locationResourceId,
+      p_idempotency_key: parsed.data.idempotencyKey,
+    });
+
+    if (error || !data) {
+      return persistenceState(
+        "Falha ao reagendar uma aula.",
+        error,
+        lessonMessage(error?.message, "Não foi possível reagendar a aula. Tente novamente."),
+      );
+    }
+
+    // `resourceId` é o identificador da substituta, e é tudo o que o cliente
+    // precisa para navegar. Nada financeiro, nada de organização, nada de actor.
+    return {
+      status: "success",
+      message: "Aula reagendada.",
+      resourceId: data,
+      confirmed: { operation: "lesson_rescheduled", changed: true },
+    };
+  } catch (error) {
+    return persistenceState("Erro inesperado ao reagendar uma aula.", error);
   }
 }
 

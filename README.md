@@ -6,7 +6,7 @@ Professores configuram alunos, pacotes, disponibilidade, locais e aulas; os alun
 A começar pelo **beach tennis**, com arquitetura preparada para outras modalidades.
 
 > **Estado:** Fases 1, 1.5, 2, 3, 4 e 5 concluídas. A Fase 6A acrescentou presença e conclusão segura da aula; a Fase 6B acrescenta cancelamento de aula, cancelamento de participação em turma e falta/no-show com destino financeiro seguro.
-> A **Etapa 6C.1** acrescenta o contrato transacional de reagendamento: a aula original fica histórica, a substituta herda participantes e reserva, e nenhum saldo se move. A interface de reagendamento (6C.2) ainda não existe.
+> A **Etapa 6C.1** acrescenta o contrato transacional de reagendamento: a aula original fica histórica, a substituta herda participantes e reserva, e nenhum saldo se move. A **Etapa 6C.2** liga-o à aplicação e separa as duas intenções: editar muda conteúdo (título e observações), reagendar muda a colocação (data, hora, local, campo) e deixa rasto. A duração é preservada, e o reagendamento afeta apenas esta ocorrência. Reagendamento pelo aluno e alteração de série inteira continuam por implementar.
 > Reagendamento operacional, self-service de cancelamento do aluno, política configurável de janelas, notificações, pagamentos e transferência/fusão de pacotes continuam nas etapas seguintes.
 
 ---
@@ -74,7 +74,7 @@ Instruções completas — incluindo a configuração do Supabase — em [`AGENT
 
 `/professor/clubes` gere contextos, clubes e membros; `/professor/clubes/[id]/calendario` mostra a disponibilidade partilhada do clube; `/professor/convites` mostra os convites recebidos. `/professor/pacotes` gere modelos reutilizáveis, atribuição, consulta e ajustes administrativos dos pacotes atribuídos. `/professor/pacotes/historico` mostra a auditoria global. `/professor/definicoes/disponibilidade` guarda a fonte de verdade da agenda do professor. `/professor/calendario` e `/aluno/calendario` mostram disponibilidade e aulas em Dia/Semana/Mês. `/aluno/pacotes` mostra apenas os próprios pacotes e movimentos básicos.
 
-O próximo passo planeado é a Fase 6C: reagendamento operacional seguro. O professor independente continua totalmente suportado, com workspace pessoal privado e agenda própria, e não precisa criar clube nenhum.
+O próximo passo planeado é a Fase 7: a área do aluno, com aulas, créditos e confirmação. O professor independente continua totalmente suportado, com workspace pessoal privado e agenda própria, e não precisa criar clube nenhum.
 
 Entrar num clube **não** partilha a agenda: `calendar_sharing_enabled` nasce desativado e só o próprio membro o altera — proprietários, gestores e a administração da plataforma não têm caminho para forçar a partilha de outra pessoa. Os locais e os seus campos já são partilhados com o clube; alunos, pacotes, turmas e disponibilidade continuam ligados ao workspace pessoal, e a interface diz isso explicitamente em vez de o esconder.
 

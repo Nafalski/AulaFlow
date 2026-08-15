@@ -10141,6 +10141,12 @@ const historyBeforeEdit = await one(
   [individualLesson.id],
 );
 
+// A edição deixou de poder mover a aula (Etapa 6C.2).
+//
+// Os parâmetros de colocação continuam na assinatura, mas nulo significa "não
+// mexer" — que é o que a interface de edição envia — e um valor diferente do
+// atual é recusado. Mover uma aula passa a ter um único caminho, e esse deixa
+// rasto.
 const editLesson = (uid, args = {}) =>
   asDatabaseRole("authenticated", uid, () =>
     one(
@@ -10149,11 +10155,11 @@ const editLesson = (uid, args = {}) =>
          $5::uuid, $6::uuid, $7::text, $8::text) as done`,
       [
         args.lessonId ?? individualLesson.id,
-        args.start ?? "2026-08-24 10:00+00",
-        args.end ?? "2026-08-24 11:00+00",
+        args.start ?? null,
+        args.end ?? null,
         args.title ?? "Aula individual 5C",
-        args.locationId ?? managedLocation.id,
-        args.resourceId ?? court1.id,
+        args.locationId ?? null,
+        args.resourceId ?? null,
         args.notes ?? null,
         args.privateNotes ?? "Nota reservada ao professor",
       ],
@@ -10167,8 +10173,14 @@ const editLedgerBefore = await one(
     where student_package_id=$1 and lesson_id=$2 and type='credit_reserved'`,
   [schedulingAnaPack.id, individualLesson.id],
 );
-const edited = await editLesson(TEACHER_UID);
-const editedAgain = await editLesson(TEACHER_UID);
+const placementBeforeEdit = await one(
+  `select starts_at, ends_at, location_id, location_resource_id
+     from public.lessons where id=$1`,
+  [individualLesson.id],
+);
+
+const edited = await editLesson(TEACHER_UID, { title: "Aula individual 5C revista" });
+const editedAgain = await editLesson(TEACHER_UID, { title: "Aula individual 5C revista" });
 const editPackageAfter = await pkg(schedulingAnaPack.id);
 const editLedgerAfter = await one(
   `select count(*)::int as total
@@ -10184,46 +10196,92 @@ check(
   edited.done === true &&
     editedAgain.done === false &&
     Number(historyAfterEdit.total) === Number(historyBeforeEdit.total) + 1,
-  "editar altera, repetir é no-op e o histórico não ganha entrada duplicada",
+  "editar o título altera, repetir é no-op e o histórico não ganha entrada duplicada",
 );
 check(
   editPackageAfter.credits_available === editPackageBefore.credits_available &&
     editPackageAfter.credits_reserved === editPackageBefore.credits_reserved &&
     Number(editLedgerAfter.total) === Number(editLedgerBefore.total),
-  "editar horário válido conserva a mesma reserva sem ledger duplicado",
+  "editar conteúdo não mexe em créditos nem no livro-razão",
 );
 
-const timeChange = await one(
-  `select change_type::text, previous_values, new_values
-     from public.lesson_change_history
-    where lesson_id=$1 and change_type='time_changed'
-    order by created_at desc limit 1`,
+// As observações são conteúdo, e continuam editáveis.
+const notesEdited = await editLesson(TEACHER_UID, {
+  title: "Aula individual 5C revista",
+  notes: "Trazer duas raquetes",
+});
+const notesRow = await one(
+  `select notes_for_students, title from public.lessons where id=$1`,
   [individualLesson.id],
 );
 check(
-  timeChange?.change_type === "time_changed" &&
-    timeChange.previous_values?.starts_at !== undefined &&
-    timeChange.new_values?.starts_at !== undefined,
-  "histórico guarda o antes e o depois de uma alteração de horário",
+  notesEdited.done === true &&
+    notesRow.notes_for_students === "Trazer duas raquetes" &&
+    notesRow.title === "Aula individual 5C revista",
+  "editar observações para o aluno é permitido",
 );
 
-await mustReject("editar para fora da disponibilidade", () =>
-  editLesson(TEACHER_UID, { start: "2026-08-24 20:00+00", end: "2026-08-24 21:00+00" }),
-);
+// ── A fronteira: editar não move a aula ─────────────────────────────────────
+
 await mustReject(
-  "editar para data fora da validade do pacote reservado",
+  "editar não muda a hora da aula",
   () =>
     editLesson(TEACHER_UID, {
-      start: "2026-09-01 09:00+00",
-      end: "2026-09-01 10:00+00",
+      title: "Aula individual 5C revista",
+      start: "2026-08-24 12:00+00",
+      end: "2026-08-24 13:00+00",
     }),
-  "créditos reservados",
+  "reagendamento",
 );
+await mustReject(
+  "editar não muda o local da aula",
+  () => editLesson(TEACHER_UID, { title: "Aula individual 5C revista", locationId: clubLocation.id }),
+  "reagendamento",
+);
+await mustReject(
+  "editar não muda o campo da aula",
+  () => editLesson(TEACHER_UID, { title: "Aula individual 5C revista", resourceId: court2.id }),
+  "reagendamento",
+);
+
+const placementAfterEdit = await one(
+  `select starts_at, ends_at, location_id, location_resource_id
+     from public.lessons where id=$1`,
+  [individualLesson.id],
+);
+check(
+  placementAfterEdit.starts_at.getTime() === placementBeforeEdit.starts_at.getTime() &&
+    placementAfterEdit.ends_at.getTime() === placementBeforeEdit.ends_at.getTime() &&
+    placementAfterEdit.location_id === placementBeforeEdit.location_id &&
+    placementAfterEdit.location_resource_id === placementBeforeEdit.location_resource_id,
+  "nenhuma tentativa de mover a aula pela edição deixou marca",
+);
+check(
+  Number(
+    (
+      await one(
+        `select count(*)::int as total from public.lesson_change_history
+          where lesson_id=$1 and change_type='time_changed'`,
+        [individualLesson.id],
+      )
+    ).total,
+  ) === 0,
+  "a edição não escreve alterações de horário no histórico",
+);
+
+// Reenviar exatamente a colocação atual não é uma tentativa de a mudar.
+const echoPlacement = await editLesson(TEACHER_UID, {
+  title: "Aula individual 5C revista",
+  notes: "Trazer duas raquetes",
+  start: placementBeforeEdit.starts_at.toISOString(),
+  end: placementBeforeEdit.ends_at.toISOString(),
+  locationId: placementBeforeEdit.location_id,
+  resourceId: placementBeforeEdit.location_resource_id,
+});
+check(echoPlacement.done === false, "reenviar a colocação atual é aceite e não muda nada");
+
 await mustReject("outro professor não edita a aula", () =>
   editLesson(OTHER_TEACHER_UID, { title: "Apropriação" }),
-);
-await mustReject("editar com recurso de outro local", () =>
-  editLesson(TEACHER_UID, { resourceId: clubCourt1.id }),
 );
 
 await markLessonParticipantsPresentFixture(contiguousLesson.id);
@@ -10891,12 +10949,12 @@ const reschedBrunoPack = await assignPackageAs(TEACHER_UID, {
 });
 
 /** Aula criada diretamente, com a reserva feita a partir de um pacote escolhido. */
-async function reschedulableLesson({ title, start, end, students }) {
+async function reschedulableLesson({ title, start, end, students, groupId = null }) {
   const lesson = await one(
     `insert into public.lessons
-       (organization_id, teacher_id, sport_id, title, starts_at, ends_at, credit_cost)
-     values ($1,$2,$3,$4,$5::timestamptz,$6::timestamptz,1) returning id`,
-    [org, teacher.id, sport, title, start, end],
+       (organization_id, teacher_id, sport_id, title, starts_at, ends_at, credit_cost, group_id)
+     values ($1,$2,$3,$4,$5::timestamptz,$6::timestamptz,1,$7::uuid) returning id`,
+    [org, teacher.id, sport, title, start, end, groupId],
   );
   for (const [studentId, packageId] of students) {
     await reserveParticipant(lesson.id, studentId, packageId);
@@ -11472,6 +11530,53 @@ check(
   groupPartsAfter.every((part) => part.billing_status === "reserved") &&
     (await ledgerRows()) === groupLedgerBefore,
   "cada reserva da turma é transferida sem tocar no livro-razão",
+);
+
+// ── Turma com uma participação cancelada ───────────────────────────────────
+//
+// Este é o único caminho que copia uma participação em vez de lhe transferir a
+// reserva. Passou despercebido até aqui porque exige uma participação que NÃO
+// está `reserved`.
+
+const declinedReschedLesson = await reschedulableLesson({
+  title: "Turma com desistência 6C.2",
+  start: "2026-09-21 12:00+00",
+  end: "2026-09-21 13:00+00",
+  groupId: managedGroup.id,
+  students: [
+    [ana.id, reschedAnaPack.id],
+    [bruno.id, reschedBrunoPack.id],
+  ],
+});
+const declinedParticipant = await one(
+  `select id from public.lesson_participants where lesson_id=$1 and student_id=$2`,
+  [declinedReschedLesson.id, bruno.id],
+);
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(`select public.cancel_lesson_participation($1,$2)`, [
+    declinedReschedLesson.id,
+    declinedParticipant.id,
+  ]),
+);
+const declinedLedgerBefore = await ledgerRows();
+const declinedReplacement = await rescheduleAs(TEACHER_UID, {
+  lessonId: declinedReschedLesson.id,
+  start: "2026-09-21 14:00+00",
+  end: "2026-09-21 15:00+00",
+  reason: "Turma pediu mais tarde",
+});
+const declinedAfter = await participationsOf(declinedReplacement.id);
+check(
+  declinedAfter.length === 2 &&
+    declinedAfter.filter((part) => part.status === "declined").length === 1 &&
+    declinedAfter.filter((part) => part.billing_status === "reserved").length === 1,
+  "uma participação cancelada acompanha a turma reagendada sem voltar a ser cobrada",
+);
+check(
+  declinedAfter.find((part) => part.student_id === bruno.id)?.billing_status === "released" &&
+    declinedAfter.find((part) => part.student_id === bruno.id)?.credits_reserved === 0 &&
+    (await ledgerRows()) === declinedLedgerBefore,
+  "a participação libertada continua libertada e não escreve no livro-razão",
 );
 
 // ── Recorrência: só esta ocorrência ─────────────────────────────────────────

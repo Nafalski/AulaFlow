@@ -2220,11 +2220,16 @@ export type Database = {
         };
         Returns: Json;
       };
+      /**
+       * Edita apenas o conteúdo da aula. Desde a Etapa 6C.2, os parâmetros de
+       * colocação aceitam `null` com o significado "não mexer"; um valor
+       * diferente do atual é recusado, porque mover uma aula é reagendar.
+       */
       update_lesson: {
         Args: {
           p_lesson_id: UUID;
-          p_starts_at: Timestamp;
-          p_ends_at: Timestamp;
+          p_starts_at: Timestamp | null;
+          p_ends_at: Timestamp | null;
           p_title: string;
           p_location_id?: UUID | null;
           p_location_resource_id?: UUID | null;

@@ -165,7 +165,10 @@ update public.profiles set role = 'admin' where email = 'voce@exemplo.pt';
 │   ├── ..._phase6a_lesson_completion.sql Fase 6A: presença e conclusão segura
 │   ├── ..._phase6b_lesson_cancellations.sql Fase 6B: cancelamentos, faltas e créditos
 │   ├── ..._phase6c1_lesson_rescheduling.sql Fase 6C.1: reagendamento transacional
-│   └── ..._phase6c1a_reschedule_idempotency.sql Fase 6C.1A: intenção de reagendamento obrigatória
+│   ├── ..._phase6c1a_reschedule_idempotency.sql Fase 6C.1A: intenção de reagendamento obrigatória
+│   ├── ..._phase6c2_edit_placement_boundary.sql Fase 6C.2: editar deixa de mover a aula
+│   ├── ..._phase6c2_reschedule_declined_cast.sql Fase 6C.2: copiar participação não reservada
+│   └── ..._phase6c2_reschedule_released_participation.sql Fase 6C.2: libertada continua libertada
 │
 └── src/
     ├── proxy.ts             Renova a sessão e protege rotas (era middleware.ts)
@@ -480,11 +483,32 @@ Ao reencontrar a chave, a função confirma que a substituta é mesmo **desta** 
 
 **A substituta herda o estado da original.** Uma aula `confirmed` produz uma substituta `confirmed`. Não existe no produto nenhum fluxo de reconfirmação pelo aluno — a Fase 7 é que o traz —, por isso baixar para `scheduled` inventaria um passo que ninguém pode dar.
 
-**A concorrência real está coberta pela via do reagendamento (6C.1B).** Com JWTs reais e chamadas em paralelo: reagendar × reagendar (mesma original), mesma chave em simultâneo, reagendar × cancelar, reagendar × editar, reagendar × concluir, disputa de recurso e conflito de professor com intervalo mínimo. Cada corrida verifica o **estado final** — estado da original, número de substitutas, participação, os três baldes de créditos, livro-razão e histórico —, nunca apenas quantas chamadas devolveram sucesso.
+**A concorrência real está coberta pela via do reagendamento (6C.1B).** Com JWTs reais e chamadas em paralelo: reagendar × reagendar (mesma original), mesma chave em simultâneo, reagendar × cancelar, reagendar × editar, reagendar × concluir, disputa de recurso e conflito de professor com intervalo mínimo. Todas verificam o **estado final** e não apenas quantas chamadas devolveram sucesso; a profundidade varia com o que cada corrida põe em risco. Todas confirmam o estado da original e o número de substitutas; as que mexem em cobrança confirmam também participação, os três baldes de créditos, livro-razão e histórico.
 
 `reschedule_lesson()` e `complete_lesson()` bloqueiam a **mesma linha** de `lessons` com `for update`, por isso serializam. O que as separa não é o lock, é a presença: concluir exige desfecho final para todos os participantes ativos, reagendar recusa se existir qualquer registo de presença. São mutuamente exclusivas por construção, e as duas metades estão testadas.
 
-**Ainda não existe interface** (6C.2), nem reagendamento de série inteira, "esta e futuras" ou self-reschedule do aluno.
+### Editar conteúdo não é reagendar colocação (Etapa 6C.2)
+
+A fronteira deixou de ser uma frase e passou a ser uma regra do PostgreSQL.
+
+| Intenção | O que muda | Caminho |
+|---|---|---|
+| **Editar** | título, observações para o aluno, observações privadas | `update_lesson()` |
+| **Reagendar** | data, hora, local, campo — com motivo | `reschedule_lesson()` |
+
+`update_lesson()` mantém a assinatura mas o significado dos parâmetros de colocação mudou: **nulo ou igual ao atual é ignorado; diferente é recusado**. Retirar os campos do formulário não seria barreira nenhuma — a RPC tem `EXECUTE` para `authenticated` e um PATCH direto contornaria a interface. Passar `NULL` deixou também de servir para apagar o local de uma aula: isso é colocação, e faz-se por `reschedule_lesson(p_location_id => null)`.
+
+**A duração é preservada e não é um campo.** A Server Action lê a duração da aula original e soma-a ao novo início. O browser não a envia: aceitá-la deixaria encurtar uma aula por um formulário aberto para mudar o dia.
+
+**O contexto é fixo.** Uma aula de clube continua desse clube, e é ele que decide os locais oferecidos. `context_kind` e `club_organization_id` não entram no formulário.
+
+A interface vive em `/professor/aulas/[id]/reagendar` — rota própria, e não mais um formulário no detalhe: são dois submits com consequências diferentes, e um deles arquiva a aula antiga. A página mostra a aula atual, o destino escolhido, a duração preservada e, numa série, que a alteração afeta só esta ocorrência.
+
+**A Action não revalida nem redireciona.** Mantém o contrato da 6B.2: responde sozinha, devolve o identificador da substituta em `resourceId`, e só então o cliente faz `router.replace()` para a aula nova. Nada financeiro, nenhuma organização e nenhum actor entram na resposta.
+
+Quando a aula já tem presenças registadas, o caminho não é oferecido e a razão é dita — mas quem decide continua a ser `reschedule_lesson()`.
+
+**Ainda não implementado:** reagendamento de série inteira, "esta e futuras", self-reschedule do aluno, desfazer reagendamento, política de janela/multa e notificações. O motivo do reagendamento fica no histórico operacional e **não** é enviado ao aluno nem por email — não existe envio nenhum.
 
 ### Ao criar uma tabela nova
 
@@ -834,7 +858,7 @@ Interface em `/professor/clubes/[id]/calendario`, com filtro por professor no UR
 
 **Não implementado:** aulas, participantes, locais, campos, recursos, conflitos, reservas e créditos. Os únicos estados são disponível e indisponível — não escrever "ocupado", "reservado", "lotado", "vagas" ou "conflito", porque nada disso existe ainda para ser verdade.
 
-Ordem atual: 6A, 6B, 6C.1 e 6C.1A fechadas → próxima etapa é a 6C.2, a interface de reagendamento.
+Ordem atual: 6A, 6B, 6C.1, 6C.1A, 6C.1B e 6C.2 fechadas → a Fase 6 está concluída; segue a Fase 7.
 
 ### `src/types/database.ts`
 
@@ -870,7 +894,7 @@ Não existe um comando de formatação separado. Use `npm run lint:fix` apenas p
 | 3 | Alunos, turmas, locais, política de cancelamento | **Concluído** |
 | 4 | Interfaces de modelos, atribuição, ajustes e saldos | **Concluído** — Etapas 1A, 1B, 1C, 1D e 1E validadas com Auth/PostgREST reais e browser desktop/mobile |
 | 5 | Calendário e criação de aulas com reserva | **Concluído** — disponibilidade, projeção segura, refinamento visual, clubes/membros, calendário partilhado, locais com moradas manuais, campos/salas/áreas, criação/edição de aulas, conflitos atómicos, reserva atómica de créditos, recorrência semanal segura e revisão integrada |
-| 6 | Cancelamento, reagendamento, presenças e histórico | **Parcialmente concluído** — 6A/6B: presença, falta/no-show, conclusão normal/mista, cancelamento de aula e cancelamento de participação com `reserved -> available` ou `reserved -> used` seguros. 6C.1/6C.1A: contrato transacional de reagendamento, com chave de idempotência obrigatória em namespace próprio, validado com JWTs reais e concorrência. Falta a interface da 6C.2 |
+| 6 | Cancelamento, reagendamento, presenças e histórico | **Concluído** — 6A/6B: presença, falta/no-show, conclusão normal/mista, cancelamento de aula e de participação com `reserved -> available` ou `reserved -> used` seguros. 6C.1/6C.1A/6C.1B: contrato transacional de reagendamento, chave de idempotência obrigatória em namespace próprio e sete corridas de concorrência com JWTs reais. 6C.2: interface operacional, com a fronteira entre editar conteúdo e reagendar colocação imposta no PostgreSQL |
 | 7 | Área do aluno: aulas, créditos e confirmação | **Planeado** |
 | 8 | Notificações, lembretes e expiração agendada | **Planeado** |
 | 9 | Supabase real, concorrência, acessibilidade e deployment | **Parcialmente concluído** — RLS em PGlite e validação real das Fases 4, 5, 6A e 6B feitas; concorrência real de aulas/créditos/recorrência/conclusão coberta; deployment pendente |

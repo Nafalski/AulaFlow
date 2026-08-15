@@ -447,7 +447,7 @@ A estrutura fica pronta para notificações push (Fase 8).
 | **3** | Alunos, turmas, locais, política de cancelamento | **Concluído** |
 | **4** | Pacotes: modelos, atribuição, ajustes, painel de saldo | **Concluído** — Etapas 1A, 1B, 1C, 1D e 1E validadas |
 | **5** | Calendário e criação de aulas, com reserva de créditos | **Concluído** — disponibilidade, calendário, clubes, locais, recursos, criação/edição de aulas, conflitos atómicos, reserva atómica de créditos, recorrência semanal segura e revisão integrada |
-| **6** | Cancelamento, reagendamento, presenças, histórico | **6A, 6B, 6C.1 e 6C.1A concluídas** (falta a interface da 6C.2) — presença, falta/no-show, conclusão normal/mista, cancelamento de aula e cancelamento de participação com `reserved -> available` ou `reserved -> used` seguros, e contrato transacional de reagendamento com chave de idempotência obrigatória em namespace próprio |
+| **6** | Cancelamento, reagendamento, presenças, histórico | **Concluída** — 6A/6B: presença, falta/no-show, conclusão normal/mista e cancelamentos com `reserved -> available` ou `reserved -> used` seguros. 6C.1/1A/1B: contrato transacional de reagendamento, chave de idempotência obrigatória e concorrência real provada. 6C.2: interface operacional, com editar conteúdo e reagendar colocação separados no PostgreSQL |
 | **7** | Área do aluno: aulas, saldo, confirmação de presença | **Planeado** |
 | **8** | Notificações, lembretes e expiração agendada | **Planeado** |
 | **9** | Supabase real, concorrência, acessibilidade, deployment | **Parcialmente concluído** — Supabase/Auth reais validados até à 6B (405 verificações, repetíveis); browser automatizado com sessão GoTrue real; paridade dev/produção confirmada na 6B.2; deployment pendente |
@@ -1067,7 +1067,7 @@ A Fase 1 tinha desenhado o mecanismo inteiro de reagendamento e nunca o ligou: o
 
 ```text
 aula original  → rescheduled, com motivo, a apontar para a substituta
-aula substituta → scheduled, a apontar de volta
+aula substituta → herda o estado da original, a apontar de volta
 ```
 
 A original nunca é apagada nem reescrita no essencial.
@@ -1153,6 +1153,21 @@ Fechar estes gates obrigou a corrigir a própria suite de Auth, que já não era
 - **A banda de datas enchia-se e nunca se libertava.** Cada execução consumia datas livres e não devolvia nenhuma, até "Sem série E2E livre". As exceções de execuções anteriores passam a ser reformadas no início — o que não afeta nenhuma aula, porque a disponibilidade só é validada ao criar ou editar.
 - **A escolha de datas livres ignorava bloqueios e aulas.** Escolher uma data só por não ter exceção deixava passar bloqueios e aulas ativas de execuções anteriores; o servidor recusava corretamente uma fixture errada, e a falha lia-se como defeito do produto.
 
+#### Concluído na Etapa 6C.2 — a interface, e a fronteira que faltava
+
+Ligar o reagendamento à aplicação obrigou a resolver uma incoerência que existia desde a 5C: `update_lesson()` alterava `starts_at`, `ends_at`, `location_id` e `location_resource_id`, e a interface de edição oferecia esses campos. Acrescentar um botão "Reagendar" ao lado disso teria criado dois caminhos para a mesma mudança — um com rasto e outro sem. O rasto passaria a ser opcional, e um rasto opcional não é rasto.
+
+`20260807000100_phase6c2_edit_placement_boundary.sql` fecha-a no servidor. A assinatura mantém-se para não partir chamadores; o que muda é o significado dos parâmetros de colocação: **nulo ou igual ao atual é ignorado, diferente é recusado**. Esconder os campos no formulário nunca seria barreira: a RPC tem `EXECUTE` para `authenticated`.
+
+Duas correções apareceram ao exercitar o caminho real:
+
+- **`20260807000200`** — copiar uma participação **não reservada** para a substituta falhava com `column "billing_status" is of type participation_billing_status but expression is of type text`. Os dois ramos do `CASE` são literais sem tipo e a expressão resolvia para `text`. Só é percorrido por participações `declined` ou `exempt`, e por isso a 6C.1, a 6C.1A e as sete corridas da 6C.1B passaram sem lhe tocar.
+- **`20260807000300`** — a mesma cópia colapsava tudo o que não fosse `exempt` em `pending`. Para uma participação cancelada isso é falso: o crédito já foi devolvido e não volta a ser cobrado. Passa a preservar `released`.
+
+**A duração é preservada.** A Server Action lê a duração da aula original e soma-a ao novo início; o browser não a envia. **O contexto é fixo**: `context_kind` e `club_organization_id` não entram no formulário, e os locais oferecidos são os do contexto da aula.
+
+A rota é `/professor/aulas/[id]/reagendar`, com resumo DE → PARA, aviso de ocorrência única em séries e motivo obrigatório. A Action mantém o contrato da 6B.2 — sem `revalidatePath()`, sem `redirect()`, sem Route Handler — e devolve apenas o identificador da substituta, que o cliente usa para `router.replace()`.
+
 **Ainda não implementado depois da 6C.1:** interface de reagendamento (6C.2), reagendar série inteira, "esta e futuras", self-reschedule do aluno, política configurável de cancelamento, self-cancel do aluno, janela de 12h/24h, cobrança parcial, multa/tolerância, reativação de participação cancelada, notificações, pagamentos e calendários externos.
 
 ### Fase 2 — estado por item
@@ -1169,7 +1184,7 @@ Fechar estes gates obrigou a corrigir a própria suite de Auth, que já não era
 | Preferências de notificação | **Concluído** | Persistência de canais/eventos; entrega automática continua planeada para a Fase 8 |
 | Diretório administrativo | **Concluído** | Pesquisa, filtros, professores, detalhe, estados vazios/erro/loading e resposta mobile/desktop |
 | Bloqueio e reativação | **Concluído** | RPC exclusiva de admin, sem auto-bloqueio, motivo, auditoria e revogação efetiva por RLS |
-| Validação num Supabase remoto | **Concluído para a Fase 4, Fase 5 e Fase 6A; 6B em validação nesta entrega** | Migrações, catálogo remoto, GoTrue/Auth, JWT/PostgREST, contas reais, calendário seguro, aulas, conflitos, reserva, recorrência, presença, conclusão, privacidade e concorrência validados por RPC/Auth real |
+| Validação num Supabase remoto | **Concluído para as Fases 4, 5, 6A, 6B e 6C** | Migrações, catálogo remoto, GoTrue/Auth, JWT/PostgREST, contas reais, calendário seguro, aulas, conflitos, reserva, recorrência, presença, conclusão, privacidade e concorrência validados por RPC/Auth real |
 
 ### Concluído na Fase 2
 

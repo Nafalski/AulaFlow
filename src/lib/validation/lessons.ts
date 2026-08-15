@@ -5,6 +5,7 @@ import {
   LESSON_DURATION_LIMITS,
   LESSON_PARTICIPANT_MODES,
   LESSON_RECURRENCE_MODES,
+  LESSON_RESCHEDULE_REASON_LIMITS,
   LESSON_TITLE_LIMITS,
   WEEKLY_RECURRENCE_LIMITS,
 } from "@/lib/domain/lesson-scheduling";
@@ -181,17 +182,62 @@ export const lessonCreateSchema = requireLocationForResource(
 export type LessonCreateInput = z.infer<typeof lessonCreateSchema>;
 
 /**
- * Edição.
+ * Edição — conteúdo, e só conteúdo (Etapa 6C.2).
  *
- * Não aceita participante, modalidade, contexto nem estado: trocar o aluno de
- * uma aula é criar outra aula, e mudar de contexto mudaria a quem ela pertence.
+ * Data, hora, duração, local e campo saíram daqui. Mover uma aula é reagendar,
+ * e reagendar preserva a original no histórico com motivo e cadeia; deixar a
+ * edição fazer o mesmo em silêncio tornava "editar não é reagendar" uma frase
+ * sem consequência. `update_lesson()` recusa-o do lado do servidor, para que a
+ * fronteira não dependa de quais campos o formulário mostra.
+ *
+ * Também não aceita participante, modalidade, contexto nem estado: trocar o
+ * aluno de uma aula é criar outra aula.
  */
-export const lessonUpdateSchema = requireLocationForResource(
+export const lessonUpdateSchema = z.strictObject({
+  lessonId: z.preprocess(normalizeRequiredUuid, z.uuid("A aula selecionada é inválida.")),
+  title: lessonTitle,
+  notesForStudents: lessonNotes,
+  privateNotes: lessonNotes,
+});
+
+/**
+ * Reagendamento (Etapa 6C.2).
+ *
+ * Contrato próprio, e não `lessonUpdateSchema` com mais campos: a intenção é
+ * outra e os campos aceites são outros.
+ *
+ * A DURAÇÃO NÃO ESTÁ AQUI, de propósito. Ela é derivada no servidor a partir da
+ * aula original — reagendar move a aula, não a encurta. Aceitá-la do browser
+ * deixaria a duração ser alterada por um caminho que não a mostra.
+ */
+export const lessonRescheduleSchema = requireLocationForResource(
   z.strictObject({
-    ...lessonPlacement,
     lessonId: z.preprocess(normalizeRequiredUuid, z.uuid("A aula selecionada é inválida.")),
+    date: lessonDate,
+    time: lessonTime,
+    locationId: optionalId("O local selecionado é inválido."),
+    locationResourceId: optionalId("O campo ou sala selecionado é inválido."),
+    reason: z.preprocess(
+      normalizeSingleLine,
+      z
+        .string({ error: "Escreva o motivo do reagendamento." })
+        .min(
+          LESSON_RESCHEDULE_REASON_LIMITS.min,
+          "O motivo tem de ter pelo menos 3 caracteres.",
+        )
+        .max(
+          LESSON_RESCHEDULE_REASON_LIMITS.max,
+          "O motivo é demasiado longo (máximo 500 caracteres).",
+        ),
+    ),
+    idempotencyKey: z.preprocess(
+      normalizeRequiredUuid,
+      z.uuid("Atualize a página antes de voltar a submeter este formulário."),
+    ),
   }),
 );
+
+export type LessonRescheduleInput = z.infer<typeof lessonRescheduleSchema>;
 
 export const LESSON_PLACEMENT_FIELDS = [
   "locationId",
@@ -217,7 +263,22 @@ export const LESSON_CREATE_FIELDS = [
   "recurrenceCount",
 ] as const;
 
-export const LESSON_UPDATE_FIELDS = [...LESSON_PLACEMENT_FIELDS, "lessonId"] as const;
+export const LESSON_UPDATE_FIELDS = [
+  "lessonId",
+  "title",
+  "notesForStudents",
+  "privateNotes",
+] as const;
+
+export const LESSON_RESCHEDULE_FIELDS = [
+  "lessonId",
+  "date",
+  "time",
+  "locationId",
+  "locationResourceId",
+  "reason",
+  "idempotencyKey",
+] as const;
 
 function readLessonPlacementFormData(formData: FormData) {
   return {
@@ -249,8 +310,22 @@ export function readLessonCreateFormData(formData: FormData) {
 
 export function readLessonUpdateFormData(formData: FormData) {
   return {
-    ...readLessonPlacementFormData(formData),
     lessonId: formString(formData, "lessonId"),
+    title: formString(formData, "title"),
+    notesForStudents: formString(formData, "notesForStudents"),
+    privateNotes: formString(formData, "privateNotes"),
+  };
+}
+
+export function readLessonRescheduleFormData(formData: FormData) {
+  return {
+    lessonId: formString(formData, "lessonId"),
+    date: formString(formData, "date"),
+    time: formString(formData, "time"),
+    locationId: formString(formData, "locationId"),
+    locationResourceId: formString(formData, "locationResourceId"),
+    reason: formString(formData, "reason"),
+    idempotencyKey: formString(formData, "idempotencyKey"),
   };
 }
 

@@ -173,7 +173,6 @@ export default async function NewLessonPage({
         </Alert>
       ) : (
         <LessonForm
-          mode="create"
           idempotencyKey={randomUUID()}
           data={formData}
           values={{

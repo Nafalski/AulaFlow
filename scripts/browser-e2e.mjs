@@ -291,13 +291,34 @@ async function discoverLessons(account) {
     created.push(lesson);
   }
 
-  await client.auth.signOut();
+  const reschedulable = await createReschedulableLesson(client);
 
   const pool = [...ended.map((lesson) => lesson.id), ...created];
+
+  // `cancel_lesson()` recusa uma aula com presenças registadas. Uma execução
+  // anterior que tenha marcado presença sem chegar a concluir deixa a aula
+  // nesse estado, e o cenário de cancelamento falharia por uma recusa correta
+  // do servidor sobre uma fixture errada.
+  const withoutAttendance = [];
+  for (const lessonId of pool) {
+    const { data: rows } = await client
+      .from("teacher_lesson_participant_credit_records")
+      .select("attendance_status")
+      .eq("lesson_id", lessonId);
+    if ((rows ?? []).every((row) => row.attendance_status === null)) {
+      withoutAttendance.push(lessonId);
+    }
+  }
+
+  let cancellable = withoutAttendance.find((lessonId) => lessonId !== pool[0]) ?? null;
+  if (!cancellable) cancellable = await createEndedLesson(client);
+
   // Aulas diferentes de propósito: concluir uma remove-lhe o botão de cancelar.
   return {
     operable: pool[0] ?? null,
-    cancellable: pool[1] ?? upcoming[0]?.id ?? null,
+    cancellable: cancellable ?? upcoming[0]?.id ?? null,
+    reschedulable,
+    client,
   };
 }
 
@@ -313,20 +334,12 @@ async function createEndedLesson(client) {
   const today = new Date();
   const iso = (date) => date.toISOString().slice(0, 10);
 
-  const { data: sports } = await client
-    .from("sports")
-    .select("id")
-    .eq("is_active", true)
-    .limit(1);
-  const sportId = sports?.[0]?.id;
-
-  const { data: students } = await client
-    .from("teacher_student_management_records")
-    .select("id")
-    .eq("is_active", true)
-    .limit(1);
-  const studentId = students?.[0]?.id;
-  if (!sportId || !studentId) return null;
+  // Quem paga a aula tem de ter saldo. O primeiro aluno da lista pode não ter
+  // pacote nenhum, e `create_lesson` recusa — a fixture ficava por criar e o
+  // cenário de presença/conclusão passava a não correr.
+  const billable = await billableStudent(client);
+  if (!billable) return null;
+  const { studentId, sportId } = billable;
 
   for (let back = 1; back <= 45; back += 1) {
     const day = iso(new Date(today.getTime() - back * 86_400_000));
@@ -364,6 +377,113 @@ async function createEndedLesson(client) {
   }
 
   return null;
+}
+
+/**
+ * Um aluno que consegue mesmo pagar uma aula, e a modalidade do pacote dele.
+ *
+ * `create_lesson()` reserva créditos na mesma transação: sem pacote com saldo,
+ * a fixture nunca chega a existir.
+ */
+async function billableStudent(client) {
+  const { data: packages } = await client
+    .from("teacher_package_records")
+    .select("student_id, sport_id, credits_available, status, expires_on")
+    .eq("status", "active")
+    .gt("credits_available", 0)
+    .order("expires_on", { ascending: false })
+    .limit(1);
+
+  const studentId = packages?.[0]?.student_id;
+  if (!studentId) return null;
+
+  let sportId = packages?.[0]?.sport_id ?? null;
+  if (!sportId) {
+    const { data: sports } = await client
+      .from("sports")
+      .select("id")
+      .eq("is_active", true)
+      .limit(1);
+    sportId = sports?.[0]?.id ?? null;
+  }
+
+  return sportId ? { studentId, sportId } : null;
+}
+
+/**
+ * Fixture do reagendamento: uma aula futura e um destino livre.
+ *
+ * Reagendar valida a disponibilidade da data NOVA, por isso tanto a origem como
+ * o destino saem da agenda declarada do próprio professor, lida pela RPC segura.
+ * Inventar horas daria contra `lesson_fits_teacher_availability` metade das
+ * vezes, e a falha leria-se como defeito da interface.
+ */
+async function createReschedulableLesson(client) {
+  const iso = (date) => date.toISOString().slice(0, 10);
+  const now = new Date();
+
+  const billable = await billableStudent(client);
+  if (!billable) {
+    console.log("  · fixture de reagendamento: sem aluno com créditos disponíveis");
+    return null;
+  }
+  const { studentId, sportId } = billable;
+
+  const slots = [];
+  for (let ahead = 2; ahead <= 60 && slots.length < 2; ahead += 1) {
+    const day = iso(new Date(now.getTime() + ahead * 86_400_000));
+    const { data: windows } = await client.rpc("get_teacher_availability_calendar", {
+      p_start_date: day,
+      p_end_date: day,
+    });
+    const slot = (windows ?? []).find(
+      (row) => row.status === "available" && row.starts_at && row.ends_at,
+    );
+    if (slot) slots.push({ day, startsAt: slot.starts_at.slice(0, 5) });
+  }
+
+  const [origin, target] = slots;
+  if (!origin || !target) {
+    console.log(`  · fixture de reagendamento: apenas ${slots.length} janela(s) livre(s)`);
+    return null;
+  }
+
+  const startsAt = new Date(`${origin.day}T${origin.startsAt}:00Z`);
+  const endsAt = new Date(startsAt.getTime() + 30 * 60_000);
+
+  const { data: lessonId, error } = await client.rpc("create_lesson", {
+    p_sport_id: sportId,
+    p_starts_at: startsAt.toISOString(),
+    p_ends_at: endsAt.toISOString(),
+    p_title: `${FIXTURE_PREFIX}reagendar ${new Date().toISOString().slice(0, 16)}`,
+    p_context_kind: "personal",
+    p_club_organization_id: null,
+    p_location_id: null,
+    p_location_resource_id: null,
+    p_student_id: studentId,
+    p_group_id: null,
+    p_notes_for_students: null,
+    p_private_notes: null,
+    p_idempotency_key: randomUUID(),
+  });
+
+  if (error || !lessonId) {
+    console.log(`  · fixture de reagendamento: ${error?.message ?? "sem aula"}`);
+    return null;
+  }
+
+  const { data: participants } = await client
+    .from("teacher_lesson_participant_credit_records")
+    .select("student_id, credits_reserved, billing_status, package_name")
+    .eq("lesson_id", lessonId);
+
+  return {
+    lessonId,
+    targetDay: target.day,
+    targetTime: target.startsAt,
+    reservedBefore: participants?.[0]?.credits_reserved ?? null,
+    packageName: participants?.[0]?.package_name ?? null,
+  };
 }
 
 /**
@@ -552,6 +672,176 @@ async function teacherScenarios(context, lessons) {
   return page;
 }
 
+/**
+ * Reagendar pela interface (Etapa 6C.2).
+ *
+ * O gate desta etapa. O que se prova aqui, e que nenhuma outra camada prova:
+ * que editar e reagendar são caminhos distintos no ecrã, que a edição já não
+ * oferece horário nem local, e que a mutação RESOLVE antes de a navegação para
+ * a substituta acontecer — a regressão permanente da 6B.2.
+ */
+async function rescheduleScenario(context, fixture, apiClient) {
+  section("Professor — reagendar aula");
+
+  if (!fixture) {
+    check(false, "Existe uma aula futura para reagendar");
+    return null;
+  }
+
+  const page = await signIn(context, ACCOUNTS.teacher);
+
+  // 1. O detalhe separa as duas intenções.
+  await page.goto(`${BASE_URL}/professor/aulas/${fixture.lessonId}`, {
+    waitUntil: "domcontentloaded",
+  });
+  await page.getByRole("heading", { name: "Dados da aula" }).first().waitFor({ timeout: 20_000 });
+
+  const detail = await panelText(page);
+  check(
+    detail.includes("Dados da aula") && detail.includes("Reagendar aula"),
+    "O detalhe separa 'Dados da aula' de 'Reagendar aula'",
+  );
+
+  const editCard = page.locator("form").filter({ has: page.locator('input[name="title"]') }).first();
+  const placementFields = await editCard
+    .locator('input[name="date"], input[name="time"], select[name="locationId"], select[name="durationMinutes"]')
+    .count();
+  check(
+    placementFields === 0,
+    "A edição não oferece data, hora, duração nem local",
+    `${placementFields} campo(s) de colocação ainda presentes`,
+  );
+
+  // 2. A rota dedicada mostra a aula atual.
+  await page.getByRole("link", { name: "Reagendar aula" }).first().click();
+  await page.waitForURL(/\/reagendar$/, { timeout: 20_000 });
+  await page.getByRole("heading", { name: "Reagendar aula" }).first().waitFor({ timeout: 20_000 });
+
+  const reschedulePage = await panelText(page);
+  check(
+    reschedulePage.includes("Aula atual") &&
+      reschedulePage.includes("Novo horário") &&
+      reschedulePage.includes("duração preservada"),
+    "A página mostra a aula atual, o destino e que a duração é preservada",
+    reschedulePage.slice(0, 160),
+  );
+  check(
+    reschedulePage.includes("Esta operação preserva a aula original no histórico."),
+    "A página explica que a aula original fica no histórico",
+  );
+
+  // 3. Preencher e submeter.
+  await page.locator('input[name="date"]').fill(fixture.targetDay);
+  await page.locator('input[name="time"]').fill(fixture.targetTime);
+  await page.locator('textarea[name="reason"]').fill("Aluno pediu para trocar de dia");
+
+  const submit = page.getByRole("button", { name: /Reagendar aula/ }).first();
+  const handle = await submit.elementHandle();
+  const startedAt = Date.now();
+  await submit.click();
+
+  // A regressão da 6B.2: a mutação tem de resolver por si, sem depender de a
+  // rota seguinte carregar.
+  await waitForIdle(page, handle, "Reagendar");
+  const resolved = await Promise.race([
+    waitForPanel(page, "Aula reagendada", 20_000).then((seen) => (seen ? "confirmado" : null)),
+    page
+      .waitForURL((url) => !url.pathname.endsWith("/reagendar"), { timeout: 20_000 })
+      .then(() => "navegou")
+      .catch(() => null),
+  ]);
+  const resolvedIn = Date.now() - startedAt;
+  check(
+    resolved !== null,
+    "A Action resolve sozinha antes de a rota seguinte carregar",
+    `${resolved ?? "sem resolução"} em ${resolvedIn} ms`,
+  );
+
+  // 4. A navegação leva à substituta.
+  await page
+    .waitForURL((url) => /\/professor\/aulas\/[0-9a-f-]{36}$/.test(url.pathname), {
+      timeout: 20_000,
+    })
+    .catch(() => {});
+  const replacementId = page.url().split("/").pop() ?? "";
+  check(
+    /^[0-9a-f-]{36}$/.test(replacementId) && replacementId !== fixture.lessonId,
+    "A navegação segue para a aula substituta",
+    `url ${mask(replacementId)}`,
+  );
+
+  await page.getByRole("heading", { name: "Dados da aula" }).first().waitFor({ timeout: 20_000 });
+  const replacementDetail = await panelText(page);
+  const [hours, minutes] = fixture.targetTime.split(":");
+  check(
+    replacementDetail.includes(`${hours}:${minutes}`),
+    "A substituta mostra o novo horário",
+    replacementDetail.slice(0, 120),
+  );
+
+  // 5. A original ficou histórica e já não oferece operação.
+  await page.goto(`${BASE_URL}/professor/aulas/${fixture.lessonId}`, {
+    waitUntil: "domcontentloaded",
+  });
+  const originalDetail = await waitForPanel(page, "Edição indisponível", 20_000);
+  check(originalDetail, "A aula original passou a histórica e não oferece edição");
+
+  // 6. O calendário mostra a substituta no horário novo e o antigo deixou de
+  //    estar ocupado por uma aula ativa.
+  const { data: replacementRow } = await apiClient
+    .from("teacher_lesson_schedule_records")
+    .select("id, status, starts_at")
+    .eq("id", replacementId)
+    .maybeSingle();
+  const replacementDay = replacementRow?.starts_at
+    ? new Intl.DateTimeFormat("en-CA", {
+        timeZone: "Europe/Lisbon",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+      }).format(new Date(replacementRow.starts_at))
+    : null;
+  check(
+    ["scheduled", "confirmed"].includes(replacementRow?.status ?? "") &&
+      replacementDay === fixture.targetDay,
+    "A substituta está ativa no dia novo",
+    `estado ${replacementRow?.status} · dia ${replacementDay}`,
+  );
+
+  const { data: originalRow } = await apiClient
+    .from("teacher_lesson_schedule_records")
+    .select("id, status")
+    .eq("id", fixture.lessonId)
+    .maybeSingle();
+  check(
+    originalRow?.status === "rescheduled",
+    "O horário antigo já não tem uma aula ativa",
+    `estado ${originalRow?.status}`,
+  );
+
+  await page.goto(`${BASE_URL}/professor/calendario?vista=dia&data=${fixture.targetDay}`, {
+    waitUntil: "domcontentloaded",
+  });
+  const calendarShows = await waitForPanel(page, FIXTURE_PREFIX.trim(), 20_000);
+  check(calendarShows, "O calendário do professor mostra a aula no novo dia");
+
+  // 7. Os créditos reservados não mudaram.
+  const { data: replacementParticipants } = await apiClient
+    .from("teacher_lesson_participant_credit_records")
+    .select("credits_reserved, credits_consumed, billing_status")
+    .eq("lesson_id", replacementId);
+  const reservedAfter = replacementParticipants?.[0]?.credits_reserved ?? null;
+  check(
+    reservedAfter === fixture.reservedBefore &&
+      replacementParticipants?.[0]?.billing_status === "reserved" &&
+      replacementParticipants?.[0]?.credits_consumed === 0,
+    "A reserva do aluno acompanha a aula sem nova cobrança",
+    `antes ${fixture.reservedBefore} · depois ${reservedAfter}`,
+  );
+
+  return replacementId;
+}
+
 async function studentScenarios(context) {
   section("Aluno — o que vê e o que não vê");
   const page = await signIn(context, ACCOUNTS.student);
@@ -611,6 +901,60 @@ async function mobileScenario(browser, lessonId) {
       .filter((height) => height < 43.5).length,
   );
   check(small === 0, "Todos os alvos de toque têm pelo menos 44px", `${small} abaixo`);
+
+  await context.close();
+}
+
+/**
+ * A rota de reagendamento no telemóvel.
+ *
+ * O bloco DE → PARA é o sítio onde a pessoa confirma o que vai fazer. A 390px
+ * tem de empilhar: duas colunas cortariam as datas ao meio precisamente no
+ * momento da decisão.
+ */
+async function mobileRescheduleScenario(browser, lessonId) {
+  section("Telemóvel — reagendar a 390×844");
+
+  if (!lessonId) {
+    check(false, "Existe uma aula para abrir o reagendamento no telemóvel");
+    return;
+  }
+
+  const context = await browser.newContext({ viewport: { width: 390, height: 844 } });
+  const page = await signIn(context, ACCOUNTS.teacher);
+
+  await page.goto(`${BASE_URL}/professor/aulas/${lessonId}/reagendar`, {
+    waitUntil: "domcontentloaded",
+  });
+  const heading = page.getByRole("heading", { name: "Reagendar aula" }).first();
+  const arrived = await heading
+    .waitFor({ timeout: 20_000 })
+    .then(() => true)
+    .catch(() => false);
+  check(arrived, "A rota de reagendamento abre no telemóvel");
+
+  const overflow = await page.evaluate(
+    () => document.documentElement.scrollWidth > window.innerWidth,
+  );
+  check(!overflow, "Sem scroll horizontal a 390px na rota de reagendamento");
+
+  const small = await page.evaluate(() =>
+    [...document.querySelectorAll("main button, main a, main select, main input, main textarea")]
+      .filter((element) => element.offsetParent !== null)
+      .map((element) => element.getBoundingClientRect().height)
+      .filter((height) => height < 43.5).length,
+  );
+  check(small === 0, "Alvos de toque adequados na rota de reagendamento", `${small} abaixo`);
+
+  // DE e PARA empilhados: o topo de um fica abaixo do fundo do outro.
+  const stacked = await page.evaluate(() => {
+    const labels = [...document.querySelectorAll("main p")];
+    const from = labels.find((node) => node.textContent?.trim() === "De");
+    const to = labels.find((node) => node.textContent?.trim() === "Para");
+    if (!from || !to) return null;
+    return to.getBoundingClientRect().top >= from.getBoundingClientRect().bottom;
+  });
+  check(stacked === true, "DE e PARA ficam empilhados no telemóvel", `medido: ${stacked}`);
 
   await context.close();
 }
@@ -682,12 +1026,27 @@ async function main() {
     await teacherScenarios(teacherContext, lessons);
     await teacherContext.close();
 
+    const rescheduleContext = await browser.newContext();
+    rescheduleContext.on("page", (page) => {
+      page.on("console", (message) => {
+        if (message.type() === "error") consoleErrors.push(message.text().slice(0, 160));
+      });
+      page.on("pageerror", (error) => consoleErrors.push(error.message.slice(0, 160)));
+    });
+    const replacementId = await rescheduleScenario(
+      rescheduleContext,
+      lessons.reschedulable,
+      lessons.client,
+    );
+    await rescheduleContext.close();
+
     // Contexto novo por papel: mais barato e mais fiável do que fazer logout.
     const studentContext = await browser.newContext();
     await studentScenarios(studentContext);
     await studentContext.close();
 
     await mobileScenario(browser, lessons.operable ?? lessons.cancellable);
+    await mobileRescheduleScenario(browser, replacementId);
 
     section("Runtime");
     check(
@@ -699,6 +1058,7 @@ async function main() {
     await browser.close();
   }
 
+  await lessons.client.auth.signOut().catch(() => {});
   await cleanUpFixtures(ACCOUNTS.teacher);
 
   console.log(

@@ -1,6 +1,6 @@
 "use client";
 
-import { CalendarDays, CalendarPlus, Info, Repeat2, Save } from "lucide-react";
+import { CalendarDays, CalendarPlus, Info, Repeat2 } from "lucide-react";
 import Link from "next/link";
 import { useActionState, useState } from "react";
 
@@ -12,7 +12,7 @@ import {
   FORM_ACTION_IDLE_STATE,
   preserveFormValuesOnReset,
 } from "@/lib/actions/action-state";
-import { createLessonAction, updateLessonAction } from "@/lib/actions/lessons";
+import { createLessonAction } from "@/lib/actions/lessons";
 import {
   LESSON_CONTEXT_DESCRIPTIONS,
   LESSON_CONTEXT_LABELS,
@@ -204,22 +204,22 @@ function LessonCreditPreview({
  * pertence. A RPC de edição recusa ambos.
  */
 export function LessonForm({
-  mode,
   values,
   data,
   idempotencyKey,
 }: {
-  mode: "create" | "edit";
   values: LessonFormValues;
   data: LessonFormData;
-  idempotencyKey?: string;
+  idempotencyKey: string;
 }) {
-  const action = mode === "create" ? createLessonAction : updateLessonAction;
-  const [state, formAction, pending] = useActionState(action, FORM_ACTION_IDLE_STATE);
+  const [state, formAction, pending] = useActionState(
+    createLessonAction,
+    FORM_ACTION_IDLE_STATE,
+  );
 
   // Fixada no arranque: o servidor gera uma chave nova a cada render, e qualquer
   // revalidação da página remontaria o formulário a meio do preenchimento.
-  const [initialKey] = useState(idempotencyKey ?? "");
+  const [initialKey] = useState(idempotencyKey);
   const key = state.status === "success" && state.resourceId ? state.resourceId : initialKey;
 
   const [participantMode, setParticipantMode] = useState<LessonParticipantMode>("student");
@@ -243,17 +243,12 @@ export function LessonForm({
   // válidos. Oferecer a lista toda mostraria o pavilhão do clube numa aula
   // pessoal e propostas públicas ainda por aprovar — opções que a RPC recusaria
   // depois de a pessoa as escolher.
-  const locationOptions = locationsForContext(
-    data.locations,
-    mode === "create" ? contextKind : (values.contextKind ?? "personal"),
-    mode === "create" ? clubId || null : (values.clubOrganizationId ?? null),
-  );
+  const locationOptions = locationsForContext(data.locations, contextKind, clubId || null);
   const resourceOptions = resourcesForLocation(data.resources, locationId || null);
-  const created = mode === "create" && state.status === "success" && state.resourceId;
+  const created = state.status === "success" && state.resourceId;
   const createdSeries = Boolean(created && state.resourceCount && state.resourceCount > 1);
   const recurrenceCountNumber = Number(recurrenceCount);
   const recurrenceSummary =
-    mode === "create" &&
     recurrenceMode === "weekly" &&
     Number.isInteger(recurrenceCountNumber) &&
     recurrenceCountNumber >= WEEKLY_RECURRENCE_LIMITS.min &&
@@ -268,12 +263,8 @@ export function LessonForm({
   return (
     <Card>
       <CardHeader
-        title={mode === "create" ? "Nova aula" : "Dados da aula"}
-        description={
-          mode === "create"
-            ? "O horário é validado contra a sua disponibilidade."
-            : "Horário, local e observações. O aluno e a modalidade não mudam."
-        }
+        title="Nova aula"
+        description="O horário é validado contra a sua disponibilidade."
       />
       <CardBody>
         <form
@@ -282,15 +273,13 @@ export function LessonForm({
           key={key}
           className="flex flex-col gap-5"
         >
-          {values.lessonId && <input type="hidden" name="lessonId" value={values.lessonId} />}
-          {mode === "create" && <input type="hidden" name="idempotencyKey" value={key} />}
+          <input type="hidden" name="idempotencyKey" value={key} />
 
           {state.message && (
             <Alert tone={state.status === "success" ? "success" : "danger"}>{state.message}</Alert>
           )}
 
-          {mode === "create" && (
-            <>
+
               {/* Escolha explícita, e não dois selects a competir: mostrar um
                   seletor de alunos e outro de turmas ao mesmo tempo convidaria a
                   preencher os dois, que é exatamente o que a base recusa. */}
@@ -419,20 +408,15 @@ export function LessonForm({
                   )}
                 </>
               )}
-            </>
-          )}
+
 
           <div className="grid gap-4 sm:grid-cols-2">
             <TextField
               name="date"
               label="Data"
               type="date"
-              {...(mode === "create"
-                ? {
-                    value: lessonDate,
-                    onChange: (event) => setLessonDate(event.target.value),
-                  }
-                : { defaultValue: values.date })}
+              value={lessonDate}
+              onChange={(event) => setLessonDate(event.target.value)}
               required
               error={state.fieldErrors?.date}
             />
@@ -440,12 +424,8 @@ export function LessonForm({
               name="time"
               label="Hora de início"
               type="time"
-              {...(mode === "create"
-                ? {
-                    value: lessonTime,
-                    onChange: (event) => setLessonTime(event.target.value),
-                  }
-                : { defaultValue: values.time })}
+              value={lessonTime}
+              onChange={(event) => setLessonTime(event.target.value)}
               step={300}
               required
               error={state.fieldErrors?.time}
@@ -467,8 +447,7 @@ export function LessonForm({
             ))}
           </SelectField>
 
-          {mode === "create" && (
-            <fieldset className="flex flex-col gap-2">
+<fieldset className="flex flex-col gap-2">
               <legend className="text-sm font-bold text-ink">Repetição</legend>
               <div className="flex flex-wrap gap-2">
                 {LESSON_RECURRENCE_MODES.map((option) => (
@@ -499,9 +478,8 @@ export function LessonForm({
                 </p>
               )}
             </fieldset>
-          )}
 
-          {mode === "create" && recurrenceMode === "weekly" && (
+          {recurrenceMode === "weekly" && (
             <>
               <TextField
                 name="recurrenceCount"
@@ -526,8 +504,7 @@ export function LessonForm({
             </>
           )}
 
-          {mode === "create" && (
-            <LessonCreditPreview
+<LessonCreditPreview
               participantMode={participantMode}
               studentId={studentId}
               groupId={groupId}
@@ -535,7 +512,6 @@ export function LessonForm({
               lessonDate={lessonDate}
               data={data}
             />
-          )}
 
           {/* Local → recurso: mudar de local limpa o campo escolhido, porque um
               campo do local anterior deixaria de existir ali. */}
@@ -629,22 +605,13 @@ export function LessonForm({
             <Button
               type="submit"
               loading={pending}
-              loadingLabel={mode === "create" ? "A criar" : "A guardar"}
+              loadingLabel="A criar"
               disabled={Boolean(created)}
             >
-              {mode === "create" ? (
-                <>
-                  <CalendarPlus className="size-4" aria-hidden="true" />
-                  Criar aula
-                </>
-              ) : (
-                <>
-                  <Save className="size-4" aria-hidden="true" />
-                  Guardar aula
-                </>
-              )}
+              <CalendarPlus className="size-4" aria-hidden="true" />
+              Criar aula
             </Button>
-            {mode === "create" && state.resourceId && (
+            {state.resourceId && (
               <Link
                 href={`/professor/aulas/${state.resourceId}`}
                 className={buttonClasses({ variant: "outline" })}

@@ -12,12 +12,15 @@ import {
   lessonCompleteSchema,
   lessonIdSchema,
   lessonParticipantCancelSchema,
+  LESSON_RESCHEDULE_FIELDS,
+  lessonRescheduleSchema,
   lessonUpdateSchema,
   readLessonAttendanceFormData,
   readLessonCancelFormData,
   readLessonCompleteFormData,
   readLessonCreateFormData,
   readLessonParticipantCancelFormData,
+  readLessonRescheduleFormData,
   unexpectedLessonFields,
 } from "./lessons";
 
@@ -227,24 +230,47 @@ describe("lessonCreateSchema", () => {
 describe("lessonUpdateSchema", () => {
   const update = {
     lessonId: LESSON,
-    date: "2026-08-24",
-    time: "19:00",
-    durationMinutes: "90",
-    title: "Aula reagendada",
+    title: "Aula com novo título",
   };
 
-  it("aceita os campos editáveis", () => {
+  it("aceita apenas conteúdo", () => {
     expect(lessonUpdateSchema.parse(update)).toEqual({
       lessonId: LESSON,
-      date: "2026-08-24",
-      time: "19:00",
-      durationMinutes: 90,
-      title: "Aula reagendada",
-      locationId: null,
-      locationResourceId: null,
+      title: "Aula com novo título",
       notesForStudents: null,
       privateNotes: null,
     });
+  });
+
+  it("aceita as observações", () => {
+    expect(
+      lessonUpdateSchema.parse({
+        ...update,
+        notesForStudents: "Trazer duas raquetes",
+        privateNotes: "Rever o serviço",
+      }),
+    ).toEqual({
+      lessonId: LESSON,
+      title: "Aula com novo título",
+      notesForStudents: "Trazer duas raquetes",
+      privateNotes: "Rever o serviço",
+    });
+  });
+
+  // A fronteira da 6C.2: mover a aula é reagendar, e reagendar tem contrato
+  // próprio. A edição nem sequer aceita os campos de colocação.
+  it("não aceita mudar horário, duração, local nem campo", () => {
+    for (const field of [
+      "date",
+      "time",
+      "durationMinutes",
+      "locationId",
+      "locationResourceId",
+    ]) {
+      expect(lessonUpdateSchema.safeParse({ ...update, [field]: "2026-08-24" }).success).toBe(
+        false,
+      );
+    }
   });
 
   it("não aceita trocar o participante pela edição", () => {
@@ -258,11 +284,137 @@ describe("lessonUpdateSchema", () => {
       expect(lessonUpdateSchema.safeParse({ ...update, [field]: "club" }).success).toBe(false);
     }
   });
+});
 
-  it("mantém a exigência de local para o campo", () => {
+describe("lessonRescheduleSchema", () => {
+  const reschedule = {
+    lessonId: LESSON,
+    date: "2026-08-24",
+    time: "19:00",
+    reason: "Aluno pediu para trocar de dia",
+    idempotencyKey: KEY,
+  };
+
+  it("aceita a intenção completa", () => {
+    expect(lessonRescheduleSchema.parse(reschedule)).toEqual({
+      lessonId: LESSON,
+      date: "2026-08-24",
+      time: "19:00",
+      reason: "Aluno pediu para trocar de dia",
+      locationId: null,
+      locationResourceId: null,
+      idempotencyKey: KEY,
+    });
+  });
+
+  it("aceita local e campo", () => {
     expect(
-      lessonUpdateSchema.safeParse({ ...update, locationResourceId: RESOURCE }).success,
+      lessonRescheduleSchema.parse({
+        ...reschedule,
+        locationId: LOCATION,
+        locationResourceId: RESOURCE,
+      }).locationResourceId,
+    ).toBe(RESOURCE);
+  });
+
+  it("exige um motivo com conteúdo", () => {
+    expect(lessonRescheduleSchema.safeParse({ ...reschedule, reason: "" }).success).toBe(false);
+    expect(lessonRescheduleSchema.safeParse({ ...reschedule, reason: "  " }).success).toBe(false);
+    expect(lessonRescheduleSchema.safeParse({ ...reschedule, reason: "ok" }).success).toBe(false);
+    expect(
+      lessonRescheduleSchema.safeParse({ ...reschedule, reason: "x".repeat(501) }).success,
     ).toBe(false);
+  });
+
+  it("apara o motivo antes de o validar", () => {
+    expect(
+      lessonRescheduleSchema.parse({ ...reschedule, reason: "  Lesão do aluno  " }).reason,
+    ).toBe("Lesão do aluno");
+  });
+
+  it("recusa identificador, data e hora inválidos", () => {
+    expect(lessonRescheduleSchema.safeParse({ ...reschedule, lessonId: "aula-1" }).success).toBe(
+      false,
+    );
+    expect(lessonRescheduleSchema.safeParse({ ...reschedule, date: "24-08-2026" }).success).toBe(
+      false,
+    );
+    expect(lessonRescheduleSchema.safeParse({ ...reschedule, time: "25:00" }).success).toBe(false);
+  });
+
+  it("exige uma chave de idempotência válida", () => {
+    expect(
+      lessonRescheduleSchema.safeParse({ ...reschedule, idempotencyKey: undefined }).success,
+    ).toBe(false);
+    expect(
+      lessonRescheduleSchema.safeParse({ ...reschedule, idempotencyKey: "repetir" }).success,
+    ).toBe(false);
+  });
+
+  it("recusa um campo sem local", () => {
+    expect(
+      lessonRescheduleSchema.safeParse({ ...reschedule, locationResourceId: RESOURCE }).success,
+    ).toBe(false);
+  });
+
+  // A duração é derivada da aula real pelo servidor. Aceitá-la aqui deixaria
+  // encurtar uma aula por um formulário que nem sequer a mostra.
+  it("não aceita duração, participante, pacote nem estado", () => {
+    for (const field of [
+      "durationMinutes",
+      "studentId",
+      "groupId",
+      "sportId",
+      "contextKind",
+      "clubOrganizationId",
+      "status",
+      "creditCost",
+      "studentPackageId",
+      "teacherId",
+      "organizationId",
+      "createdBy",
+      "startsAt",
+      "endsAt",
+      "rescheduledFromId",
+      "rescheduledToId",
+    ]) {
+      expect(lessonRescheduleSchema.safeParse({ ...reschedule, [field]: "60" }).success).toBe(
+        false,
+      );
+    }
+  });
+
+  it("lê apenas os campos previstos do formulário", () => {
+    const formData = new FormData();
+    formData.set("lessonId", LESSON);
+    formData.set("date", "2026-08-24");
+    formData.set("time", "19:00");
+    formData.set("locationId", LOCATION);
+    formData.set("locationResourceId", RESOURCE);
+    formData.set("reason", "Aluno pediu para trocar de dia");
+    formData.set("idempotencyKey", KEY);
+
+    expect(readLessonRescheduleFormData(formData)).toEqual({
+      lessonId: LESSON,
+      date: "2026-08-24",
+      time: "19:00",
+      locationId: LOCATION,
+      locationResourceId: RESOURCE,
+      reason: "Aluno pediu para trocar de dia",
+      idempotencyKey: KEY,
+    });
+  });
+
+  it("assinala campos que o formulário não devia enviar", () => {
+    const formData = new FormData();
+    formData.set("lessonId", LESSON);
+    formData.set("durationMinutes", "30");
+    formData.set("teacherId", STUDENT);
+
+    expect(unexpectedLessonFields(formData, LESSON_RESCHEDULE_FIELDS).sort()).toEqual([
+      "durationMinutes",
+      "teacherId",
+    ]);
   });
 });
 
