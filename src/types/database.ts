@@ -1163,6 +1163,8 @@ export type TeacherLessonScheduleRecord = {
 export type StudentLessonRecord = {
   id: UUID;
   participation_id: UUID;
+  /** A aula pede confirmação ao aluno (Etapa 7A). */
+  requires_confirmation: boolean;
   title: string;
   starts_at: Timestamp;
   ends_at: Timestamp;
@@ -2198,6 +2200,7 @@ export type Database = {
           p_notes_for_students?: string | null;
           p_private_notes?: string | null;
           p_idempotency_key?: UUID | null;
+          p_requires_confirmation?: boolean;
         };
         Returns: UUID;
       };
@@ -2217,6 +2220,7 @@ export type Database = {
           p_notes_for_students?: string | null;
           p_private_notes?: string | null;
           p_idempotency_key?: UUID | null;
+          p_requires_confirmation?: boolean;
         };
         Returns: Json;
       };
@@ -2225,6 +2229,15 @@ export type Database = {
        * colocação aceitam `null` com o significado "não mexer"; um valor
        * diferente do atual é recusado, porque mover uma aula é reagendar.
        */
+      /**
+       * RSVP do aluno: responde a "vou a esta aula", nunca a "estive nesta
+       * aula". Não escreve em attendance nem move créditos. Devolve `false`
+       * quando a participação já estava confirmada.
+       */
+      confirm_lesson_participation: {
+        Args: { p_lesson_id: UUID };
+        Returns: boolean;
+      };
       update_lesson: {
         Args: {
           p_lesson_id: UUID;

@@ -1258,6 +1258,84 @@ checks as (
   union all
   select
     'estrutura',
+    'as RPCs de criacao tem uma unica assinatura publica',
+    (
+      select count(*) = 3
+      from (
+        select proc.proname
+        from pg_proc proc
+        join pg_namespace ns on ns.oid = proc.pronamespace
+        where ns.nspname = 'public'
+          and proc.proname in (
+            'create_lesson', 'create_recurring_lessons', 'create_lesson_occurrence'
+          )
+        group by proc.proname
+        having count(*) = 1
+      ) unicas
+    ),
+    'ok'
+
+  union all
+  select
+    'estrutura',
+    'a aula pode pedir confirmacao ao aluno',
+    exists (
+      select 1
+      from pg_proc proc
+      join pg_namespace ns on ns.oid = proc.pronamespace
+      where ns.nspname = 'public'
+        and proc.proname = 'create_lesson'
+        and pg_get_function_arguments(proc.oid) like '%p_requires_confirmation boolean%'
+    ),
+    'ok'
+
+  union all
+  select
+    'seguranca',
+    'o aluno nao escreve diretamente a sua resposta',
+    not exists (
+      select 1
+      from information_schema.role_table_grants
+      where table_schema = 'public'
+        and table_name = 'lesson_participants'
+        and grantee in ('authenticated', 'anon', 'PUBLIC')
+        and privilege_type in ('INSERT', 'UPDATE', 'DELETE')
+    ),
+    'ok'
+
+  union all
+  select
+    'seguranca',
+    'anon nao confirma participacao',
+    not exists (
+      select 1
+      from pg_proc proc
+      join pg_namespace ns on ns.oid = proc.pronamespace
+      where ns.nspname = 'public'
+        and proc.proname = 'confirm_lesson_participation'
+        and has_function_privilege('anon', proc.oid, 'EXECUTE')
+    ),
+    'ok'
+
+  union all
+  select
+    'privacidade',
+    'a projecao do aluno nao expoe autoria nem pacote interno',
+    not exists (
+      select 1
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'student_lesson_records'
+        and column_name in (
+          'teacher_id', 'organization_id', 'created_by', 'private_notes',
+          'student_package_id', 'reschedule_reason'
+        )
+    ),
+    'ok'
+
+  union all
+  select
+    'estrutura',
     'a chave de reagendamento tem namespace proprio',
     exists (
       select 1

@@ -168,7 +168,8 @@ update public.profiles set role = 'admin' where email = 'voce@exemplo.pt';
 │   ├── ..._phase6c1a_reschedule_idempotency.sql Fase 6C.1A: intenção de reagendamento obrigatória
 │   ├── ..._phase6c2_edit_placement_boundary.sql Fase 6C.2: editar deixa de mover a aula
 │   ├── ..._phase6c2_reschedule_declined_cast.sql Fase 6C.2: copiar participação não reservada
-│   └── ..._phase6c2_reschedule_released_participation.sql Fase 6C.2: libertada continua libertada
+│   ├── ..._phase6c2_reschedule_released_participation.sql Fase 6C.2: libertada continua libertada
+│   └── ..._phase7a_lesson_confirmation.sql Fase 7A: confirmação da participação pelo aluno
 │
 └── src/
     ├── proxy.ts             Renova a sessão e protege rotas (era middleware.ts)
@@ -509,6 +510,43 @@ A interface vive em `/professor/aulas/[id]/reagendar` — rota própria, e não 
 Quando a aula já tem presenças registadas, o caminho não é oferecido e a razão é dita — mas quem decide continua a ser `reschedule_lesson()`.
 
 **Ainda não implementado:** reagendamento de série inteira, "esta e futuras", self-reschedule do aluno, desfazer reagendamento, política de janela/multa e notificações. O motivo do reagendamento fica no histórico operacional e **não** é enviado ao aluno nem por email — não existe envio nenhum.
+
+### Confirmação da participação pelo aluno (Etapa 7A)
+
+**RSVP não é presença, e o esquema já dizia isso antes de existir a funcionalidade.**
+
+| Pergunta | Coluna | Quem responde | Quando |
+|---|---|---|---|
+| "Vou a esta aula?" | `lesson_participants.status` | o aluno | antes da aula |
+| "Esteve nesta aula?" | `attendance.status` | o professor | depois da aula |
+
+`confirm_lesson_participation()` **nunca** escreve em `attendance`, e o aluno continua sem poder marcar `present`, `absent`, `late` ou `excused`. Há um teste dedicado em `db:verify` e outro na suite de Auth só para isso — é o ponto onde a palavra "confirmar" produziria um bug grave.
+
+**O que a auditoria encontrou dormente:**
+
+- `lessons.requires_confirmation` existia desde a Fase 1 e **nunca era escrito**: `create_lesson()` não o expunha, e todas as aulas nasciam `false`. As duas RPCs de criação passaram a aceitar `p_requires_confirmation`, com omissão `false` — nenhuma aula existente passou a exigir confirmação, e não houve migração de dados.
+- `lesson_status` tem o valor `confirmed`, mas **nenhuma função o escreve**. Não existe no repositório regra nenhuma que diga o que significaria numa turma — todos confirmaram? a maioria? um só? Não se inventou: `lessons.status` fica intacto e a resposta individual vive em `lesson_participants.status`.
+- A Fase 1 tinha dado ao cliente `GRANT UPDATE (status, confirmed_at, declined_at, decline_reason)` em `lesson_participants`, com policy que aceitava o próprio aluno. Nunca foi revogado. Um PATCH direto marcava-se `confirmed` com um `confirmed_at` do dispositivo — ou `declined` **sem libertar o crédito**, deixando a participação recusada e `billing_status='reserved'` ao mesmo tempo. Revogado na 7A: sem isso a RPC seria decorativa.
+
+**Assinatura mudou, e por isso a antiga foi removida.** `create_lesson()`, `create_recurring_lessons()` e `create_lesson_occurrence()` foram recriadas com `drop function` explícito da versão anterior. Um `create or replace` com mais um parâmetro deixaria as duas vivas e o PostgREST escolheria entre elas de forma ambígua.
+
+**A confirmação recebe apenas a aula.** `confirm_lesson_participation(p_lesson_id)` deriva aluno e participação de `auth.uid()` → `current_student_id()`. Não aceita `student_id`, `participant_id`, professor, organização, pacote, créditos nem estado final.
+
+**Regras de aceitação:** aula operacional (`scheduled`/`confirmed`), `requires_confirmation = true`, participação do próprio, e **antes de a aula começar** — depois disso a pergunta deixou de ser "vou?" e passou a ser "esteve?", que é do professor. A comparação usa `now() >= starts_at` sobre `timestamptz`, nunca datas civis.
+
+**Idempotência pelo próprio estado da linha**, sob o `for update` que já foi tomado: `invited → confirmed` devolve `true`, `confirmed → confirmed` devolve `false` e não toca em `confirmed_at`. Não foi preciso mais nenhuma máquina de idempotência.
+
+**Nada financeiro.** Confirmar é declaração de intenção: os três baldes de créditos ficam iguais, não há linha nova no livro-razão, e a reserva feita na criação continua como estava.
+
+**`declined` e `removed` não voltam atrás.** Uma participação cancelada não é reativada por confirmação. Self-cancel do aluno continua fora do produto: dizer que não vai envolve destino do crédito, política e janela, e isso é outra etapa.
+
+**Reagendar preserva a resposta (correção da 7A).** `transfer_participation_reservation()` criava a participação da substituta sempre como `invited`. Esse valor vinha da Fase 1.5, escrito quando nada conseguia pôr uma participação em `confirmed` — não era uma política de reconfirmação. Deixá-lo significaria que reagendar apagava em silêncio o "vou lá estar", enquanto o outro ramo da mesma operação preservava um `declined`. A assimetria era acidental; passou a copiar `status` e `confirmed_at`.
+
+**Recorrência:** cada ocorrência herda o pedido de confirmação e é respondida isoladamente. Não existe confirmar a série inteira nem "esta e futuras".
+
+**Projeção:** `student_lesson_records` ganhou apenas `requires_confirmation`. `confirmed_at` ficou de fora — a interface precisa de saber se já respondeu, e isso está em `participation_status`.
+
+**Ainda não implementado (7B):** interface do professor para pedir confirmação, interface do aluno para responder, e o gate de browser/mobile.
 
 ### Ao criar uma tabela nova
 
@@ -858,7 +896,7 @@ Interface em `/professor/clubes/[id]/calendario`, com filtro por professor no UR
 
 **Não implementado:** aulas, participantes, locais, campos, recursos, conflitos, reservas e créditos. Os únicos estados são disponível e indisponível — não escrever "ocupado", "reservado", "lotado", "vagas" ou "conflito", porque nada disso existe ainda para ser verdade.
 
-Ordem atual: 6A, 6B, 6C.1, 6C.1A, 6C.1B e 6C.2 fechadas → a Fase 6 está concluída; segue a Fase 7.
+Ordem atual: Fase 6 concluída. Fase 7A fechada (backend da confirmação individual); segue a 7B, com as interfaces de pedir e responder.
 
 ### `src/types/database.ts`
 
@@ -895,7 +933,7 @@ Não existe um comando de formatação separado. Use `npm run lint:fix` apenas p
 | 4 | Interfaces de modelos, atribuição, ajustes e saldos | **Concluído** — Etapas 1A, 1B, 1C, 1D e 1E validadas com Auth/PostgREST reais e browser desktop/mobile |
 | 5 | Calendário e criação de aulas com reserva | **Concluído** — disponibilidade, projeção segura, refinamento visual, clubes/membros, calendário partilhado, locais com moradas manuais, campos/salas/áreas, criação/edição de aulas, conflitos atómicos, reserva atómica de créditos, recorrência semanal segura e revisão integrada |
 | 6 | Cancelamento, reagendamento, presenças e histórico | **Concluído** — 6A/6B: presença, falta/no-show, conclusão normal/mista, cancelamento de aula e de participação com `reserved -> available` ou `reserved -> used` seguros. 6C.1/6C.1A/6C.1B: contrato transacional de reagendamento, chave de idempotência obrigatória em namespace próprio e sete corridas de concorrência com JWTs reais. 6C.2: interface operacional, com a fronteira entre editar conteúdo e reagendar colocação imposta no PostgreSQL |
-| 7 | Área do aluno: aulas, créditos e confirmação | **Planeado** |
+| 7 | Área do aluno: aulas, créditos e confirmação | **Em curso** — 7A: contrato de confirmação individual, com `requires_confirmation` ligado, escrita direta na resposta fechada e RSVP separado de presença. Falta a 7B: interfaces de pedir e responder |
 | 8 | Notificações, lembretes e expiração agendada | **Planeado** |
 | 9 | Supabase real, concorrência, acessibilidade e deployment | **Parcialmente concluído** — RLS em PGlite e validação real das Fases 4, 5, 6A e 6B feitas; concorrência real de aulas/créditos/recorrência/conclusão coberta; deployment pendente |
 

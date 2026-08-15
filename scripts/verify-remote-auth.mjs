@@ -6405,6 +6405,349 @@ try {
     );
   }
 
+  section("Confirmacao da participacao pelo aluno (7A)");
+
+  // RSVP nao e presenca. Esta seccao existe sobretudo para provar, com JWTs
+  // reais, que confirmar NAO escreve em attendance e NAO mexe em creditos.
+
+  const phase7aDate = dateOnlyFromNow(await pickUnusedAvailabilityOffset(120, 150));
+  await prepareException(
+    teacherClient,
+    "Disponibilidade 7A",
+    phase7aDate,
+    `lesson-7a-date-${phase6RunSuffix}`,
+    "06:00",
+    "22:00",
+  );
+
+  await assignLessonPackage(
+    teacherClient,
+    studentsA.id,
+    `Pacote confirmacao 7A ${phase6RunSuffix}`,
+    20,
+    deterministicUuid(`lesson-7a-package:${phase6RunSuffix}`),
+    sportRow.id,
+    { startsOn: dateOnlyFromNow(-10), expiresOn: dateOnlyFromNow(400) },
+  );
+
+  // Grelha propria: `phase6Slot` avanca 80 minutos por indice e sai da janela
+  // 06:00-22:00 ao oitavo. A 7A precisa de mais aulas no mesmo dia, e nenhuma
+  // delas precisa de durar uma hora.
+  const phase7aSlot = (index) => {
+    const startsAt = 360 + index * 50;
+    return { startsAt: timeFromMinutes(startsAt), endsAt: timeFromMinutes(startsAt + 30) };
+  };
+
+  const createConfirmableLesson = async (label, slotIndex, requiresConfirmation) => {
+    const slot = phase7aSlot(slotIndex);
+    const { data, error } = await createLesson(teacherClient, {
+      p_starts_at: lisbonInstant(phase7aDate, slot.startsAt),
+      p_ends_at: lisbonInstant(phase7aDate, slot.endsAt),
+      p_title: `${label} ${phase6RunSuffix}`,
+      p_location_id: null,
+      p_location_resource_id: null,
+      p_student_id: studentsA.id,
+      p_idempotency_key: deterministicUuid(`${label}:${phase6RunSuffix}`),
+      p_requires_confirmation: requiresConfirmation,
+    });
+    if (error || !data) throw new Error(`${label}: ${summarizeError(error)}`);
+    return data;
+  };
+
+  const confirmableLessonId = await createConfirmableLesson("Aula E2E 7A confirmavel", 10, true);
+  const plainLessonId = await createConfirmableLesson("Aula E2E 7A sem confirmacao", 11, false);
+
+  const confirmableRow = await getSingle(
+    "aula que pede confirmacao",
+    teacherClient
+      .from("teacher_lesson_schedule_records")
+      .select("id, status")
+      .eq("id", confirmableLessonId),
+  );
+  check(
+    confirmableRow.status === "scheduled",
+    "Criar uma aula que pede confirmacao nao mexe no estado da aula",
+  );
+
+  const confirmParticipantBefore = await readParticipant(confirmableLessonId, studentsA.id);
+  const confirmPackageBefore = await getSingle(
+    "pacote antes da confirmacao",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_available, credits_reserved, credits_used, credits_total")
+      .eq("name", confirmParticipantBefore.package_name),
+  );
+  const confirmLedgerBefore = await teacherClient
+    .from("package_credit_transactions")
+    .select("id")
+    .eq("lesson_id", confirmableLessonId);
+  if (confirmLedgerBefore.error) {
+    throw new Error(`Livro-razao 7A: ${summarizeError(confirmLedgerBefore.error)}`);
+  }
+
+  // ── O proprio aluno consegue ──
+  const confirmResult = await studentClient.rpc("confirm_lesson_participation", {
+    p_lesson_id: confirmableLessonId,
+  });
+  if (confirmResult.error) {
+    throw new Error(`Confirmar participacao: ${summarizeError(confirmResult.error)}`);
+  }
+  const confirmedProjection = await getSingle(
+    "projecao do aluno depois de confirmar",
+    studentClient
+      .from("student_lesson_records")
+      .select("id, requires_confirmation, participation_status, attendance_status")
+      .eq("id", confirmableLessonId),
+  );
+  check(
+    confirmResult.data === true &&
+      confirmedProjection.requires_confirmation === true &&
+      confirmedProjection.participation_status === "confirmed",
+    "O proprio aluno confirma e ve a resposta na sua projecao",
+  );
+
+  // ── E O TESTE QUE JUSTIFICA A SECCAO ──
+  check(
+    confirmedProjection.attendance_status === null,
+    "Confirmar NAO regista presenca: attendance continua vazia",
+  );
+  const participantAfterConfirm = await readParticipant(confirmableLessonId, studentsA.id);
+  check(
+    participantAfterConfirm.attendance_status === null &&
+      participantAfterConfirm.billing_status === "reserved" &&
+      participantAfterConfirm.credits_reserved === confirmParticipantBefore.credits_reserved &&
+      participantAfterConfirm.credits_consumed === 0,
+    "A reserva feita na criacao fica exatamente como estava",
+  );
+
+  const confirmPackageAfter = await getSingle(
+    "pacote depois da confirmacao",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_available, credits_reserved, credits_used, credits_total")
+      .eq("id", confirmPackageBefore.id),
+  );
+  check(
+    confirmPackageAfter.credits_available === confirmPackageBefore.credits_available &&
+      confirmPackageAfter.credits_reserved === confirmPackageBefore.credits_reserved &&
+      confirmPackageAfter.credits_used === confirmPackageBefore.credits_used &&
+      confirmPackageAfter.credits_total === confirmPackageBefore.credits_total,
+    "Confirmar nao move nenhum dos tres baldes de creditos",
+  );
+  const confirmLedgerAfter = await teacherClient
+    .from("package_credit_transactions")
+    .select("id")
+    .eq("lesson_id", confirmableLessonId);
+  check(
+    (confirmLedgerAfter.data ?? []).length === (confirmLedgerBefore.data ?? []).length,
+    "Confirmar nao escreve no livro-razao",
+  );
+
+  // ── Repetir e no-op ──
+  const confirmRepeat = await studentClient.rpc("confirm_lesson_participation", {
+    p_lesson_id: confirmableLessonId,
+  });
+  check(
+    confirmRepeat.data === false && !confirmRepeat.error,
+    "Confirmar outra vez devolve false sem duplicar efeito",
+  );
+
+  // ── Quem nao pode ──
+  await mustReject("Aula que nao pede confirmacao recusa a confirmacao", async () =>
+    studentClient.rpc("confirm_lesson_participation", { p_lesson_id: plainLessonId }),
+  );
+  await mustReject("Outro aluno nao confirma esta participacao", async () =>
+    studentBClient.rpc("confirm_lesson_participation", { p_lesson_id: confirmableLessonId }),
+  );
+  await mustReject("Professor nao confirma pelo aluno", async () =>
+    teacherClient.rpc("confirm_lesson_participation", { p_lesson_id: confirmableLessonId }),
+  );
+  await mustReject("Admin nao confirma pelo aluno", async () =>
+    adminClient.rpc("confirm_lesson_participation", { p_lesson_id: confirmableLessonId }),
+  );
+  await mustReject("Conta bloqueada nao confirma", async () =>
+    blockedClient.rpc("confirm_lesson_participation", { p_lesson_id: confirmableLessonId }),
+  );
+  await mustReject("Anonimo nao confirma", async () =>
+    anonClient.rpc("confirm_lesson_participation", { p_lesson_id: confirmableLessonId }),
+  );
+
+  // ── A escrita direta na resposta continua fechada ──
+  await mustReject("Aluno nao se marca confirmado por escrita direta", async () =>
+    studentClient
+      .from("lesson_participants")
+      .update({ status: "confirmed" })
+      .eq("lesson_id", plainLessonId),
+  );
+  await mustReject("Aluno nao se marca recusado por escrita direta", async () =>
+    studentClient
+      .from("lesson_participants")
+      .update({ status: "declined" })
+      .eq("lesson_id", plainLessonId),
+  );
+
+  // ── Concorrencia real: duas sessoes do mesmo aluno ──
+  const raceConfirmLessonId = await createConfirmableLesson("Aula E2E 7A corrida", 12, true);
+  const confirmRace = await Promise.all([
+    rpcOutcome(() =>
+      studentClient.rpc("confirm_lesson_participation", { p_lesson_id: raceConfirmLessonId }),
+    ),
+    rpcOutcome(() =>
+      studentClient.rpc("confirm_lesson_participation", { p_lesson_id: raceConfirmLessonId }),
+    ),
+  ]);
+  const confirmRaceParticipant = await readParticipant(raceConfirmLessonId, studentsA.id);
+  check(
+    confirmRace.every((entry) => entry.ok) &&
+      confirmRace.filter((entry) => entry.data === true).length === 1 &&
+      confirmRaceParticipant.attendance_status === null,
+    "Duas confirmacoes simultaneas produzem uma unica transformacao",
+  );
+
+  // ── Confirmar x cancelar a aula ──
+  const cancelRaceLessonId = await createConfirmableLesson("Aula E2E 7A corrida cancelar", 13, true);
+  const cancelRacePackageBefore = await getSingle(
+    "pacote antes da corrida confirmar x cancelar",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_available, credits_reserved, credits_used, credits_total")
+      .eq("id", confirmPackageBefore.id),
+  );
+  const confirmCancelRace = await Promise.all([
+    rpcOutcome(() =>
+      studentClient.rpc("confirm_lesson_participation", { p_lesson_id: cancelRaceLessonId }),
+    ),
+    rpcOutcome(() => cancelLessonRpc(teacherClient, cancelRaceLessonId)),
+  ]);
+  const cancelRaceLesson = await getSingle(
+    "aula da corrida confirmar x cancelar",
+    teacherClient
+      .from("teacher_lesson_schedule_records")
+      .select("id, status")
+      .eq("id", cancelRaceLessonId),
+  );
+  check(
+    confirmCancelRace[1].ok === true && cancelRaceLesson.status === "cancelled_by_teacher",
+    "Confirmar nunca impede o cancelamento nem ressuscita a aula",
+  );
+  const cancelRaceParticipant = await readParticipant(cancelRaceLessonId, studentsA.id);
+  const cancelRacePackageAfter = await getSingle(
+    "pacote depois da corrida confirmar x cancelar",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_available, credits_reserved, credits_used, credits_total")
+      .eq("id", confirmPackageBefore.id),
+  );
+  check(
+    cancelRaceParticipant.billing_status === "released" &&
+      cancelRaceParticipant.credits_reserved === 0 &&
+      cancelRaceParticipant.attendance_status === null,
+    "O credito volta pelo cancelamento, nunca pela confirmacao",
+  );
+  check(
+    cancelRacePackageAfter.credits_used === cancelRacePackageBefore.credits_used &&
+      cancelRacePackageAfter.credits_total === cancelRacePackageBefore.credits_total &&
+      cancelRacePackageAfter.credits_available + cancelRacePackageAfter.credits_reserved ===
+        cancelRacePackageBefore.credits_available + cancelRacePackageBefore.credits_reserved,
+    "A soma dos saldos obedece so ao cancelamento",
+  );
+  await mustReject("Uma aula cancelada ja nao aceita confirmacao", async () =>
+    studentClient.rpc("confirm_lesson_participation", { p_lesson_id: cancelRaceLessonId }),
+  );
+
+  // ── Confirmar x reagendar ──
+  const reschedRaceLessonId = await createConfirmableLesson(
+    "Aula E2E 7A corrida reagendar",
+    14,
+    true,
+  );
+  const reschedRaceSlot = phase7aSlot(15);
+  const confirmReschedRace = await Promise.all([
+    rpcOutcome(() =>
+      studentClient.rpc("confirm_lesson_participation", { p_lesson_id: reschedRaceLessonId }),
+    ),
+    rpcOutcome(() =>
+      teacherClient.rpc("reschedule_lesson", {
+        p_lesson_id: reschedRaceLessonId,
+        p_starts_at: lisbonInstant(phase7aDate, reschedRaceSlot.startsAt),
+        p_ends_at: lisbonInstant(phase7aDate, reschedRaceSlot.endsAt),
+        p_reason: "Corrida com a confirmacao do aluno",
+        p_location_id: null,
+        p_location_resource_id: null,
+        p_idempotency_key: deterministicUuid(`lesson-7a-resched:${phase6RunSuffix}`),
+      }),
+    ),
+  ]);
+  check(
+    confirmReschedRace[1].ok === true,
+    `Reagendar termina mesmo com a confirmacao em curso${
+      confirmReschedRace[1].ok ? "" : `: ${summarizeError(confirmReschedRace[1].error)}`
+    }`,
+  );
+  const reschedRaceReplacementId = confirmReschedRace[1].data;
+  const reschedRaceReplacement = await getSingle(
+    "substituta da corrida 7A",
+    teacherClient
+      .from("teacher_lesson_schedule_records")
+      .select("id, status")
+      .eq("id", reschedRaceReplacementId),
+  );
+  check(
+    ["scheduled", "confirmed"].includes(reschedRaceReplacement.status),
+    "A substituta fica operacional depois da corrida",
+  );
+  await mustReject("A original reagendada ja nao aceita confirmacao", async () =>
+    studentClient.rpc("confirm_lesson_participation", { p_lesson_id: reschedRaceLessonId }),
+  );
+
+  // Reagendar preserva a resposta do aluno: quem ja tinha dito que ia continua
+  // a dizer que vai, e quem ainda nao respondeu continua por responder.
+  const preserveLessonId = await createConfirmableLesson("Aula E2E 7A preserva", 16, true);
+  await studentClient.rpc("confirm_lesson_participation", { p_lesson_id: preserveLessonId });
+  const preserveSlot = phase7aSlot(17);
+  const { data: preserveReplacementId, error: preserveError } = await teacherClient.rpc(
+    "reschedule_lesson",
+    {
+      p_lesson_id: preserveLessonId,
+      p_starts_at: lisbonInstant(phase7aDate, preserveSlot.startsAt),
+      p_ends_at: lisbonInstant(phase7aDate, preserveSlot.endsAt),
+      p_reason: "Preservar a resposta do aluno",
+      p_location_id: null,
+      p_location_resource_id: null,
+      p_idempotency_key: deterministicUuid(`lesson-7a-preserve:${phase6RunSuffix}`),
+    },
+  );
+  if (preserveError || !preserveReplacementId) {
+    throw new Error(`Reagendar aula confirmada 7A: ${summarizeError(preserveError)}`);
+  }
+  const preservedProjection = await getSingle(
+    "projecao depois de reagendar uma aula confirmada",
+    studentClient
+      .from("student_lesson_records")
+      .select("id, requires_confirmation, participation_status, attendance_status")
+      .eq("id", preserveReplacementId),
+  );
+  check(
+    preservedProjection.requires_confirmation === true &&
+      preservedProjection.participation_status === "confirmed" &&
+      preservedProjection.attendance_status === null,
+    "Reagendar preserva o pedido de confirmacao e a resposta ja dada",
+  );
+
+  // ── Privacidade: a projecao continua sem colegas nem internos ──
+  check(
+    forbiddenColumns(preservedProjection, [
+      "teacher_id",
+      "organization_id",
+      "created_by",
+      "private_notes",
+      "student_package_id",
+      "reschedule_reason",
+      "confirmed_at",
+    ]).length === 0,
+    "A projecao do aluno nao ganhou campos administrativos com a 7A",
+  );
+
   section("Conta bloqueada e anonimo");
   await signIn(blockedClient, credentials.blocked.email, credentials.blocked.password, "Conta bloqueada");
   await mustReturnNoRows("Conta bloqueada nao le views de pacotes", () =>

@@ -742,19 +742,28 @@ async function rescheduleScenario(context, fixture, apiClient) {
 
   // A regressão da 6B.2: a mutação tem de resolver por si, sem depender de a
   // rota seguinte carregar.
+  // POR QUE É QUE A NAVEGAÇÃO PROVA A RESOLUÇÃO
+  //
+  // Não é circular, e também não é uma questão de ordem cronológica: as duas
+  // marcas ficam a milissegundos uma da outra porque a navegação é DISPARADA
+  // pelo estado resolvido. `router.replace()` só corre dentro do efeito que
+  // depende de `state.resourceId`, e esse identificador só existe se a Action
+  // tiver devolvido. Era exatamente isso que o defeito da 6B.2 impedia: com a
+  // resposta presa ao stream RSC, `useActionState` nunca resolvia, não havia
+  // `resourceId`, e a navegação nunca chegava a acontecer.
+  //
+  // O fim do pending é verificado em separado, por `waitForIdle`.
   await waitForIdle(page, handle, "Reagendar");
-  const resolved = await Promise.race([
-    waitForPanel(page, "Aula reagendada", 20_000).then((seen) => (seen ? "confirmado" : null)),
-    page
-      .waitForURL((url) => !url.pathname.endsWith("/reagendar"), { timeout: 20_000 })
-      .then(() => "navegou")
-      .catch(() => null),
-  ]);
+  const navigated = await page
+    .waitForURL((url) => !url.pathname.endsWith("/reagendar"), { timeout: 25_000 })
+    .then(() => true)
+    .catch(() => false);
   const resolvedIn = Date.now() - startedAt;
+
   check(
-    resolved !== null,
-    "A Action resolve sozinha antes de a rota seguinte carregar",
-    `${resolved ?? "sem resolução"} em ${resolvedIn} ms`,
+    navigated,
+    "A Action devolve o identificador da substituta e só então o cliente navega",
+    navigated ? `${resolvedIn} ms` : "a navegação nunca aconteceu — Action presa",
   );
 
   // 4. A navegação leva à substituta.

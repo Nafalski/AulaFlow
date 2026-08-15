@@ -7,7 +7,8 @@ A começar pelo **beach tennis**, com arquitetura preparada para outras modalida
 
 > **Estado:** Fases 1, 1.5, 2, 3, 4 e 5 concluídas. A Fase 6A acrescentou presença e conclusão segura da aula; a Fase 6B acrescenta cancelamento de aula, cancelamento de participação em turma e falta/no-show com destino financeiro seguro.
 > A **Etapa 6C.1** acrescenta o contrato transacional de reagendamento: a aula original fica histórica, a substituta herda participantes e reserva, e nenhum saldo se move. A **Etapa 6C.2** liga-o à aplicação e separa as duas intenções: editar muda conteúdo (título e observações), reagendar muda a colocação (data, hora, local, campo) e deixa rasto. A duração é preservada, e o reagendamento afeta apenas esta ocorrência. Reagendamento pelo aluno e alteração de série inteira continuam por implementar.
-> Reagendamento operacional, self-service de cancelamento do aluno, política configurável de janelas, notificações, pagamentos e transferência/fusão de pacotes continuam nas etapas seguintes.
+> A **Etapa 7A** liga a confirmação da participação pelo aluno: uma aula pode passar a pedir confirmação, e o aluno responde pela sua própria participação. Confirmar é RSVP — responde a "vou a esta aula", nunca a "estive nesta aula" — e por isso não escreve presença nem move créditos. As interfaces de pedir e de responder são a 7B.
+> Self-service de cancelamento do aluno, política configurável de janelas, notificações, pagamentos e transferência/fusão de pacotes continuam nas etapas seguintes.
 
 ---
 
@@ -40,7 +41,8 @@ Instruções completas — incluindo a configuração do Supabase — em [`AGENT
 - Gestão de turmas, participantes, capacidade, modalidade e observações administrativas privadas
 - Locais privados, de clube e propostas públicas em `/professor/locais`, com morada escrita à mão e assumida como não validada por terceiros; moderação das propostas em `/admin/locais`
 - Campos, salas e áreas de cada local, com tipo genérico, ordem de apresentação e desativação que preserva a linha; herdam a autorização do local
-- Criação e edição de aulas em `/professor/aulas/nova` e `/professor/aulas/[id]`, com aluno ou turma, contexto pessoal ou de clube, local, campo, data, hora e duração — validadas contra a disponibilidade, bloqueios, intervalo mínimo, aulas ativas do professor e ocupação do recurso físico
+- Criação de aulas em `/professor/aulas/nova`, com aluno ou turma, contexto pessoal ou de clube, local, campo, data, hora e duração — validadas contra a disponibilidade, bloqueios, intervalo mínimo, aulas ativas do professor e ocupação do recurso físico
+- Em `/professor/aulas/[id]`, **editar** muda título e observações; **reagendar**, em `/professor/aulas/[id]/reagendar`, muda data, hora, local e campo com motivo, preserva a duração e afeta apenas aquela ocorrência
 - Ao criar uma aula, o Supabase seleciona um pacote válido e reserva créditos na mesma transação; em turma, se algum aluno não tiver saldo, a criação inteira é desfeita
 - Criação de séries semanais de 2 a 12 aulas, sempre por hora civil `Europe/Lisbon`: a hora local é preservada ao atravessar mudança de horário, cada ocorrência é uma aula real, e qualquer falha de disponibilidade, conflito ou crédito desfaz a série inteira
 - Aulas de turma fixam os alunos no momento da criação: alterar a turma depois não altera quem estava previsto
@@ -78,9 +80,9 @@ O próximo passo planeado é a Fase 7: a área do aluno, com aulas, créditos e 
 
 Entrar num clube **não** partilha a agenda: `calendar_sharing_enabled` nasce desativado e só o próprio membro o altera — proprietários, gestores e a administração da plataforma não têm caminho para forçar a partilha de outra pessoa. Os locais e os seus campos já são partilhados com o clube; alunos, pacotes, turmas e disponibilidade continuam ligados ao workspace pessoal, e a interface diz isso explicitamente em vez de o esconder.
 
-Criar ou editar uma aula impede sobreposição de aulas ativas do professor, respeita o intervalo mínimo e impede duas aulas no mesmo campo/sala ao mesmo horário. Ao criar, os créditos ficam reservados; ao editar horário/local/recurso, a reserva é mantida e a validade do pacote é revalidada quando a data muda. Depois do início, o professor pode confirmar presença; depois do fim, pode marcar falta/no-show e concluir a aula quando todos os participantes ativos tiverem desfecho. Cancelar aula ou participação de turma devolve reservas; concluir presença ou falta consome reservas exatamente uma vez. Numa série semanal, editar, concluir ou cancelar a página de uma aula altera apenas aquela ocorrência; não existe ainda edição/cancelamento de série inteira.
+Criar ou reagendar uma aula impede sobreposição de aulas ativas do professor, respeita o intervalo mínimo e impede duas aulas no mesmo campo/sala ao mesmo horário. Ao criar, os créditos ficam reservados; ao reagendar, a reserva é transferida para a aula nova sem nova cobrança e a validade do pacote é revalidada na data nova. Editar uma aula não mexe na colocação: `update_lesson()` recusa qualquer tentativa de mudar data, hora, local ou campo. Depois do início, o professor pode confirmar presença; depois do fim, pode marcar falta/no-show e concluir a aula quando todos os participantes ativos tiverem desfecho. Cancelar aula ou participação de turma devolve reservas; concluir presença ou falta consome reservas exatamente uma vez. Numa série semanal, editar, reagendar, concluir ou cancelar a página de uma aula altera apenas aquela ocorrência; não existe ainda edição, reagendamento ou cancelamento de série inteira.
 
-Ainda não existe política configurável de cancelamento, janela de 12h/24h, cancelamento self-service do aluno, reativação de participação cancelada, reagendamento semântico, notificações nem pagamentos.
+Ainda não existe política configurável de cancelamento, janela de 12h/24h, cancelamento self-service do aluno, reativação de participação cancelada, notificações nem pagamentos.
 
 Sem um bucket de Storage configurado, os avatares usam iniciais. Preparar a ligação de um aluno ainda não envia email sem um Supabase remoto; a interface identifica essa limitação. As preferências de email ficam guardadas, mas a entrega automática e os lembretes agendados pertencem à Fase 8.
 

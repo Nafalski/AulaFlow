@@ -7556,7 +7556,8 @@ const createLessonAs = (uid, args) =>
          p_group_id => $10::uuid,
          p_notes_for_students => $11::text,
          p_private_notes => $12::text,
-         p_idempotency_key => $13::uuid
+         p_idempotency_key => $13::uuid,
+         p_requires_confirmation => $14::boolean
        ) as id`,
       [
         args.sportId ?? sport,
@@ -7572,6 +7573,7 @@ const createLessonAs = (uid, args) =>
         args.notes ?? null,
         args.privateNotes ?? null,
         args.idempotencyKey ?? randomUUID(),
+        args.requiresConfirmation ?? false,
       ],
     ),
   );
@@ -11721,6 +11723,419 @@ await mustReject("cancelamento sem motivo", () =>
 
 await mustReject("apagar uma aula em estado terminal", () =>
   db.query(`delete from public.lessons where id=$1`, [lessonA.id]),
+);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Fase 7A — confirmação da participação pelo aluno
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// RSVP não é presença. `participant_status` responde a "vou?", antes da aula;
+// `attendance_status` responde a "estive?", depois, e é registo do professor.
+// A secção inteira existe para que a palavra "confirmar" nunca passe a escrever
+// na tabela errada.
+
+const confirmAs = (uid, lessonId) =>
+  asDatabaseRole("authenticated", uid, () =>
+    one(`select public.confirm_lesson_participation($1) as changed`, [lessonId]),
+  );
+
+const confirmPack = await assignPackageAs(TEACHER_UID, {
+  student: ana.id,
+  name: "Pacote confirmação 7A",
+  credits: 20,
+  sportId: sport,
+  starts: "2026-01-01",
+  expires: "2028-12-31",
+});
+const confirmBrunoPack = await assignPackageAs(TEACHER_UID, {
+  student: bruno.id,
+  name: "Pacote confirmação turma 7A",
+  credits: 20,
+  sportId: sport,
+  starts: "2026-01-01",
+  expires: "2028-12-31",
+});
+
+// ── Uma aula pode agora PEDIR confirmação ──────────────────────────────────
+
+const confirmLesson = await createLessonAs(TEACHER_UID, {
+  studentId: ana.id,
+  title: "Aula com confirmação 7A",
+  start: "2027-03-01 10:00+00",
+  end: "2027-03-01 11:00+00",
+  requiresConfirmation: true,
+});
+const plainLesson = await createLessonAs(TEACHER_UID, {
+  studentId: ana.id,
+  title: "Aula sem confirmação 7A",
+  start: "2027-03-08 10:00+00",
+  end: "2027-03-08 11:00+00",
+});
+check(
+  (await one(`select requires_confirmation from public.lessons where id=$1`, [confirmLesson.id]))
+    .requires_confirmation === true &&
+    (await one(`select requires_confirmation from public.lessons where id=$1`, [plainLesson.id]))
+      .requires_confirmation === false,
+  "create_lesson aceita o pedido de confirmação e mantém false por omissão",
+);
+
+// ── Uma aula que não pede confirmação não a aceita ─────────────────────────
+
+await mustReject(
+  "confirmar uma aula que não pede confirmação",
+  () => confirmAs(ANA_UID, plainLesson.id),
+  "não pede confirmação",
+);
+
+// ── O caminho feliz, e o que ele NÃO toca ──────────────────────────────────
+
+const confirmPackBefore = await pkg(confirmPack.id);
+const confirmLedgerBefore = await ledgerRows();
+const attendanceBefore = Number(
+  (await one(`select count(*)::int as total from public.attendance`)).total,
+);
+
+const confirmed = await confirmAs(ANA_UID, confirmLesson.id);
+const confirmedRow = await one(
+  `select status::text, confirmed_at, billing_status::text, credits_reserved
+     from public.lesson_participants where lesson_id=$1 and student_id=$2`,
+  [confirmLesson.id, ana.id],
+);
+check(
+  confirmed.changed === true &&
+    confirmedRow.status === "confirmed" &&
+    confirmedRow.confirmed_at !== null,
+  "o aluno confirma a própria participação e o servidor carimba a hora",
+);
+
+// ESTE É O TESTE QUE JUSTIFICA A SECÇÃO. Confirmar não é presença.
+check(
+  Number((await one(`select count(*)::int as total from public.attendance`)).total) ===
+    attendanceBefore,
+  "confirmar NÃO cria nenhuma linha de presença",
+);
+const confirmPackAfter = await pkg(confirmPack.id);
+check(
+  confirmPackAfter.credits_available === confirmPackBefore.credits_available &&
+    confirmPackAfter.credits_reserved === confirmPackBefore.credits_reserved &&
+    confirmPackAfter.credits_used === confirmPackBefore.credits_used &&
+    (await ledgerRows()) === confirmLedgerBefore,
+  "confirmar não move créditos nem escreve no livro-razão",
+);
+check(
+  confirmedRow.billing_status === "reserved" && confirmedRow.credits_reserved === 1,
+  "a reserva feita na criação continua exatamente como estava",
+);
+check(
+  (await one(`select status::text from public.lessons where id=$1`, [confirmLesson.id]))
+    .status === "scheduled",
+  "confirmar não mexe no estado da aula",
+);
+
+// ── Repetir é no-op, e não mexe no carimbo ─────────────────────────────────
+
+const repeatConfirm = await confirmAs(ANA_UID, confirmLesson.id);
+const afterRepeat = await one(
+  `select confirmed_at from public.lesson_participants where lesson_id=$1 and student_id=$2`,
+  [confirmLesson.id, ana.id],
+);
+check(
+  repeatConfirm.changed === false &&
+    afterRepeat.confirmed_at.getTime() === confirmedRow.confirmed_at.getTime(),
+  "confirmar outra vez é no-op e preserva o confirmed_at original",
+);
+
+// ── Quem não pode ──────────────────────────────────────────────────────────
+
+const otherConfirmLesson = await createLessonAs(TEACHER_UID, {
+  studentId: ana.id,
+  title: "Aula com confirmação alheia 7A",
+  start: "2027-03-15 10:00+00",
+  end: "2027-03-15 11:00+00",
+  requiresConfirmation: true,
+});
+
+await mustReject("o professor não confirma pelo aluno", () =>
+  confirmAs(TEACHER_UID, otherConfirmLesson.id),
+);
+await mustReject("o administrador não confirma pelo aluno", () =>
+  confirmAs(ADMIN_UID, otherConfirmLesson.id),
+);
+await mustReject("outro aluno não confirma esta participação", () =>
+  confirmAs(BRUNO_UID, otherConfirmLesson.id),
+);
+await mustReject("anónimo não confirma", () =>
+  asDatabaseRole("anon", null, () =>
+    db.query(`select public.confirm_lesson_participation($1)`, [otherConfirmLesson.id]),
+  ),
+);
+
+// ── Estados que não aceitam confirmação ────────────────────────────────────
+
+const cancelledConfirmLesson = await createLessonAs(TEACHER_UID, {
+  studentId: ana.id,
+  title: "Aula cancelada com confirmação 7A",
+  start: "2027-03-22 10:00+00",
+  end: "2027-03-22 11:00+00",
+  requiresConfirmation: true,
+});
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(`select public.cancel_lesson($1)`, [cancelledConfirmLesson.id]),
+);
+await mustReject(
+  "uma aula cancelada não aceita confirmação",
+  () => confirmAs(ANA_UID, cancelledConfirmLesson.id),
+  "histórico",
+);
+
+const pastConfirmLesson = await reschedulableLesson({
+  title: "Aula já começada com confirmação 7A",
+  start: "2026-08-03 10:00+00",
+  end: "2026-08-03 11:00+00",
+  students: [[ana.id, confirmPack.id]],
+});
+await db.query(`update public.lessons set requires_confirmation = true where id=$1`, [
+  pastConfirmLesson.id,
+]);
+await mustReject(
+  "uma aula que já começou não aceita confirmação",
+  () => confirmAs(ANA_UID, pastConfirmLesson.id),
+  "já começou",
+);
+
+// ── Turma: cada aluno responde apenas por si ───────────────────────────────
+
+const confirmGroupLesson = await createLessonAs(TEACHER_UID, {
+  groupId: managedGroup.id,
+  title: "Turma com confirmação 7A",
+  start: "2027-04-05 10:00+00",
+  end: "2027-04-05 11:00+00",
+  requiresConfirmation: true,
+});
+const groupBefore = await participationsOf(confirmGroupLesson.id);
+// Instantâneo IMEDIATAMENTE antes de confirmar: a criação da aula de turma já
+// reservou créditos, por isso o estado da atribuição não serve de referência.
+const brunoPackBeforeGroupConfirm = await pkg(confirmBrunoPack.id);
+await confirmAs(ANA_UID, confirmGroupLesson.id);
+const groupAfter = await participationsOf(confirmGroupLesson.id);
+check(
+  groupBefore.length > 1 &&
+    groupAfter.filter((part) => part.status === "confirmed").length === 1 &&
+    groupAfter.find((part) => part.student_id === ana.id)?.status === "confirmed",
+  "numa turma, confirmar muda apenas a própria participação",
+);
+check(
+  groupAfter
+    .filter((part) => part.student_id !== ana.id)
+    .every((part) => part.status === groupBefore.find((b) => b.student_id === part.student_id)?.status),
+  "as participações dos colegas ficam exatamente como estavam",
+);
+const brunoPackAfterGroupConfirm = await pkg(confirmBrunoPack.id);
+check(
+  brunoPackAfterGroupConfirm.credits_available === brunoPackBeforeGroupConfirm.credits_available &&
+    brunoPackAfterGroupConfirm.credits_reserved === brunoPackBeforeGroupConfirm.credits_reserved &&
+    brunoPackAfterGroupConfirm.credits_used === brunoPackBeforeGroupConfirm.credits_used,
+  "confirmar não toca no pacote de nenhum colega",
+);
+
+// ── Uma participação cancelada não é reativada pela confirmação ────────────
+
+const declinedConfirmParticipant = await one(
+  `select id from public.lesson_participants where lesson_id=$1 and student_id=$2`,
+  [confirmGroupLesson.id, bruno.id],
+);
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(`select public.cancel_lesson_participation($1,$2)`, [
+    confirmGroupLesson.id,
+    declinedConfirmParticipant.id,
+  ]),
+);
+await mustReject(
+  "uma participação cancelada não volta atrás por confirmação",
+  () => confirmAs(BRUNO_UID, confirmGroupLesson.id),
+  "cancelada",
+);
+
+// ── Reagendar preserva o pedido e a resposta ───────────────────────────────
+
+const reschedConfirmLesson = await createLessonAs(TEACHER_UID, {
+  studentId: ana.id,
+  title: "Aula confirmada a reagendar 7A",
+  start: "2027-04-12 10:00+00",
+  end: "2027-04-12 11:00+00",
+  requiresConfirmation: true,
+});
+await confirmAs(ANA_UID, reschedConfirmLesson.id);
+const reschedConfirmReplacement = await rescheduleAs(TEACHER_UID, {
+  lessonId: reschedConfirmLesson.id,
+  start: "2027-04-12 14:00+00",
+  end: "2027-04-12 15:00+00",
+  reason: "Mudança de horário do aluno",
+});
+const replacementLessonRow = await one(
+  `select requires_confirmation, status::text from public.lessons where id=$1`,
+  [reschedConfirmReplacement.id],
+);
+const replacementParticipation = await one(
+  `select status::text, confirmed_at from public.lesson_participants
+     where lesson_id=$1 and student_id=$2`,
+  [reschedConfirmReplacement.id, ana.id],
+);
+check(
+  replacementLessonRow.requires_confirmation === true &&
+    replacementParticipation.status === "confirmed",
+  "reagendar preserva o pedido de confirmação e a resposta já dada",
+);
+
+// Uma participação ainda por responder continua por responder.
+const invitedReschedLesson = await createLessonAs(TEACHER_UID, {
+  studentId: ana.id,
+  title: "Aula por confirmar a reagendar 7A",
+  start: "2027-04-19 10:00+00",
+  end: "2027-04-19 11:00+00",
+  requiresConfirmation: true,
+});
+const invitedReplacement = await rescheduleAs(TEACHER_UID, {
+  lessonId: invitedReschedLesson.id,
+  start: "2027-04-19 14:00+00",
+  end: "2027-04-19 15:00+00",
+  reason: "Mudança de horário do professor",
+});
+check(
+  (
+    await one(
+      `select status::text from public.lesson_participants where lesson_id=$1 and student_id=$2`,
+      [invitedReplacement.id, ana.id],
+    )
+  ).status === "invited" &&
+    (await one(`select requires_confirmation from public.lessons where id=$1`, [
+      invitedReplacement.id,
+    ])).requires_confirmation === true,
+  "uma participação por responder continua por responder depois de reagendada",
+);
+
+// ── Recorrência: cada ocorrência é respondida isoladamente ─────────────────
+
+const confirmSeries = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.create_recurring_lessons(
+       p_sport_id => $1::uuid,
+       p_starts_at => '2027-05-03 10:00+00'::timestamptz,
+       p_ends_at => '2027-05-03 11:00+00'::timestamptz,
+       p_title => 'Série com confirmação 7A',
+       p_occurrence_count => 2,
+       p_student_id => $2::uuid,
+       p_idempotency_key => $3::uuid,
+       p_requires_confirmation => true
+     ) as result`,
+    [sport, ana.id, randomUUID()],
+  ),
+);
+const confirmSeriesIds = confirmSeries.result.lesson_ids;
+check(
+  confirmSeriesIds.length === 2 &&
+    (await rows(
+      `select requires_confirmation from public.lessons where id = any($1::uuid[])`,
+      [confirmSeriesIds],
+    )).every((row) => row.requires_confirmation === true),
+  "uma série herda o pedido de confirmação em todas as ocorrências",
+);
+await confirmAs(ANA_UID, confirmSeriesIds[0]);
+check(
+  (
+    await one(
+      `select status::text from public.lesson_participants where lesson_id=$1 and student_id=$2`,
+      [confirmSeriesIds[1], ana.id],
+    )
+  ).status === "invited",
+  "confirmar uma ocorrência não confirma as restantes",
+);
+
+// ── A escrita direta na resposta continua fechada ──────────────────────────
+
+const participantWriteGrants = await rows(
+  `select privilege_type, grantee from information_schema.role_table_grants
+    where table_schema='public' and table_name='lesson_participants'
+      and grantee in ('authenticated','anon','PUBLIC')
+      and privilege_type in ('INSERT','UPDATE','DELETE')`,
+);
+check(
+  participantWriteGrants.length === 0,
+  "authenticated e anon não escrevem diretamente em lesson_participants",
+);
+await mustReject("o aluno não se marca confirmado por escrita direta", () =>
+  asDatabaseRole("authenticated", ANA_UID, () =>
+    db.query(
+      `update public.lesson_participants set status='confirmed', confirmed_at=now()
+        where lesson_id=$1 and student_id=$2`,
+      [otherConfirmLesson.id, ana.id],
+    ),
+  ),
+);
+await mustReject("o aluno não se marca recusado por escrita direta", () =>
+  asDatabaseRole("authenticated", ANA_UID, () =>
+    db.query(
+      `update public.lesson_participants set status='declined', declined_at=now()
+        where lesson_id=$1 and student_id=$2`,
+      [otherConfirmLesson.id, ana.id],
+    ),
+  ),
+);
+
+const confirmFunctionAnon = await rows(
+  `select proc.proname from pg_proc proc
+     join pg_namespace ns on ns.oid = proc.pronamespace
+    where ns.nspname='public'
+      and proc.proname='confirm_lesson_participation'
+      and has_function_privilege('anon', proc.oid, 'EXECUTE')`,
+);
+check(confirmFunctionAnon.length === 0, "anon não executa a confirmação");
+
+const createSignatures = await rows(
+  `select proc.proname, count(*)::int as total from pg_proc proc
+     join pg_namespace ns on ns.oid = proc.pronamespace
+    where ns.nspname='public'
+      and proc.proname in ('create_lesson','create_recurring_lessons','create_lesson_occurrence')
+    group by proc.proname`,
+);
+check(
+  createSignatures.length === 3 && createSignatures.every((row) => Number(row.total) === 1),
+  "cada RPC de criação tem uma única assinatura, sem overload ambíguo",
+);
+
+// ── A projeção do aluno diz o que precisa, e nada mais ─────────────────────
+
+const studentConfirmProjection = await asDatabaseRole("authenticated", ANA_UID, () =>
+  one(
+    `select requires_confirmation, participation_status::text
+       from public.student_lesson_records where id=$1`,
+    [confirmLesson.id],
+  ),
+);
+check(
+  studentConfirmProjection.requires_confirmation === true &&
+    studentConfirmProjection.participation_status === "confirmed",
+  "o aluno vê que a aula pede confirmação e que já respondeu",
+);
+const studentProjectionColumns = await rows(
+  `select column_name from information_schema.columns
+    where table_schema='public' and table_name='student_lesson_records'`,
+);
+check(
+  !studentProjectionColumns.some((row) =>
+    [
+      "teacher_id",
+      "organization_id",
+      "created_by",
+      "private_notes",
+      "student_package_id",
+      "reschedule_reason",
+      "confirmed_at",
+      "rescheduled_from_id",
+      "rescheduled_to_id",
+    ].includes(row.column_name),
+  ),
+  "a projeção do aluno continua sem professor, organização, pacote nem autoria",
 );
 
 // ── Resultado ────────────────────────────────────────────────────────────────

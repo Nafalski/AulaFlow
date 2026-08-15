@@ -448,7 +448,7 @@ A estrutura fica pronta para notificações push (Fase 8).
 | **4** | Pacotes: modelos, atribuição, ajustes, painel de saldo | **Concluído** — Etapas 1A, 1B, 1C, 1D e 1E validadas |
 | **5** | Calendário e criação de aulas, com reserva de créditos | **Concluído** — disponibilidade, calendário, clubes, locais, recursos, criação/edição de aulas, conflitos atómicos, reserva atómica de créditos, recorrência semanal segura e revisão integrada |
 | **6** | Cancelamento, reagendamento, presenças, histórico | **Concluída** — 6A/6B: presença, falta/no-show, conclusão normal/mista e cancelamentos com `reserved -> available` ou `reserved -> used` seguros. 6C.1/1A/1B: contrato transacional de reagendamento, chave de idempotência obrigatória e concorrência real provada. 6C.2: interface operacional, com editar conteúdo e reagendar colocação separados no PostgreSQL |
-| **7** | Área do aluno: aulas, saldo, confirmação de presença | **Planeado** |
+| **7** | Área do aluno: aulas, saldo, confirmação da participação | **7A concluída** — contrato de confirmação individual: `requires_confirmation` deixou de estar dormente, a escrita direta na resposta do aluno foi fechada, e RSVP ficou separado de presença. Falta a 7B: interfaces de pedir e de responder |
 | **8** | Notificações, lembretes e expiração agendada | **Planeado** |
 | **9** | Supabase real, concorrência, acessibilidade, deployment | **Parcialmente concluído** — Supabase/Auth reais validados até à 6B (405 verificações, repetíveis); browser automatizado com sessão GoTrue real; paridade dev/produção confirmada na 6B.2; deployment pendente |
 
@@ -1169,6 +1169,42 @@ Duas correções apareceram ao exercitar o caminho real:
 A rota é `/professor/aulas/[id]/reagendar`, com resumo DE → PARA, aviso de ocorrência única em séries e motivo obrigatório. A Action mantém o contrato da 6B.2 — sem `revalidatePath()`, sem `redirect()`, sem Route Handler — e devolve apenas o identificador da substituta, que o cliente usa para `router.replace()`.
 
 **Ainda não implementado depois da 6C.1:** interface de reagendamento (6C.2), reagendar série inteira, "esta e futuras", self-reschedule do aluno, política configurável de cancelamento, self-cancel do aluno, janela de 12h/24h, cobrança parcial, multa/tolerância, reativação de participação cancelada, notificações, pagamentos e calendários externos.
+
+### Concluído na Etapa 7A — contrato de confirmação do aluno
+
+Estado: **backend concluído. As interfaces de pedir e de responder são a 7B.**
+
+A Fase 7 não começou numa página vazia: `/aluno`, `/aluno/calendario`, `/aluno/pacotes` e `/aluno/historico` já existem, e `student_lesson_records` já projetava `participation_status`. A 7A ligou o que faltava e fechou o que estava aberto.
+
+#### RSVP não é presença
+
+O esquema já distinguia as duas perguntas desde a Fase 1; faltava garantir que a funcionalidade nova não as juntava. `confirm_lesson_participation()` escreve em `lesson_participants` e nunca em `attendance`, e existe um teste dedicado em cada camada só para o afirmar — é o ponto exato onde a palavra "confirmar" produziria um bug grave e silencioso.
+
+#### Três coisas dormentes que a auditoria encontrou
+
+1. **`requires_confirmation` nunca era escrito.** As RPCs de criação não o expunham. Passaram a aceitar `p_requires_confirmation`, com omissão `false`: nenhuma aula existente mudou e não houve migração de dados.
+2. **`lesson_status = 'confirmed'` não tem escritor nenhum.** Sem uma regra no repositório sobre o que significaria numa turma, não se inventou uma. `lessons.status` fica como está.
+3. **O cliente ainda podia escrever a sua própria resposta.** `GRANT UPDATE` da Fase 1 sobre `(status, confirmed_at, declined_at, decline_reason)` nunca tinha sido revogado. Além do `confirmed_at` forjável, permitia marcar-se `declined` sem passar por `cancel_lesson_participation()` — ou seja, recusado e com o crédito ainda reservado. Revogado.
+
+#### Assinaturas: uma só, sem overload
+
+Acrescentar um parâmetro a `create_lesson()` com `create or replace` deixaria a versão de 13 argumentos viva ao lado da de 14, e o PostgREST resolveria entre elas de forma ambígua. As três funções (`create_lesson`, `create_recurring_lessons`, `create_lesson_occurrence`) foram removidas por assinatura explícita e recriadas, com `create_lesson_occurrence` a continuar interna.
+
+#### Reagendar preserva a resposta
+
+`transfer_participation_reservation()` criava a participação da substituta como `invited`. Esse literal vinha da Fase 1.5, de quando nada no produto conseguia pôr uma participação em `confirmed` — era o default de uma linha nova, não uma política. Mantê-lo faria reagendar apagar em silêncio o "vou lá estar", enquanto o outro ramo da mesma função preservava um `declined`. A assimetria era acidental e foi corrigida.
+
+Reconfirmação obrigatória depois de reagendar continua a ser uma decisão de produto por tomar — e não se toma por omissão.
+
+#### O que foi provado
+
+| Camada | Cobertura da 7A |
+|---|---|
+| `npm run db:verify` | 870 verificações: pedido de confirmação, caminho feliz, retry, recusas por papel e por estado, turma, recorrência, escrita direta fechada, assinatura única e privacidade da projeção |
+| `db:verify:remote` | assinatura única das três RPCs, `p_requires_confirmation` presente, sem GRANT de escrita em `lesson_participants`, `anon` sem EXECUTE |
+| `db:verify:auth` | 492 verificações com JWTs reais, **duas execuções completas consecutivas verdes**, incluindo confirmar × confirmar, confirmar × cancelar e confirmar × reagendar |
+
+**Ainda não implementado na 7A:** interface de pedir confirmação, interface de responder, decline/self-cancel do aluno, janela e multas, lista de espera, confirmação de série inteira e notificações.
 
 ### Fase 2 — estado por item
 
