@@ -173,7 +173,8 @@ update public.profiles set role = 'admin' where email = 'voce@exemplo.pt';
 │   ├── ..._phase8a_notification_producers.sql Fase 8A: quem escreve as notificações
 │   ├── ..._phase8b_notification_types.sql Fase 8B: tipos de aviso do agendador
 │   ├── ..._phase8b_scheduled_notifications.sql Fase 8B: o trabalho agendado
-│   └── ..._phase8b_scheduler.sql  Fase 8B: o job `pg_cron` que lhe toca à campainha
+│   ├── ..._phase8b_scheduler.sql  Fase 8B: o job `pg_cron` que lhe toca à campainha
+│   └── ..._phase8b1_scheduler_corrections.sql Fase 8B.1: título, episódio e contagens
 │
 └── src/
     ├── proxy.ts             Renova a sessão e protege rotas (era middleware.ts)
@@ -625,16 +626,24 @@ A migração que o instala é condicional: o Supabase tem `pg_cron`, o PGlite do
 
 Pacotes `suspended` e `cancelled` não são tocados: `refresh_package_status()` sai cedo para esses estados, e o agendador respeita-o.
 
-**Datas civis de Lisboa, sempre.** `refresh_package_status()` usava `current_date` — a data do servidor, que corre em UTC. Entre a meia-noite de Lisboa e a meia-noite UTC isso dava, no verão, uma hora inteira em que um pacote válido até hoje já aparecia expirado. Passou a usar `public.lisbon_date(now())`. A **ordem de prioridade não mudou**: `depleted` → `expired` → `not_started` → `active`.
+**Datas civis de Lisboa, sempre.** `refresh_package_status()` usava `current_date` — a data do servidor, que corre em UTC. No verão Lisboa está uma hora à frente de UTC, por isso à 00:30 de Lisboa o servidor ainda marca 23:30 do dia ANTERIOR. Um pacote cuja validade terminou ontem em Lisboa continuava, durante essa hora, a parecer válido — expirava **tarde**, não cedo. Passou a usar `public.lisbon_date(now())`. A **ordem de prioridade não mudou**: `depleted` → `expired` → `not_started` → `active`.
 
 **O saldo baixo é um EPISÓDIO, não um estado.** A dedupe eterna por pacote diria uma vez na vida e calava-se para sempre; disparar por "tem ≤ 2" repetiria o aviso a cada hora. A chave é a **movimentação** que atravessou o limiar — `available_before > 2 and available_after <= 2` — lida do livro-razão, que é append-only e por isso a fonte honesta de "isto aconteceu agora".
+
+**Não há limite de idade.** Um saldo que desceu há 31 dias e nunca subiu continua baixo hoje; calá-lo por causa do calendário esconderia exatamente o caso mais preocupante. O que impede um episódio antigo **já resolvido** de ressuscitar não é uma data — é o pacote ter voltado a ter mais de 2 créditos e, por isso, não entrar sequer na consulta.
+
+**A consulta parte dos pacotes, não do livro-razão.** Escolhem-se os pacotes operacionais com 2 ou menos créditos disponíveis — que são poucos — e, para cada um, um `LATERAL` procura a travessia mais recente usando `credit_transactions_package_idx`, o índice `(student_package_id, created_at desc)` que já existia desde a Fase 1.5. Nenhum índice novo foi preciso, e o trabalho horário deixa de crescer com o tamanho do histórico.
 
 Duas consequências que valem por si:
 
 - Um pacote **vendido com 2 créditos** não gera aviso nenhum. A linha de criação tem `available_before = 0`, e 0 não é `> 2`. Não há nada de anormal em comprar um pacote pequeno.
 - Recarregar e voltar a descer gera um aviso **novo**, porque é uma travessia nova, com um identificador de movimento novo.
 
+**O lembrete de 24 h é uma JANELA, não "amanhã".** Vai de `agora + 2h` a `agora + 24h`, por isso apanha aulas do próprio dia — uma aula daqui a três horas é hoje. O título é **"Lembrete de aula"**, verdadeiro em toda a janela; a data e a hora reais vão no corpo. O título anterior, "Aula amanhã", mentia em boa parte dos casos. O tipo continua `lesson_reminder_24h`: criar um tipo novo por causa de uma palavra dividiria a caixa em duas categorias que ninguém distingue.
+
 **O atraso é tolerado, o salto não.** As janelas dos lembretes são intervalos com largura (2 h e 22 h), não instantes. Uma passagem por hora nunca perde a de 2 horas, e um job atrasado dez minutos continua a apanhar tudo o que devia. O que a janela **não** faz é inventar um lembrete de "amanhã" para uma aula marcada em cima da hora: se a aula nasceu já dentro das 2 horas, só recebe o lembrete de 2 horas.
+
+**As cinco contagens significam a mesma coisa: notificações criadas nesta passagem.** Os nomes dizem-no (`new_packages_expired`, `new_packages_expiring`, `new_low_balance`, `new_reminders_24h`, `new_reminders_2h`). Antes as de lembrete subiam por linha *elegível*, mesmo quando o `dedupe_key` já existia e nada era escrito — o mesmo JSON tinha duas semânticas. O sinal vem do `returning` do próprio `INSERT`, nunca de um `select` prévio, que perderia a corrida. Nenhum código consome este JSON: é diagnóstico interno.
 
 **Correr duas vezes não duplica.** Provado em PostgreSQL real com duas invocações em paralelo, em processos e ligações distintas: zero chaves repetidas em `notifications`. A garantia é estrutural — índice único **total** sobre `dedupe_key` mais `on conflict do nothing` — e não uma verificação prévia, que perderia a corrida entre o `select` e o `insert`.
 

@@ -12678,6 +12678,21 @@ const packageNotifications = (profileId, type, packageId) =>
     [profileId, type, packageId],
   );
 
+// O aviso de saldo baixo e identificado pela TRAVESSIA, nao pelo pacote — a
+// chave e `package_low_balance:<transacao>`. Filtrar por pacote obriga, por
+// isso, a passar pelo livro-razao.
+const lowBalanceNotifications = (profileId, packageId) =>
+  rows(
+    `select notification.id, notification.title, notification.body, notification.dedupe_key
+       from public.notifications notification
+       join public.package_credit_transactions ledger
+         on notification.dedupe_key = 'package_low_balance:' || ledger.id::text
+      where notification.recipient_profile_id = $1
+        and ledger.student_package_id = $2
+      order by notification.created_at`,
+    [profileId, packageId],
+  );
+
 const packageStatusOf = async (packageId) =>
   (await one(`select status::text, credits_available, credits_reserved, credits_used
                 from public.student_packages where id = $1`, [packageId]));
@@ -12998,6 +13013,92 @@ check(
   "cair outra vez na faixa baixa é um episódio novo, e avisa outra vez",
 );
 
+// ── (8B.1 B) UM SALDO BAIXO NÃO DEIXA DE SER BAIXO POR SER ANTIGO ──────────
+//
+// A consulta exigia que a travessia tivesse menos de 30 dias. Era uma política
+// que ninguém pediu, e calava exatamente o caso mais preocupante: o pacote que
+// desceu há muito tempo e nunca mais foi tocado.
+const sched_stalePack = await assignPackageAs(TEACHER_UID, {
+  student: schedStudent.id,
+  name: "Pacote antigo 8B1",
+  credits: 5,
+  sportId: sport,
+  starts: "2026-01-01",
+  expires: "2029-12-31",
+});
+
+// A travessia acontece agora, mas o runner só passa 31 dias depois.
+await spendCredits(sched_stalePack.id, 3, "Ajuste de teste 8B1");
+check(
+  (await lowBalanceNotifications(SCHED_UID, sched_stalePack.id)).length === 0,
+  "a travessia por si so nao escreve nada: quem avisa e o runner",
+);
+
+await runScheduler("2026-10-05T12:00:00Z");
+const staleAlert = await lowBalanceNotifications(SCHED_UID, sched_stalePack.id);
+check(
+  staleAlert.length === 1 && staleAlert[0].body.includes("Restam 2 aulas"),
+  "uma travessia com mais de 30 dias continua a avisar enquanto o saldo esta baixo",
+);
+
+// ── (8B.1 C) MAS UM EPISÓDIO JÁ RESOLVIDO NÃO RESSUSCITA ───────────────────
+//
+// O que cala um episódio antigo não é a data — é o pacote ter voltado a ter mais
+// do que 2 créditos, e por isso nem entrar na consulta.
+const sched_resolvedPack = await assignPackageAs(TEACHER_UID, {
+  student: schedStudent.id,
+  name: "Pacote reposto 8B1",
+  credits: 5,
+  sportId: sport,
+  starts: "2026-01-01",
+  expires: "2029-12-31",
+});
+await spendCredits(sched_resolvedPack.id, 3, "Queda A 8B1");
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(`select public.admin_adjust_package_credits($1,$2,$3,$4::uuid)`, [
+    sched_resolvedPack.id,
+    3,
+    "Reposicao 8B1",
+    randomUUID(),
+  ]),
+);
+
+// O runner só passa muito depois, e a queda A já não corresponde ao estado atual.
+await runScheduler("2027-02-01T12:00:00Z");
+check(
+  (await lowBalanceNotifications(SCHED_UID, sched_resolvedPack.id)).length === 0,
+  "uma queda antiga ja reposta nao gera aviso, por mais tempo que passe",
+);
+
+// ── (8B.1 D) UMA QUEDA NOVA DEPOIS DA REPOSIÇÃO É UM EPISÓDIO NOVO ─────────
+await spendCredits(sched_resolvedPack.id, 3, "Queda B 8B1");
+await runScheduler("2027-02-02T12:00:00Z");
+const episodeB = await lowBalanceNotifications(SCHED_UID, sched_resolvedPack.id);
+check(
+  episodeB.length === 1 && episodeB[0].body.includes("Restam 2 aulas"),
+  "cair outra vez depois de repor e um episodio novo, e avisa",
+);
+
+// A chave tem de ser a da travessia NOVA, e não a da antiga.
+const crossings = await rows(
+  `select id from public.package_credit_transactions
+    where student_package_id = $1
+      and available_before > 2 and available_after <= 2
+    order by created_at`,
+  [sched_resolvedPack.id],
+);
+check(
+  crossings.length === 2 &&
+    episodeB[0].dedupe_key === `package_low_balance:${crossings[1].id}`,
+  "o aviso identifica a travessia mais recente, nao a primeira",
+);
+
+await runScheduler("2027-02-03T12:00:00Z");
+check(
+  (await lowBalanceNotifications(SCHED_UID, sched_resolvedPack.id)).length === 1,
+  "o episodio novo tambem nao se repete a cada passagem",
+);
+
 // ── Lembretes de aula ──────────────────────────────────────────────────────
 
 const reminderPack = await assignPackageAs(TEACHER_UID, {
@@ -13058,6 +13159,114 @@ await runScheduler("2029-05-10T09:30:00Z");
 check(
   (await notificationsOfType(SCHED_UID, "lesson_reminder_2h")).length === 1,
   "o lembrete de 2h também não se repete",
+);
+
+// ── (8B.1 A) A JANELA DE 24 HORAS APANHA AULAS DO PRÓPRIO DIA ──────────────
+//
+// O título dizia "Aula amanhã". A janela vai de +2h a +24h, por isso apanha uma
+// aula daqui a três horas — que é hoje. A palavra era falsa em boa parte da
+// janela, e um aviso que diz o dia errado é pior do que não dizer o dia.
+const sameDayLesson = await reminderLesson(
+  "Aula do proprio dia 8B",
+  "2029-05-14 15:00+00",
+  "2029-05-14 16:00+00",
+);
+await runScheduler("2029-05-14T12:00:00Z");
+const sameDayReminder = await rows(
+  `select title, body from public.notifications
+    where recipient_profile_id=$1 and lesson_id=$2
+      and type = 'lesson_reminder_24h'::public.notification_type`,
+  [SCHED_UID, sameDayLesson.id],
+);
+check(
+  sameDayReminder.length === 1,
+  "uma aula daqui a tres horas recebe o lembrete de 24h: a janela e ate 24h",
+);
+check(
+  sameDayReminder.length === 1 && !/amanh/i.test(sameDayReminder[0].title),
+  "o titulo do lembrete nao afirma 'amanha' para uma aula do proprio dia",
+);
+check(
+  sameDayReminder.length === 1 && sameDayReminder[0].title === "Lembrete de aula",
+  "o titulo do lembrete e verdadeiro em toda a janela",
+);
+check(
+  sameDayReminder.length === 1 && sameDayReminder[0].body.includes("14/05/2029"),
+  "o corpo do lembrete leva a data e a hora reais",
+);
+await runScheduler("2029-05-14T13:00:00Z");
+check(
+  (
+    await rows(
+      `select id from public.notifications
+        where recipient_profile_id=$1 and lesson_id=$2
+          and type = 'lesson_reminder_24h'::public.notification_type`,
+      [SCHED_UID, sameDayLesson.id],
+    )
+  ).length === 1,
+  "o lembrete do proprio dia nao se repete na passagem seguinte",
+);
+
+// A aula a menos de duas horas continua a receber SO o de 2h.
+const sameDaySoonLesson = await reminderLesson(
+  "Aula do proprio dia ja perto 8B",
+  "2029-05-21 15:00+00",
+  "2029-05-21 16:00+00",
+);
+await runScheduler("2029-05-21T14:00:00Z");
+const soonReminders = await rows(
+  `select type::text as type from public.notifications
+    where recipient_profile_id=$1 and lesson_id=$2
+    order by type`,
+  [SCHED_UID, sameDaySoonLesson.id],
+);
+check(
+  soonReminders.some((row) => row.type === "lesson_reminder_2h") &&
+    !soonReminders.some((row) => row.type === "lesson_reminder_24h"),
+  "a uma hora do inicio ha lembrete de 2h e nenhum de 24h",
+);
+
+// ── (8B.1 F) AS CONTAGENS DO RUNNER SÃO NOTIFICAÇÕES CRIADAS ───────────────
+//
+// Antes, as de lembrete subiam por linha ELEGÍVEL e as de pacote por INSERT: o
+// mesmo JSON tinha duas semânticas, e a segunda passagem parecia ter criado
+// lembretes que não criou.
+const counterLesson = await reminderLesson(
+  "Aula para contar 8B1",
+  "2029-04-16 15:00+00",
+  "2029-04-16 16:00+00",
+);
+void counterLesson;
+
+const firstPass = (await runScheduler("2029-04-16T12:00:00Z")).result;
+const secondPass = (await runScheduler("2029-04-16T12:30:00Z")).result;
+
+check(
+  Object.keys(firstPass).sort().join(",") ===
+    [
+      "lisbon_date",
+      "new_low_balance",
+      "new_packages_expired",
+      "new_packages_expiring",
+      "new_reminders_24h",
+      "new_reminders_2h",
+      "ran_at",
+    ].join(","),
+  "o resultado do runner nomeia as contagens como novas notificacoes",
+);
+check(
+  firstPass.new_reminders_24h >= 1,
+  "a primeira passagem conta o lembrete que criou",
+);
+check(
+  secondPass.new_reminders_24h === 0,
+  "a segunda passagem no mesmo estado conta zero lembretes: nada foi criado",
+);
+check(
+  secondPass.new_packages_expiring === 0 &&
+    secondPass.new_packages_expired === 0 &&
+    secondPass.new_low_balance === 0,
+  "as cinco contagens tem a mesma semantica: so contam o que entrou mesmo",
 );
 
 // Uma aula marcada em cima da hora não recebe um "faltam 24 horas" absurdo.

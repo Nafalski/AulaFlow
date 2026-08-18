@@ -7252,6 +7252,18 @@ try {
   await mustReject("Aluno nao escreve avisos de pacote", async () =>
     studentClient.rpc("record_package_notification"),
   );
+  // A 8B.1 recriou o produtor de avisos de aula com nome novo. Um `drop`/`create`
+  // repoe os privilegios por omissao, e no Supabase isso significa dar EXECUTE a
+  // PUBLIC — por isso o revoke tem de estar provado, e nao apenas escrito.
+  await mustReject("Aluno nao escreve avisos de aula", async () =>
+    studentClient.rpc("record_lesson_notification_if_new"),
+  );
+  await mustReject("Professor nao escreve avisos de aula", async () =>
+    teacherClient.rpc("record_lesson_notification_if_new"),
+  );
+  await mustReject("Anonimo nao escreve avisos de aula", async () =>
+    anonClient.rpc("record_lesson_notification_if_new"),
+  );
 
   // Uma aula proxima o suficiente para o lembrete de 24h ser elegivel, criada
   // pelo contrato oficial. O agendador do remoto corre de hora a hora; aqui

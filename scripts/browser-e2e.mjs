@@ -2032,6 +2032,35 @@ async function scheduledNotificationsScenario(browser, apiClient) {
   check(inbox.includes(lowName), "(C) O aviso de saldo baixo aparece na caixa");
   if (reminderStartsAt) {
     check(/Lembrete/.test(inbox), "(A) O lembrete da aula aparece na caixa");
+
+    // O relogio foi adiantado tres horas antes da aula: cai na janela das 24h,
+    // mas e o PROPRIO dia. Um titulo a dizer "amanha" seria falso, e e por isso
+    // que a 8B.1 o trocou por "Lembrete de aula".
+    const reminderCard = page
+      .locator("main li")
+      .filter({ hasText: `${FIXTURE_PREFIX}lembrete ${stamp}` })
+      .first();
+    const reminderText = (await reminderCard.count()) > 0 ? await reminderCard.innerText() : "";
+    check(
+      reminderText.length > 0 && !/amanh/i.test(reminderText),
+      "(A) O lembrete nao afirma 'amanha' para uma aula do proprio dia",
+      reminderText.slice(0, 80),
+    );
+    check(
+      /Lembrete de aula/.test(reminderText),
+      "(A) O lembrete usa o titulo verdadeiro em toda a janela",
+    );
+    const reminderDay = reminderStartsAt.toLocaleDateString("pt-PT", {
+      timeZone: "Europe/Lisbon",
+      day: "2-digit",
+      month: "2-digit",
+      year: "numeric",
+    });
+    check(
+      reminderText.includes(reminderDay),
+      "(A) O lembrete leva a data real da aula",
+      `esperava ${reminderDay}`,
+    );
   }
 
   // ── Nada de privado escapa para a caixa ──

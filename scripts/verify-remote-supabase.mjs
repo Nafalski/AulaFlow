@@ -1337,6 +1337,71 @@ checks as (
 
   union all
   select
+    'contrato',
+    'o lembrete de 24h nao afirma amanha',
+    not exists (
+      select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+      where n.nspname = 'public' and p.proname = 'run_scheduled_notifications'
+        and p.prosrc like '%Aula amanh%'
+    ),
+    'ok'
+
+  union all
+  select
+    'contrato',
+    'o saldo baixo nao tem limite de idade da travessia',
+    not exists (
+      select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+      where n.nspname = 'public' and p.proname = 'run_scheduled_notifications'
+        and p.prosrc like '%interval ''30 days''%'
+    ),
+    'ok'
+
+  union all
+  select
+    'contrato',
+    'as contagens do agendador dizem que sao novas',
+    exists (
+      select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+      where n.nspname = 'public' and p.proname = 'run_scheduled_notifications'
+        and p.prosrc like '%new_reminders_24h%'
+    ),
+    'ok'
+
+  union all
+  select
+    'seguranca',
+    'o produtor que devolve se escreveu nao e chamavel pelo cliente',
+    not exists (
+      select 1
+      from information_schema.role_routine_grants
+      where routine_schema = 'public'
+        and routine_name = 'record_lesson_notification_if_new'
+        and grantee in ('authenticated', 'anon', 'PUBLIC')
+    ),
+    'ok'
+
+  union all
+  select
+    'seguranca',
+    'o produtor que devolve se escreveu tem search_path fixo',
+    exists (
+      select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+      where n.nspname = 'public' and p.proname = 'record_lesson_notification_if_new'
+        and p.proconfig::text like '%search_path%'
+    ),
+    'ok'
+
+  union all
+  select
+    'estrutura',
+    'existe exatamente um job de notificacoes agendadas',
+    (select count(*) from cron.job
+      where jobname = 'aulaflow-scheduled-notifications') = 1,
+    'ok'
+
+  union all
+  select
     'estrutura',
     'duas passagens do agendador nunca duplicaram um aviso',
     not exists (

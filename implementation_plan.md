@@ -1297,7 +1297,7 @@ A expiração escreve `student_packages.status = 'expired'` e mais nada. Os trê
 
 #### Datas civis de Lisboa
 
-`refresh_package_status()` usava `current_date` — a data do **servidor**, que corre em UTC. No verão, entre a meia-noite de Lisboa e a meia-noite UTC, havia uma hora inteira em que um pacote válido até hoje já aparecia expirado. Passou a usar `public.lisbon_date(now())`. A ordem de prioridade não mudou: `depleted` → `expired` → `not_started` → `active`.
+`refresh_package_status()` usava `current_date` — a data do **servidor**, que corre em UTC. No verão Lisboa está uma hora à frente de UTC, por isso à 00:30 de Lisboa o servidor ainda marca 23:30 do dia ANTERIOR. Um pacote cuja validade terminou ontem em Lisboa continuava, durante essa hora, a parecer válido — expirava **tarde**, não cedo. Passou a usar `public.lisbon_date(now())`. A ordem de prioridade não mudou: `depleted` → `expired` → `not_started` → `active`.
 
 #### O saldo baixo é um episódio, não um estado
 
@@ -1308,9 +1308,27 @@ Duas consequências valem por si:
 - Um pacote **vendido com 2 créditos** não gera aviso. A linha de criação tem `available_before = 0`, e 0 não é `> 2`. Comprar um pacote pequeno não tem nada de anormal.
 - Recarregar e voltar a descer gera um aviso **novo** — é uma travessia nova, com identificador de movimento novo.
 
+#### Corrigido na 8B.1
+
+Três coisas que a revisão apanhou, sem tocar na arquitetura, no `pg_cron`, na cadência nem nos limiares.
+
+**O título do lembrete mentia.** A janela de 24 horas vai de `agora + 2h` a `agora + 24h` e apanha aulas do próprio dia; o título dizia "Aula amanhã". Passou a **"Lembrete de aula"**, verdadeiro em toda a janela — a data e a hora reais já vinham no corpo. O tipo continua `lesson_reminder_24h`.
+
+**A janela de 30 dias no saldo baixo era uma política por engano.** A consulta exigia que a travessia tivesse menos de 30 dias. Quem impede um episódio antigo de ressuscitar é a condição `credits_available <= 2`, que olha só para o agora; os 30 dias apenas calavam um saldo genuinamente baixo por ter descido há muito tempo. Foram removidos. Um pacote com 2 créditos há 31 dias tem 2 créditos hoje.
+
+**A consulta passou a partir dos pacotes.** Antes varria o livro-razão inteiro à procura de travessias e só depois filtrava — trabalho que cresce para sempre. Agora parte dos pacotes operacionais com 2 ou menos créditos e, para cada um, um `LATERAL` encontra a travessia mais recente por `credit_transactions_package_idx`, o índice `(student_package_id, created_at desc)` que já existia desde a Fase 1.5. **Nenhum índice novo, nenhuma tabela de estado, nenhum booleano `low_balance_notified`** — o livro-razão continua a ser a fonte do episódio.
+
+**As cinco contagens não contavam a mesma coisa.** As de pacote subiam por INSERT; as de lembrete por linha *elegível*, mesmo quando nada era escrito. Agora todas contam notificações realmente criadas, e os nomes dizem-no: `new_packages_expired`, `new_packages_expiring`, `new_low_balance`, `new_reminders_24h`, `new_reminders_2h`. O sinal vem do `returning` do próprio `INSERT` — nunca de uma leitura prévia, que perderia a corrida contra outra execução. Nenhum código consome este JSON: é diagnóstico interno.
+
+Para isso foi preciso um produtor que devolva se escreveu. Ele nasceu com **nome novo** — `record_lesson_notification_if_new()` — em vez de mudar o retorno do antigo: a migração da 8A já está aplicada, não se edita, e um tipo de retorno diferente faria a reaplicação dela falhar com *cannot change return type*. O nome que os triggers da 8A conhecem passou a delegar nele.
+
 #### O atraso é tolerado; o salto não
 
 As janelas dos lembretes têm largura (2 h e 22 h), não são instantes. Uma passagem por hora nunca perde a de 2 horas, e um job atrasado dez minutos continua a apanhar tudo. O que a janela não faz é inventar um "amanhã" para uma aula marcada em cima da hora: se nasceu já dentro das 2 horas, recebe apenas o lembrete de 2 horas.
+
+#### O lembrete de 24 h é uma janela, não "amanhã"
+
+Vai de `agora + 2h` a `agora + 24h`. Uma aula daqui a três horas entra nela e é hoje, por isso o título não pode afirmar um dia. Diz **"Lembrete de aula"**; o corpo leva a data e a hora.
 
 #### Correr duas vezes não duplica
 
