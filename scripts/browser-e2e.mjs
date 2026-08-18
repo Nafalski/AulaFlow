@@ -1649,6 +1649,36 @@ async function studentNotificationsScenario(browser, apiClient) {
   await page.goto(`${BASE_URL}/aluno/notificacoes`, { waitUntil: "domcontentloaded" });
   await page.getByRole("heading", { name: "Avisos" }).first().waitFor({ timeout: 20_000 });
 
+  // ── A pagina e o sino contam a MESMA coisa (regressao da 8A.1) ──
+  //
+  // Antes, a pagina derivava o total dos 50 itens carregados. Com mais do que
+  // isso por ler dizia "50 por ler"; e com as 50 mais recentes ja lidas dizia
+  // que nao havia nada, escondendo o botao que limpava o sino.
+  const pageCounter = page.locator("main").getByText(/por ler$/).first();
+  const pageCounterText = (await pageCounter.count()) > 0 ? await pageCounter.innerText() : null;
+  const pageCounterNumber = pageCounterText ? Number(pageCounterText.split(" ")[0]) : null;
+  const bellIsCapped = badgeBefore?.trim() === "99+";
+
+  check(
+    pageCounterNumber !== null &&
+      (bellIsCapped ? pageCounterNumber >= 100 : String(pageCounterNumber) === badgeBefore?.trim()),
+    "A pagina e o sino mostram o mesmo total por ler",
+    `sino ${badgeBefore} · pagina ${pageCounterText}`,
+  );
+  check(
+    (await page.getByRole("button", { name: /Marcar todos como lidos/ }).count()) > 0,
+    "Havendo avisos por ler na conta, a pagina oferece marcar todos como lidos",
+  );
+
+  // Quando ha mais do que a janela mostra, isso e dito.
+  const shownCount = await page.locator("main ul li").count();
+  const saysWindow = (await panelText(page)).includes("A mostrar os 50 avisos mais recentes");
+  check(
+    shownCount < 50 || saysWindow,
+    "Com mais avisos do que os mostrados, a pagina di-lo",
+    `${shownCount} mostrados · aviso de janela ${saysWindow}`,
+  );
+
   const card = page.locator("li").filter({ hasText: title }).first();
   check((await card.count()) > 0, "O aviso da aula marcada aparece na caixa");
   if ((await card.count()) === 0) {

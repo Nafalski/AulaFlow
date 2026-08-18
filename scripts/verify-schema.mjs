@@ -12573,6 +12573,79 @@ check(
   "o escritor de notificações e o snapshot são internos ao servidor",
 );
 
+// ── O 51.º aviso por ler (regressão da Etapa 8A.1) ────────────────────────
+//
+// A caixa mostra os 50 avisos mais recentes. Derivar o total por ler dessa
+// lista produzia dois estados falsos:
+//
+//   · com 137 por ler, a página dizia "50 por ler";
+//   · com as 50 mais recentes JÁ lidas e uma antiga por ler, a página dizia
+//     que não havia nada — e escondia o botão que era a única forma de limpar
+//     o contador do sino.
+//
+// A fixture é preparada por escrita privilegiada, como todas as outras desta
+// suite. O que se prova é o contrato: `unread_notification_count()` conta a
+// CONTA inteira, e não a janela que a interface mostra.
+
+await db.query(`delete from public.notifications where recipient_profile_id = $1`, [ANA_UID]);
+
+for (let index = 0; index < 51; index += 1) {
+  await db.query(
+    `insert into public.notifications
+       (recipient_profile_id, type, title, body, dedupe_key, created_at, read_at)
+     values ($1,'lesson_created',$2,$3,$4, now() - ($5 || ' minutes')::interval, $6)`,
+    [
+      ANA_UID,
+      `Aviso 8A.1 ${index}`,
+      "Corpo do aviso de regressão.",
+      `regressao-8a1:${index}`,
+      // O índice 0 é o MAIS ANTIGO: fica fora da janela dos 50 mais recentes.
+      String(51 - index),
+      index === 0 ? null : new Date().toISOString(),
+    ],
+  );
+}
+
+const windowRows = await asDatabaseRole("authenticated", ANA_UID, () =>
+  rows(
+    `select read_at from public.user_notification_records
+      order by created_at desc limit 50`,
+  ),
+);
+const globalUnread = await asDatabaseRole("authenticated", ANA_UID, () =>
+  one(`select public.unread_notification_count() as total`),
+);
+
+check(
+  windowRows.length === 50 && windowRows.every((row) => row.read_at !== null),
+  "os 50 avisos mais recentes estão todos lidos",
+);
+check(
+  Number(globalUnread.total) === 1,
+  "o contador global vê o aviso por ler que ficou fora da janela",
+  `contador ${globalUnread.total}`,
+);
+
+const totalInbox = await asDatabaseRole("authenticated", ANA_UID, () =>
+  one(`select count(*)::int as total from public.user_notification_records`),
+);
+check(
+  Number(totalInbox.total) === 51,
+  "a projeção conta o histórico inteiro, e não só a janela mostrada",
+);
+
+// E a operação que a interface oferece limpa mesmo o que está fora da janela.
+const clearedAll = await asDatabaseRole("authenticated", ANA_UID, () =>
+  one(`select public.mark_all_notifications_read() as total`),
+);
+const afterClearing = await asDatabaseRole("authenticated", ANA_UID, () =>
+  one(`select public.unread_notification_count() as total`),
+);
+check(
+  Number(clearedAll.total) === 1 && Number(afterClearing.total) === 0,
+  "marcar todos como lidos limpa o aviso antigo e zera o contador",
+);
+
 // ── Resultado ────────────────────────────────────────────────────────────────
 
 console.log(

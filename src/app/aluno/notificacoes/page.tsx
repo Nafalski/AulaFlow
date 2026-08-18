@@ -10,6 +10,7 @@ import { EmptyState } from "@/components/ui/empty-state";
 import { Badge } from "@/components/ui/status-badge";
 import { requireRole } from "@/lib/auth/session";
 import { formatDateTime, formatRelativeDay } from "@/lib/datetime";
+import { unreadNotificationCount } from "@/lib/notifications/unread-count";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 
 export const metadata: Metadata = { title: "Avisos" };
@@ -32,13 +33,26 @@ export default async function StudentNotificationsPage() {
   await requireRole("student", "/aluno/notificacoes");
   const supabase = await createSupabaseServerClient();
 
-  const { data, error } = await supabase
-    .from("user_notification_records")
-    .select(
-      "id, type, title, body, lesson_id, read_at, created_at, lesson_starts_at, location_name",
-    )
-    .order("created_at", { ascending: false })
-    .limit(INBOX_LIMIT);
+  // O TOTAL POR LER VEM DA MESMA FONTE QUE O SINO.
+  //
+  // Derivá-lo dos 50 itens carregados dava números falsos nos dois sentidos:
+  // com 137 por ler, a página dizia "50 por ler"; e se as 50 mais recentes já
+  // estivessem lidas, a página dizia que não havia nada por ler — escondendo o
+  // botão que era a única forma de limpar o contador do sino.
+  //
+  // `count: "exact"` vem na mesma resposta da lista: dá para saber que há mais
+  // do que 50 sem carregar a caixa inteira, e sem uma segunda ida ao servidor.
+  const [{ data, error, count }, unreadCount] = await Promise.all([
+    supabase
+      .from("user_notification_records")
+      .select(
+        "id, type, title, body, lesson_id, read_at, created_at, lesson_starts_at, location_name",
+        { count: "exact" },
+      )
+      .order("created_at", { ascending: false })
+      .limit(INBOX_LIMIT),
+    unreadNotificationCount(),
+  ]);
 
   if (error) {
     console.error("[AulaFlow] Falha ao carregar os avisos do aluno.", error);
@@ -46,7 +60,8 @@ export default async function StudentNotificationsPage() {
   }
 
   const notifications = data ?? [];
-  const unread = notifications.filter((notification) => notification.read_at === null);
+  const totalNotifications = count ?? notifications.length;
+  const hasMoreThanShown = totalNotifications > notifications.length;
 
   return (
     <div className="flex flex-col gap-6">
@@ -57,17 +72,25 @@ export default async function StudentNotificationsPage() {
         </p>
       </div>
 
-      {unread.length > 0 && (
+      {unreadCount > 0 && (
         <div className="flex flex-wrap items-center gap-3">
           <Badge tone="brand">
-            {unread.length === 1 ? "1 por ler" : `${unread.length} por ler`}
+            {unreadCount === 1 ? "1 por ler" : `${unreadCount} por ler`}
           </Badge>
+          {/* Aparece com base no total da CONTA, e não no que coube na lista:
+              um aviso por ler mais antigo do que os 50 mostrados continua a
+              precisar de forma de ser limpo. */}
           <MarkAllNotificationsReadButton />
         </div>
       )}
 
       <section>
         <SectionTitle>Histórico</SectionTitle>
+        {hasMoreThanShown && (
+          <p className="mb-3 text-sm text-muted">
+            A mostrar os {INBOX_LIMIT} avisos mais recentes.
+          </p>
+        )}
         {notifications.length === 0 ? (
           <EmptyState
             icon={BellRing}

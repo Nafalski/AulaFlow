@@ -450,7 +450,7 @@ A estrutura fica pronta para notificações push (Fase 8).
 | **6** | Cancelamento, reagendamento, presenças, histórico | **Concluída** — 6A/6B: presença, falta/no-show, conclusão normal/mista e cancelamentos com `reserved -> available` ou `reserved -> used` seguros. 6C.1/1A/1B: contrato transacional de reagendamento, chave de idempotência obrigatória e concorrência real provada. 6C.2: interface operacional, com editar conteúdo e reagendar colocação separados no PostgreSQL |
 | **7** | Área do aluno: aulas, saldo, confirmação da participação | **Concluída** — 7A: contrato de confirmação individual, com `requires_confirmation` ligado, escrita direta fechada e RSVP separado de presença. 7B: o professor pede ao criar, o aluno responde pela própria participação, provado em browser e mobile |
 | **8** | Notificações, lembretes e expiração agendada | **8A concluída** — a fundação da Fase 1 foi ligada: producers dos eventos de aula por trigger, caixa in-app do aluno, lida/por ler e contador de não lidas. Faltam a 8B (agendador, lembretes, saldo baixo, expiração automática) e a 8C (entrega por email a partir do outbox) |
-| **9** | Supabase real, concorrência, acessibilidade, deployment | **Parcialmente concluído** — Supabase/Auth reais validados até à 7A (506 verificações, repetíveis em execuções consecutivas); browser automatizado com sessão GoTrue real, em dev e em build de produção; deployment pendente |
+| **9** | Supabase real, concorrência, acessibilidade, deployment | **Parcialmente concluído** — Supabase/Auth reais validados até à 8A (526 verificações, verdes em duas execuções consecutivas); 908 verificações de esquema em PGlite; browser automatizado com sessão GoTrue real, verde em dev e em build de produção; deployment pendente |
 
 A ordem segue as prioridades pedidas: primeiro a área do professor ao computador, depois as regras seguras de créditos, depois o aluno no telemóvel.
 
@@ -1263,6 +1263,14 @@ A Fase 1 tinha dado ao cliente `GRANT UPDATE (read_at)` sobre `notifications`. �
 
 Não emite `lesson_updated` — mudar o título não é uma alteração operacional, e abrir esse tipo exigiria decidir quais alterações merecem aviso. Não emite aviso de RSVP: a interface da 7B já mostra o resultado a quem clicou. Não notifica o professor da sua própria ação. E não toca em `lesson.status`.
 
+#### Correção da 8A.1 — o total por ler não é o que cabe no ecrã
+
+A caixa mostra os 50 avisos mais recentes, e a página derivava o total por ler dessa lista. O sino, corretamente, usava `unread_notification_count()`. As duas fontes divergiam, e em dois sentidos: com 137 por ler, a página dizia "50 por ler"; e com as 50 mais recentes já lidas e uma antiga por responder, a página dizia que não havia nada — escondendo o botão "Marcar todos como lidos", que era a única forma de limpar o contador do sino pela interface.
+
+A página passou a usar a mesma RPC do sino, e a saber quantos avisos existem ao todo através de `count: "exact"` na própria consulta da lista — sem segunda ida ao servidor e sem carregar a caixa inteira para contar. Quando existem mais do que os mostrados, di-lo. Nenhum SQL mudou: o contrato da 8A já resolvia, o defeito estava na composição da página.
+
+A regressão está fixada em `db:verify` com o cenário exato: 51 avisos, os 50 mais recentes lidos, o mais antigo por ler — o contador global vê-o, a projeção conta 51, e `mark_all_notifications_read()` limpa-o.
+
 **Para a 8B:** `refresh_package_status()` é interna e **reativa** — recalcula `depleted`/`expired`/`not_started`/`active` a partir de `current_date` e só corre depois de uma movimentação de créditos (`assign`, `reserve`, `release`, `consume`, ajustes administrativos). Não existe tarefa agendada: um pacote que expirou ontem mantém o estado anterior até alguém lhe tocar. O limiar de saldo baixo existe hoje apenas como regra visual em `lib/domain/package-display.ts` (1–2 créditos), e uma regra visual não é política de notificação — falta decidir limiar, repetição, rearme e destinatário.
 
 ### Fase 2 — estado por item
@@ -1279,7 +1287,7 @@ Não emite `lesson_updated` — mudar o título não é uma alteração operacio
 | Preferências de notificação | **Concluído** | Persistência de canais/eventos; entrega automática continua planeada para a Fase 8 |
 | Diretório administrativo | **Concluído** | Pesquisa, filtros, professores, detalhe, estados vazios/erro/loading e resposta mobile/desktop |
 | Bloqueio e reativação | **Concluído** | RPC exclusiva de admin, sem auto-bloqueio, motivo, auditoria e revogação efetiva por RLS |
-| Validação num Supabase remoto | **Concluído para as Fases 4, 5, 6 e 7A** | Migrações, catálogo remoto, GoTrue/Auth, JWT/PostgREST, contas reais, calendário seguro, aulas, conflitos, reserva, recorrência, presença, conclusão, privacidade e concorrência validados por RPC/Auth real |
+| Validação num Supabase remoto | **Concluído para as Fases 4, 5, 6, 7 e 8A** | Migrações, catálogo remoto, GoTrue/Auth, JWT/PostgREST, contas reais, calendário seguro, aulas, conflitos, reserva, recorrência, presença, conclusão, privacidade e concorrência validados por RPC/Auth real |
 
 ### Concluído na Fase 2
 
