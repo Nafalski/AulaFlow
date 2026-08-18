@@ -27,6 +27,14 @@ export type NavItem = {
   iconKey: NavIconKey;
   /** Aparece na barra inferior do telemóvel. Máximo 5 por área. */
   primary?: boolean;
+  /**
+   * Contador de itens por ver, resolvido no servidor (Etapa 8A).
+   *
+   * Vem como número já contado, e não como lista: o cabeçalho precisa do
+   * número, e carregar a caixa inteira em todas as páginas para o obter seria
+   * pagar uma consulta grande por uma informação pequena.
+   */
+  badgeCount?: number;
 };
 
 /**

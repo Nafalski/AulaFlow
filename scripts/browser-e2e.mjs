@@ -1581,6 +1581,237 @@ async function mobileStudentConfirmationScenario(browser) {
   await context.close();
 }
 
+/**
+ * A caixa de avisos do aluno (Etapa 8A).
+ *
+ * O que só o browser prova: que o aviso aparece, que o contador do sino desce
+ * ao marcar como lido, que o estado sobrevive a um reload, e — o mais
+ * importante — que um aviso antigo continua a dizer o horário antigo depois de
+ * a aula ser movida. É isso que faz da caixa um histórico e não um espelho.
+ */
+async function studentNotificationsScenario(browser, apiClient) {
+  section("Aluno — caixa de avisos");
+
+  // Uma aula criada agora, pelo contrato oficial, com a sessão do professor.
+  const billable = await billableStudent(apiClient);
+  const slot = billable ? await findFreeSlot(apiClient) : null;
+  if (!billable || !slot) {
+    check(false, "Existe um horário livre para criar a aula que gera o aviso");
+    return;
+  }
+
+  const title = `${FIXTURE_PREFIX}aviso ${Date.now().toString(36)}`;
+  const startsAt = lisbonCivilToInstant(slot.day, slot.time);
+  const { data: lessonId, error: lessonError } = await apiClient.rpc("create_lesson", {
+    p_sport_id: billable.sportId,
+    p_starts_at: startsAt.toISOString(),
+    p_ends_at: new Date(startsAt.getTime() + 30 * 60_000).toISOString(),
+    p_title: title,
+    p_context_kind: "personal",
+    p_club_organization_id: null,
+    p_location_id: null,
+    p_location_resource_id: null,
+    p_student_id: billable.studentId,
+    p_group_id: null,
+    p_notes_for_students: null,
+    p_private_notes: null,
+    p_idempotency_key: randomUUID(),
+  });
+  if (lessonError || !lessonId) {
+    check(false, "A aula que gera o aviso é criada", lessonError?.message);
+    return;
+  }
+
+  const context = await browser.newContext();
+  context.on("page", (page) => {
+    page.on("console", (message) => {
+      if (message.type() === "error") consoleErrors.push(message.text().slice(0, 160));
+    });
+    page.on("pageerror", (error) => consoleErrors.push(error.message.slice(0, 160)));
+  });
+  const page = await signIn(context, ACCOUNTS.student);
+
+  // ── O sino indica que há algo por ler ──
+  await page.goto(`${BASE_URL}/aluno`, { waitUntil: "domcontentloaded" });
+  await page.getByRole("heading", { name: "Próximas aulas" }).first().waitFor({ timeout: 20_000 });
+  const badge = page.locator('nav a[href="/aluno/notificacoes"] span[aria-label$="por ler"]');
+  const badgeBefore = (await badge.count()) > 0 ? await badge.first().innerText() : null;
+  // O contador corta em "99+" de propósito; comparar números com o texto do
+  // corte seria comparar com NaN. O que se afirma aqui é que ele existe e não
+  // está a zero.
+  check(
+    badgeBefore !== null && badgeBefore.trim() !== "0",
+    "O sino mostra um contador de avisos por ler",
+    `contador ${badgeBefore}`,
+  );
+
+  // ── A caixa mostra o aviso com a data certa ──
+  await page.goto(`${BASE_URL}/aluno/notificacoes`, { waitUntil: "domcontentloaded" });
+  await page.getByRole("heading", { name: "Avisos" }).first().waitFor({ timeout: 20_000 });
+
+  const card = page.locator("li").filter({ hasText: title }).first();
+  check((await card.count()) > 0, "O aviso da aula marcada aparece na caixa");
+  if ((await card.count()) === 0) {
+    await context.close();
+    return;
+  }
+
+  const cardText = await card.innerText();
+  check(
+    cardText.includes("Aula marcada") && cardText.includes(slot.time),
+    "O aviso diz que a aula foi marcada, e a que horas",
+    cardText.replace(/\s+/g, " ").slice(0, 140),
+  );
+  check(cardText.includes("Por ler"), "O aviso por ler diz 'Por ler', e não só uma cor");
+
+  // ── Marcar como lido ──
+  const readButton = card.getByRole("button", { name: /Marcar como lido/ });
+  const handle = await readButton.first().elementHandle();
+  await readButton.first().click();
+  await waitForIdle(page, handle, "Marcar como lido");
+  check(
+    await waitForPanel(page, "Lido", 20_000),
+    "A UI confirma a leitura sem esperar pelo repintar",
+  );
+
+  // ── O estado sobrevive ao reload, e o contador desce ──
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.getByRole("heading", { name: "Avisos" }).first().waitFor({ timeout: 20_000 });
+  const reloadedCard = page.locator("li").filter({ hasText: title }).first();
+  check(
+    (await reloadedCard.getByRole("button", { name: /Marcar como lido/ }).count()) === 0 &&
+      (await reloadedCard.getAttribute("data-unread")) === "false",
+    "Recarregar mantém o aviso como lido",
+  );
+
+  // A descida prova-se de forma inequívoca: marcar TODOS como lidos e ver o
+  // contador desaparecer. Com a caixa a mostrar "99+", subtrair um não seria
+  // observável.
+  const markAll = page.getByRole("button", { name: /Marcar todos como lidos/ });
+  if ((await markAll.count()) > 0) {
+    // Este botão fica desativado DEPOIS do sucesso, de propósito: marcar todos
+    // outra vez não teria efeito nenhum. `waitForIdle` espera o contrário — que
+    // o controlo volte a ficar utilizável — por isso aqui espera-se pelo estado
+    // final, que é o que interessa afirmar.
+    const allHandle = await markAll.first().elementHandle();
+    await markAll.first().click();
+    await page
+      .waitForFunction(
+        (element) =>
+          !(element instanceof HTMLButtonElement) || !element.isConnected || element.disabled,
+        allHandle,
+        { timeout: 20_000 },
+      )
+      .catch(() => {});
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.getByRole("heading", { name: "Avisos" }).first().waitFor({ timeout: 20_000 });
+  }
+
+  check(
+    (await badge.count()) === 0,
+    "Depois de marcar todos como lidos, o contador do sino desaparece",
+    `ainda mostra ${(await badge.count()) > 0 ? await badge.first().innerText() : "—"}`,
+  );
+  check(
+    !(await panelText(page)).includes("Por ler"),
+    "Nenhum aviso fica marcado como por ler",
+  );
+
+  // ── Reagendar acrescenta um aviso e não reescreve o antigo ──
+  const destination = await findFreeSlot(apiClient, { skipDays: [slot.day] });
+  if (destination) {
+    const movedStart = lisbonCivilToInstant(destination.day, destination.time);
+    const { data: replacementId } = await apiClient.rpc("reschedule_lesson", {
+      p_lesson_id: lessonId,
+      p_starts_at: movedStart.toISOString(),
+      p_ends_at: new Date(movedStart.getTime() + 30 * 60_000).toISOString(),
+      p_reason: "Fixture 8A: mover para gerar aviso",
+      p_location_id: null,
+      p_location_resource_id: null,
+      p_idempotency_key: randomUUID(),
+    });
+
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.getByRole("heading", { name: "Avisos" }).first().waitFor({ timeout: 20_000 });
+    const inbox = await panelText(page);
+    check(
+      inbox.includes("Aula reagendada"),
+      "O aluno vê um aviso novo de reagendamento",
+    );
+
+    // O aviso antigo é histórico: continua a dizer a hora antiga.
+    const oldCard = page
+      .locator("li")
+      .filter({ hasText: title })
+      .filter({ hasText: "Aula marcada" })
+      .first();
+    const oldText = (await oldCard.count()) > 0 ? await oldCard.innerText() : "";
+    check(
+      oldText.includes(slot.time) && !oldText.includes(destination.time),
+      "O aviso de criação continua a mostrar o horário antigo",
+      oldText.replace(/\s+/g, " ").slice(0, 140),
+    );
+
+    // ── Cancelar ──
+    if (replacementId) {
+      await apiClient.rpc("cancel_lesson", { p_lesson_id: replacementId });
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await page.getByRole("heading", { name: "Avisos" }).first().waitFor({ timeout: 20_000 });
+      check(
+        (await panelText(page)).includes("Aula cancelada"),
+        "O aluno vê o aviso de cancelamento",
+      );
+    }
+  } else {
+    check(false, "Existe um destino livre para reagendar a aula do aviso");
+  }
+
+  // ── Privacidade ──
+  const markup = await page.content();
+  const leaks = [
+    "recipient_profile_id",
+    "dedupe_key",
+    "student_package_id",
+    "organization_id",
+    "private_notes",
+  ].filter((token) => markup.includes(token));
+  check(leaks.length === 0, "A caixa não traz campos internos para o HTML", leaks.join(", "));
+
+  await context.close();
+}
+
+/** A caixa de avisos no telemóvel. */
+async function mobileNotificationsScenario(browser) {
+  section("Telemóvel — avisos a 390×844");
+
+  const context = await browser.newContext({ viewport: { width: 390, height: 844 } });
+  const page = await signIn(context, ACCOUNTS.student);
+
+  await page.goto(`${BASE_URL}/aluno/notificacoes`, { waitUntil: "domcontentloaded" });
+  const arrived = await page
+    .getByRole("heading", { name: "Avisos" })
+    .first()
+    .waitFor({ timeout: 20_000 })
+    .then(() => true)
+    .catch(() => false);
+  check(arrived, "A caixa de avisos abre no telemóvel");
+
+  const overflow = await page.evaluate(
+    () => document.documentElement.scrollWidth > window.innerWidth,
+  );
+  check(!overflow, "Sem scroll horizontal na caixa de avisos a 390px");
+
+  const small = await page.evaluate(() =>
+    [...document.querySelectorAll("main button, main a")]
+      .filter((element) => element.offsetParent !== null)
+      .map((element) => element.getBoundingClientRect().height)
+      .filter((height) => height < 43.5).length,
+  );
+  check(small === 0, "Alvos de toque adequados na caixa de avisos", `${small} abaixo`);
+
+  await context.close();
+}
+
 async function mobileScenario(browser, lessonId) {
   section("Telemóvel — 390×844");
   const context = await browser.newContext({ viewport: { width: 390, height: 844 } });
@@ -1701,6 +1932,8 @@ async function cleanUpFixtures(account) {
   check(true, `Fixtures deste guião arrumadas (${cleaned})`);
 }
 
+const consoleErrors = [];
+
 async function main() {
   console.log(`AulaFlow — validação de browser em ${BASE_URL}`);
 
@@ -1712,7 +1945,6 @@ async function main() {
     slowMo: SLOW_MO,
   });
 
-  const consoleErrors = [];
   try {
     const teacherContext = await browser.newContext();
     teacherContext.on("page", (page) => {
@@ -1769,6 +2001,8 @@ async function main() {
       lessons.client,
     );
     await mobileStudentConfirmationScenario(browser);
+    await studentNotificationsScenario(browser, lessons.client);
+    await mobileNotificationsScenario(browser);
 
     await mobileScenario(browser, lessons.operable ?? lessons.cancellable);
     await mobileRescheduleScenario(browser, replacementId);

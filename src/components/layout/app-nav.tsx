@@ -94,6 +94,9 @@ export function BottomNav({
                 <Icon className="size-5.5" aria-hidden="true" />
                 <span className="text-[0.6875rem] leading-tight font-semibold">
                   {item.shortLabel ?? item.label}
+                  {item.badgeCount ? (
+                    <span className="sr-only">{` — ${item.badgeCount} por ler`}</span>
+                  ) : null}
                 </span>
               </Link>
             </li>
@@ -173,6 +176,23 @@ export function PageTitle({ items, fallback }: { items: readonly NavItem[]; fall
   );
 }
 
+/**
+ * O contador de não lidas.
+ *
+ * O número é dito também por extenso a quem usa leitor de ecrã: uma bolinha
+ * colorida não comunica nada a quem não a vê.
+ */
+function NavBadge({ count }: { count: number }) {
+  return (
+    <span
+      className="inline-flex min-w-5 shrink-0 items-center justify-center rounded-[var(--radius-pill)] bg-brand px-1.5 text-xs font-bold text-white"
+      aria-label={`${count} por ler`}
+    >
+      {count > 99 ? "99+" : count}
+    </span>
+  );
+}
+
 export function Sidebar({
   items,
   roots,
@@ -201,7 +221,8 @@ export function Sidebar({
             )}
           >
             <Icon className="size-5 shrink-0" aria-hidden="true" />
-            {item.label}
+            <span className="min-w-0 flex-1">{item.label}</span>
+            {item.badgeCount ? <NavBadge count={item.badgeCount} /> : null}
           </Link>
         );
       })}

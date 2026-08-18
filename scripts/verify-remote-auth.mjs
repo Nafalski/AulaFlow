@@ -7005,6 +7005,201 @@ try {
     "A projecao do aluno nao ganhou campos administrativos com a 7A",
   );
 
+  section("Notificacoes dentro da aplicacao (8A)");
+
+  // A notificacao e uma OBSERVACAO do evento. Nada aqui pode mover um credito,
+  // e a caixa de cada pessoa e so dela.
+
+  const inboxOfStudent = async (client, label) => {
+    const found = await client
+      .from("user_notification_records")
+      .select("id, type, title, body, lesson_id, read_at, created_at, lesson_starts_at")
+      .order("created_at", { ascending: false })
+      .limit(50);
+    if (found.error) throw new Error(`${label}: ${summarizeError(found.error)}`);
+    return found.data ?? [];
+  };
+
+  // Data própria: a grelha da 7A já vai nos 22:40 ao índice 20, fora da janela.
+  const phase8aDate = dateOnlyFromNow(await pickUnusedAvailabilityOffset(155, 185));
+  await prepareException(
+    teacherClient,
+    "Disponibilidade 8A",
+    phase8aDate,
+    `notification-8a-date-${phase6RunSuffix}`,
+    "06:00",
+    "22:00",
+  );
+  const phase8aSlot = (index) => {
+    const startsAt = 360 + index * 50;
+    return { startsAt: timeFromMinutes(startsAt), endsAt: timeFromMinutes(startsAt + 30) };
+  };
+
+  const notifySlot = phase8aSlot(0);
+  const { data: notifyLessonId, error: notifyLessonError } = await createLesson(teacherClient, {
+    p_starts_at: lisbonInstant(phase8aDate, notifySlot.startsAt),
+    p_ends_at: lisbonInstant(phase8aDate, notifySlot.endsAt),
+    p_title: `Aula E2E 8A notificada ${phase6RunSuffix}`,
+    p_location_id: null,
+    p_location_resource_id: null,
+    p_student_id: studentsA.id,
+    p_idempotency_key: deterministicUuid(`lesson-8a-notify:${phase6RunSuffix}`),
+  });
+  if (notifyLessonError || !notifyLessonId) {
+    throw new Error(`Aula notificada 8A: ${summarizeError(notifyLessonError)}`);
+  }
+
+  const studentInbox = await inboxOfStudent(studentClient, "caixa do aluno A");
+  const createdNotification = studentInbox.find(
+    (row) => row.lesson_id === notifyLessonId && row.type === "lesson_created",
+  );
+  check(
+    createdNotification !== undefined && createdNotification.read_at === null,
+    "Criar uma aula deixa um aviso por ler na caixa do aluno",
+  );
+  check(
+    forbiddenColumns(createdNotification ?? {}, [
+      "recipient_profile_id",
+      "organization_id",
+      "payload",
+      "dedupe_key",
+      "student_package_id",
+    ]).length === 0,
+    "A caixa nao expoe destinatario, organizacao, payload nem chave interna",
+  );
+
+  // ── Isolamento ──
+  const otherStudentInbox = await inboxOfStudent(studentBClient, "caixa do aluno B");
+  check(
+    !otherStudentInbox.some((row) => row.lesson_id === notifyLessonId),
+    "O aviso de um aluno nunca aparece na caixa de outro",
+  );
+
+  const teacherInbox = await teacherClient
+    .from("user_notification_records")
+    .select("id")
+    .limit(5);
+  const adminInbox = await adminClient.from("user_notification_records").select("id").limit(5);
+  check(
+    (teacherInbox.data ?? []).length === 0 && (adminInbox.data ?? []).length === 0,
+    "Professor e administrador nao leem a caixa do aluno",
+  );
+  await mustReturnNoRows("Conta bloqueada nao le a caixa de avisos", () =>
+    blockedClient.from("user_notification_records").select("id").limit(1),
+  );
+  await mustReject("Anonimo nao le a caixa de avisos", async () =>
+    anonClient.from("user_notification_records").select("id").limit(1),
+  );
+
+  // ── Escrita direta fechada ──
+  await mustReject("Aluno nao fabrica um aviso", async () =>
+    studentClient
+      .from("notifications")
+      .insert({ recipient_profile_id: studentsA.id, type: "lesson_created", title: "x", body: "y" }),
+  );
+  await mustReject("Aluno nao escreve read_at diretamente", async () =>
+    studentClient
+      .from("notifications")
+      .update({ read_at: new Date().toISOString() })
+      .eq("id", createdNotification?.id ?? "00000000-0000-0000-0000-000000000000"),
+  );
+  await mustReject("Aluno nao apaga avisos", async () =>
+    studentClient
+      .from("notifications")
+      .delete()
+      .eq("id", createdNotification?.id ?? "00000000-0000-0000-0000-000000000000"),
+  );
+
+  // ── Marcar como lido ──
+  const { data: unreadBefore } = await studentClient.rpc("unread_notification_count");
+  const markResult = await studentClient.rpc("mark_notification_read", {
+    p_notification_id: createdNotification?.id,
+  });
+  const markRepeat = await studentClient.rpc("mark_notification_read", {
+    p_notification_id: createdNotification?.id,
+  });
+  const { data: unreadAfter } = await studentClient.rpc("unread_notification_count");
+  check(
+    markResult.data === true && markRepeat.data === false,
+    `Marcar como lido e idempotente${markResult.error ? `: ${summarizeError(markResult.error)}` : ""}`,
+  );
+  check(
+    Number(unreadAfter) === Number(unreadBefore) - 1,
+    "O contador de nao lidas desce exatamente um",
+    `${unreadBefore} -> ${unreadAfter}`,
+  );
+
+  await mustReject("Outro aluno nao marca este aviso", async () =>
+    studentBClient.rpc("mark_notification_read", { p_notification_id: createdNotification?.id }),
+  );
+  await mustReject("Professor nao marca o aviso do aluno", async () =>
+    teacherClient.rpc("mark_notification_read", { p_notification_id: createdNotification?.id }),
+  );
+  await mustReject("Admin nao marca o aviso do aluno", async () =>
+    adminClient.rpc("mark_notification_read", { p_notification_id: createdNotification?.id }),
+  );
+  await mustReject("Anonimo nao marca avisos", async () =>
+    anonClient.rpc("mark_notification_read", { p_notification_id: createdNotification?.id }),
+  );
+
+  // ── Reagendar acrescenta um aviso e nao reescreve o antigo ──
+  const notifyRescheduleSlot = phase8aSlot(1);
+  const { data: notifyReplacementId, error: notifyRescheduleError } = await teacherClient.rpc(
+    "reschedule_lesson",
+    {
+      p_lesson_id: notifyLessonId,
+      p_starts_at: lisbonInstant(phase8aDate, notifyRescheduleSlot.startsAt),
+      p_ends_at: lisbonInstant(phase8aDate, notifyRescheduleSlot.endsAt),
+      p_reason: "Fixture 8A: mover para gerar aviso",
+      p_location_id: null,
+      p_location_resource_id: null,
+      p_idempotency_key: deterministicUuid(`lesson-8a-resched:${phase6RunSuffix}`),
+    },
+  );
+  if (notifyRescheduleError || !notifyReplacementId) {
+    throw new Error(`Reagendar aula notificada 8A: ${summarizeError(notifyRescheduleError)}`);
+  }
+
+  const inboxAfterReschedule = await inboxOfStudent(studentClient, "caixa depois de reagendar");
+  const rescheduledNotification = inboxAfterReschedule.find(
+    (row) => row.lesson_id === notifyReplacementId && row.type === "lesson_rescheduled",
+  );
+  const originalNotification = inboxAfterReschedule.find(
+    (row) => row.lesson_id === notifyLessonId && row.type === "lesson_created",
+  );
+  check(
+    rescheduledNotification !== undefined,
+    "Reagendar deixa um aviso novo na caixa do aluno",
+  );
+  check(
+    originalNotification !== undefined &&
+      originalNotification.lesson_starts_at !== rescheduledNotification?.lesson_starts_at,
+    "O aviso antigo continua a mostrar o horario antigo",
+  );
+
+  // ── Cancelar notifica, e repetir nao duplica ──
+  const cancelNotifyBefore = (await inboxOfStudent(studentClient, "antes de cancelar")).filter(
+    (row) => row.lesson_id === notifyReplacementId && row.type === "lesson_cancelled",
+  ).length;
+  await cancelLessonRpc(teacherClient, notifyReplacementId);
+  await cancelLessonRpc(teacherClient, notifyReplacementId);
+  const cancelNotifyAfter = (await inboxOfStudent(studentClient, "depois de cancelar")).filter(
+    (row) => row.lesson_id === notifyReplacementId && row.type === "lesson_cancelled",
+  ).length;
+  check(
+    cancelNotifyBefore === 0 && cancelNotifyAfter === 1,
+    "Cancelar notifica uma unica vez, mesmo repetindo",
+  );
+
+  // ── Nenhum credito se moveu por causa dos avisos ──
+  const notifyParticipant = await readParticipant(notifyReplacementId, studentsA.id);
+  check(
+    notifyParticipant.billing_status === "released" &&
+      notifyParticipant.credits_consumed === 0 &&
+      notifyParticipant.attendance_status === null,
+    "Os avisos nao criaram presenca nem consumo: o credito voltou pelo cancelamento",
+  );
+
   section("Conta bloqueada e anonimo");
   await signIn(blockedClient, credentials.blocked.email, credentials.blocked.password, "Conta bloqueada");
   await mustReturnNoRows("Conta bloqueada nao le views de pacotes", () =>

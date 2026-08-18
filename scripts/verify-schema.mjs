@@ -9771,8 +9771,8 @@ const mixedCarlaParticipant = await reserveParticipant(
 await cancelLessonParticipationAs(TEACHER_UID, mixedGroupLesson.id, mixedCarlaParticipant.id);
 await db.query(
   `update public.lessons
-      set starts_at = now() + '-38 days'::interval,
-          ends_at = now() + '-38 days 1 hour'::interval
+      set starts_at = date_trunc('day', now()) + interval '3 hours' + '-38 days'::interval,
+          ends_at = date_trunc('day', now()) + interval '3 hours' + '-38 days 1 hour'::interval
     where id=$1`,
   [mixedGroupLesson.id],
 );
@@ -9866,14 +9866,14 @@ const recurringCancelLessons = await rows(
      (organization_id, teacher_id, sport_id, title, starts_at, ends_at,
       is_recurring, recurrence_group_id, recurrence_rule, credit_cost)
    values
-     ($1,$2,$3,'Recorrente 6B 1', now() + '70 days'::interval,
-      now() + '70 days 1 hour'::interval, true, $4,
+     ($1,$2,$3,'Recorrente 6B 1', date_trunc('day', now()) + interval '3 hours' + '70 days'::interval,
+      date_trunc('day', now()) + interval '3 hours' + '70 days 1 hour'::interval, true, $4,
       jsonb_build_object('frequency','weekly','interval_weeks',1,'occurrence_index',1,'occurrence_count',3), 1),
-     ($1,$2,$3,'Recorrente 6B 2', now() + '77 days'::interval,
-      now() + '77 days 1 hour'::interval, true, $4,
+     ($1,$2,$3,'Recorrente 6B 2', date_trunc('day', now()) + interval '3 hours' + '77 days'::interval,
+      date_trunc('day', now()) + interval '3 hours' + '77 days 1 hour'::interval, true, $4,
       jsonb_build_object('frequency','weekly','interval_weeks',1,'occurrence_index',2,'occurrence_count',3), 1),
-     ($1,$2,$3,'Recorrente 6B 3', now() + '84 days'::interval,
-      now() + '84 days 1 hour'::interval, true, $4,
+     ($1,$2,$3,'Recorrente 6B 3', date_trunc('day', now()) + interval '3 hours' + '84 days'::interval,
+      date_trunc('day', now()) + interval '3 hours' + '84 days 1 hour'::interval, true, $4,
       jsonb_build_object('frequency','weekly','interval_weeks',1,'occurrence_index',3,'occurrence_count',3), 1)
    returning id, starts_at`,
   [org, teacher.id, sport, recurrenceCancelGroup],
@@ -12136,6 +12136,441 @@ check(
     ].includes(row.column_name),
   ),
   "a projeção do aluno continua sem professor, organização, pacote nem autoria",
+);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Fase 8A — notificações dentro da aplicação
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// A notificação é uma OBSERVAÇÃO de um evento, não lógica financeira. Nada
+// nesta secção pode mover um crédito.
+
+const inboxOf = (profileId) =>
+  rows(
+    `select id, type::text, title, body, read_at, lesson_id, payload, dedupe_key
+       from public.notifications
+      where recipient_profile_id = $1
+      order by created_at`,
+    [profileId],
+  );
+
+const notificationsFor = (profileId, lessonId) =>
+  rows(
+    `select type::text, title, body, payload, read_at
+       from public.notifications
+      where recipient_profile_id = $1 and lesson_id = $2
+      order by created_at`,
+    [profileId, lessonId],
+  );
+
+await assignPackageAs(TEACHER_UID, {
+  student: ana.id,
+  name: "Pacote notificações 8A",
+  credits: 30,
+  sportId: sport,
+  starts: "2026-01-01",
+  expires: "2028-12-31",
+});
+await assignPackageAs(TEACHER_UID, {
+  student: bruno.id,
+  name: "Pacote notificações turma 8A",
+  credits: 30,
+  sportId: sport,
+  starts: "2026-01-01",
+  expires: "2028-12-31",
+});
+
+// ── Criar uma aula notifica o participante ─────────────────────────────────
+
+const notifLedgerBefore = await ledgerRows();
+const notifKey = randomUUID();
+const notifLesson = await createLessonAs(TEACHER_UID, {
+  studentId: ana.id,
+  title: "Aula notificada 8A",
+  start: "2027-06-07 09:00+00",
+  end: "2027-06-07 10:00+00",
+  idempotencyKey: notifKey,
+});
+
+const createdNotifications = await notificationsFor(ANA_UID, notifLesson.id);
+check(
+  createdNotifications.length === 1 &&
+    createdNotifications[0].type === "lesson_created" &&
+    createdNotifications[0].title === "Aula marcada" &&
+    createdNotifications[0].read_at === null,
+  "criar uma aula deixa uma notificação por ler para o participante",
+);
+check(
+  createdNotifications[0]?.body.includes("07/06/2027") &&
+    createdNotifications[0]?.body.includes("10:00"),
+  "a mensagem diz a data e a hora civis de Lisboa",
+);
+
+// O snapshot é o que torna a notificação histórica.
+const createdPayload = createdNotifications[0]?.payload ?? {};
+check(
+  createdPayload.lesson_title === "Aula notificada 8A" &&
+    createdPayload.starts_at !== undefined &&
+    createdPayload.teacher_name !== undefined,
+  "o snapshot guarda título, horário e professor",
+);
+check(
+  !("student_package_id" in createdPayload) &&
+    !("credits_reserved" in createdPayload) &&
+    !("private_notes" in createdPayload) &&
+    !("organization_id" in createdPayload) &&
+    !("participants" in createdPayload),
+  "o snapshot não guarda pacote, saldos, notas privadas nem colegas",
+);
+
+check(
+  (await ledgerRows()) === notifLedgerBefore + 1,
+  "notificar não acrescenta movimentos: só a reserva normal da criação entrou no livro-razão",
+);
+
+// ── Repetir a criação não duplica a caixa ──────────────────────────────────
+
+await createLessonAs(TEACHER_UID, {
+  studentId: ana.id,
+  title: "Aula notificada 8A",
+  start: "2027-06-07 09:00+00",
+  end: "2027-06-07 10:00+00",
+  idempotencyKey: notifKey,
+});
+check(
+  (await notificationsFor(ANA_UID, notifLesson.id)).length === 1,
+  "repetir a criação com a mesma chave não duplica a notificação",
+);
+
+// ── Reagendar produz um evento novo, e não reescreve o antigo ──────────────
+
+const notifReplacement = await rescheduleAs(TEACHER_UID, {
+  lessonId: notifLesson.id,
+  start: "2027-06-07 14:00+00",
+  end: "2027-06-07 15:00+00",
+  reason: "Aluno pediu outra hora",
+  idempotencyKey: randomUUID(),
+});
+const rescheduledNotifications = await notificationsFor(ANA_UID, notifReplacement.id);
+check(
+  rescheduledNotifications.length === 1 &&
+    rescheduledNotifications[0].type === "lesson_rescheduled" &&
+    rescheduledNotifications[0].body.includes("15:00"),
+  "reagendar produz uma notificação com o horário novo",
+);
+
+const originalAfterReschedule = await notificationsFor(ANA_UID, notifLesson.id);
+check(
+  originalAfterReschedule.length === 1 &&
+    originalAfterReschedule[0].type === "lesson_created" &&
+    originalAfterReschedule[0].body.includes("10:00") &&
+    !originalAfterReschedule[0].body.includes("15:00"),
+  "a notificação antiga continua a dizer o horário antigo",
+);
+check(
+  !rescheduledNotifications[0]?.payload.rescheduled_from_id &&
+    !rescheduledNotifications[0]?.payload.reschedule_reason,
+  "a notificação de reagendamento não expõe a mecânica interna nem o motivo",
+);
+check(
+  originalAfterReschedule.every((row) => row.type !== "lesson_cancelled"),
+  "a aula original ficar histórica não é anunciada como um cancelamento",
+);
+
+// Editar conteúdo não é um evento operacional: mudar o título não pode produzir
+// um aviso de reagendamento nem de nada.
+const notifBeforeEdit = (await notificationsFor(ANA_UID, notifReplacement.id)).length;
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(
+    `select public.update_lesson($1, null, null, $2, null, null, null, null)`,
+    [notifReplacement.id, "Aula notificada 8A com outro título"],
+  ),
+);
+check(
+  (await notificationsFor(ANA_UID, notifReplacement.id)).length === notifBeforeEdit,
+  "editar o título de uma aula não produz aviso nenhum",
+);
+
+// ── Cancelar notifica, e repetir não duplica ───────────────────────────────
+
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(`select public.cancel_lesson($1)`, [notifReplacement.id]),
+);
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(`select public.cancel_lesson($1)`, [notifReplacement.id]),
+);
+const cancelledNotifications = await notificationsFor(ANA_UID, notifReplacement.id);
+check(
+  cancelledNotifications.filter((row) => row.type === "lesson_cancelled").length === 1,
+  "cancelar notifica uma única vez, mesmo repetindo",
+);
+check(
+  cancelledNotifications.every((row) => row.type !== "lesson_participant_removed"),
+  "cancelar a aula inteira não produz também o evento de participação cancelada",
+);
+
+// ── Recorrência: uma notificação por ocorrência ────────────────────────────
+
+const notifSeries = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.create_recurring_lessons(
+       p_sport_id => $1::uuid,
+       p_starts_at => '2027-07-05 09:00+00'::timestamptz,
+       p_ends_at => '2027-07-05 10:00+00'::timestamptz,
+       p_title => 'Série notificada 8A',
+       p_occurrence_count => 2,
+       p_student_id => $2::uuid,
+       p_idempotency_key => $3::uuid
+     ) as result`,
+    [sport, ana.id, randomUUID()],
+  ),
+);
+const notifSeriesIds = notifSeries.result.lesson_ids;
+const seriesNotifications = await rows(
+  `select lesson_id from public.notifications
+    where recipient_profile_id=$1 and lesson_id = any($2::uuid[])`,
+  [ANA_UID, notifSeriesIds],
+);
+check(
+  notifSeriesIds.length === 2 && seriesNotifications.length === 2,
+  "cada ocorrência de uma série produz a sua própria notificação",
+);
+
+// ── Turma: cada aluno recebe apenas a sua ──────────────────────────────────
+
+const notifGroupLesson = await createLessonAs(TEACHER_UID, {
+  groupId: managedGroup.id,
+  title: "Turma notificada 8A",
+  start: "2027-08-02 09:00+00",
+  end: "2027-08-02 10:00+00",
+  idempotencyKey: randomUUID(),
+});
+check(
+  (await notificationsFor(ANA_UID, notifGroupLesson.id)).length === 1 &&
+    (await notificationsFor(BRUNO_UID, notifGroupLesson.id)).length === 1,
+  "numa turma, cada participante recebe a sua própria notificação",
+);
+
+const groupNotifRow = await one(
+  `select payload, body from public.notifications
+    where recipient_profile_id=$1 and lesson_id=$2`,
+  [ANA_UID, notifGroupLesson.id],
+);
+check(
+  !JSON.stringify(groupNotifRow.payload).includes(bruno.id) &&
+    !groupNotifRow.body.includes("Bruno"),
+  "a notificação de turma não menciona colegas",
+);
+
+// Cancelar a participação de um aluno notifica só esse aluno.
+const notifGroupParticipant = await one(
+  `select id from public.lesson_participants where lesson_id=$1 and student_id=$2`,
+  [notifGroupLesson.id, bruno.id],
+);
+const anaBeforeParticipantCancel = (await notificationsFor(ANA_UID, notifGroupLesson.id))
+  .length;
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(`select public.cancel_lesson_participation($1,$2)`, [
+    notifGroupLesson.id,
+    notifGroupParticipant.id,
+  ]),
+);
+check(
+  (await notificationsFor(BRUNO_UID, notifGroupLesson.id)).some(
+    (row) => row.type === "lesson_participant_removed",
+  ) &&
+    (await notificationsFor(ANA_UID, notifGroupLesson.id)).length ===
+      anaBeforeParticipantCancel,
+  "cancelar uma participação notifica só esse aluno, e não os colegas",
+);
+
+// ── Um aluno sem conta ligada não gera linha órfã ──────────────────────────
+
+const unlinkedStudent = await one(
+  `insert into public.student_profiles (organization_id, created_by_teacher_id, full_name)
+   values ($1,$2,'Aluno sem conta 8A') returning id`,
+  [org, teacher.id],
+);
+await assignPackageAs(TEACHER_UID, {
+  student: unlinkedStudent.id,
+  name: "Pacote sem conta 8A",
+  credits: 5,
+  sportId: sport,
+  starts: "2026-01-01",
+  expires: "2028-12-31",
+});
+const notificationsBeforeUnlinked = Number(
+  (await one(`select count(*)::int as total from public.notifications`)).total,
+);
+await createLessonAs(TEACHER_UID, {
+  studentId: unlinkedStudent.id,
+  title: "Aula de aluno sem conta 8A",
+  start: "2027-09-06 09:00+00",
+  end: "2027-09-06 10:00+00",
+  idempotencyKey: randomUUID(),
+});
+check(
+  Number((await one(`select count(*)::int as total from public.notifications`)).total) ===
+    notificationsBeforeUnlinked,
+  "um aluno sem conta ligada não produz notificação endereçada a ninguém",
+);
+
+// ── Isolamento: cada um lê só a sua caixa ──────────────────────────────────
+
+const anaInboxAsAna = await asDatabaseRole("authenticated", ANA_UID, () =>
+  rows(`select id from public.user_notification_records`),
+);
+const anaInboxAsBruno = await asDatabaseRole("authenticated", BRUNO_UID, () =>
+  rows(`select id from public.user_notification_records`),
+);
+check(
+  anaInboxAsAna.length > 0 &&
+    !anaInboxAsBruno.some((row) => anaInboxAsAna.some((mine) => mine.id === row.id)),
+  "a caixa de um aluno nunca contém notificações de outro",
+);
+
+const inboxAsTeacher = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  rows(`select id from public.user_notification_records`),
+);
+const inboxAsAdmin = await asDatabaseRole("authenticated", ADMIN_UID, () =>
+  rows(`select id from public.user_notification_records`),
+);
+check(
+  inboxAsTeacher.length === 0 && inboxAsAdmin.length === 0,
+  "professor e administrador não leem a caixa do aluno",
+);
+await mustReject("anónimo não lê notificações", () =>
+  asDatabaseRole("anon", null, () => db.query(`select id from public.user_notification_records`)),
+);
+
+const inboxColumns = await rows(
+  `select column_name from information_schema.columns
+    where table_schema='public' and table_name='user_notification_records'`,
+);
+check(
+  !inboxColumns.some((row) =>
+    ["recipient_profile_id", "organization_id", "payload", "dedupe_key"].includes(row.column_name),
+  ),
+  "a projeção da caixa não expõe destinatário, organização, payload nem chave interna",
+);
+
+// ── Escrita direta fechada ─────────────────────────────────────────────────
+
+const notificationWriteGrants = await rows(
+  `select privilege_type from information_schema.role_table_grants
+    where table_schema='public' and table_name='notifications'
+      and grantee in ('authenticated','anon','PUBLIC')
+      and privilege_type in ('INSERT','UPDATE','DELETE')`,
+);
+check(
+  notificationWriteGrants.length === 0,
+  "authenticated e anon não inserem, alteram nem apagam notificações",
+);
+await mustReject("aluno não fabrica uma notificação", () =>
+  asDatabaseRole("authenticated", ANA_UID, () =>
+    db.query(
+      `insert into public.notifications (recipient_profile_id, type, title, body)
+       values ($1,'lesson_created','Forjada','Forjada')`,
+      [ANA_UID],
+    ),
+  ),
+);
+await mustReject("aluno não escreve read_at diretamente", () =>
+  asDatabaseRole("authenticated", ANA_UID, () =>
+    db.query(`update public.notifications set read_at = now() where recipient_profile_id = $1`, [
+      ANA_UID,
+    ]),
+  ),
+);
+await mustReject("aluno não apaga notificações", () =>
+  asDatabaseRole("authenticated", ANA_UID, () =>
+    db.query(`delete from public.notifications where recipient_profile_id = $1`, [ANA_UID]),
+  ),
+);
+
+// ── Marcar como lida ───────────────────────────────────────────────────────
+
+const anaFirstNotification = (await inboxOf(ANA_UID))[0];
+const markedRead = await asDatabaseRole("authenticated", ANA_UID, () =>
+  one(`select public.mark_notification_read($1) as changed`, [anaFirstNotification.id]),
+);
+const markedAgain = await asDatabaseRole("authenticated", ANA_UID, () =>
+  one(`select public.mark_notification_read($1) as changed`, [anaFirstNotification.id]),
+);
+const readRow = await one(`select read_at from public.notifications where id=$1`, [
+  anaFirstNotification.id,
+]);
+check(
+  markedRead.changed === true && markedAgain.changed === false && readRow.read_at !== null,
+  "marcar como lida é idempotente e a hora é do servidor",
+);
+
+await mustReject("um aluno não marca a notificação de outro", () =>
+  asDatabaseRole("authenticated", BRUNO_UID, () =>
+    one(`select public.mark_notification_read($1) as changed`, [anaFirstNotification.id]),
+  ),
+);
+await mustReject("o professor não marca a notificação do aluno", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    one(`select public.mark_notification_read($1) as changed`, [anaFirstNotification.id]),
+  ),
+);
+await mustReject("o administrador não marca a notificação do aluno", () =>
+  asDatabaseRole("authenticated", ADMIN_UID, () =>
+    one(`select public.mark_notification_read($1) as changed`, [anaFirstNotification.id]),
+  ),
+);
+
+// ── Contador de não lidas ──────────────────────────────────────────────────
+
+const unreadBefore = await asDatabaseRole("authenticated", ANA_UID, () =>
+  one(`select public.unread_notification_count() as total`),
+);
+const markedAll = await asDatabaseRole("authenticated", ANA_UID, () =>
+  one(`select public.mark_all_notifications_read() as total`),
+);
+const unreadAfter = await asDatabaseRole("authenticated", ANA_UID, () =>
+  one(`select public.unread_notification_count() as total`),
+);
+check(
+  Number(unreadBefore.total) > 0 &&
+    Number(markedAll.total) === Number(unreadBefore.total) &&
+    Number(unreadAfter.total) === 0,
+  "marcar todas como lidas zera o contador do próprio utilizador",
+);
+check(
+  Number(
+    (
+      await asDatabaseRole("authenticated", BRUNO_UID, () =>
+        one(`select public.unread_notification_count() as total`),
+      )
+    ).total,
+  ) > 0,
+  "marcar as próprias como lidas não toca nas de mais ninguém",
+);
+
+const notificationFunctionsAnon = await rows(
+  `select proc.proname from pg_proc proc
+     join pg_namespace ns on ns.oid = proc.pronamespace
+    where ns.nspname='public'
+      and proc.proname in (
+        'mark_notification_read','mark_all_notifications_read',
+        'unread_notification_count','record_lesson_notification'
+      )
+      and has_function_privilege('anon', proc.oid, 'EXECUTE')`,
+);
+check(notificationFunctionsAnon.length === 0, "anon não executa nenhuma função de notificações");
+
+const notificationInternal = await rows(
+  `select proc.proname from pg_proc proc
+     join pg_namespace ns on ns.oid = proc.pronamespace
+    where ns.nspname='public'
+      and proc.proname in ('record_lesson_notification','lesson_notification_payload')
+      and has_function_privilege('authenticated', proc.oid, 'EXECUTE')`,
+);
+check(
+  notificationInternal.length === 0,
+  "o escritor de notificações e o snapshot são internos ao servidor",
 );
 
 // ── Resultado ────────────────────────────────────────────────────────────────

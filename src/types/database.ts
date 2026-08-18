@@ -712,6 +712,8 @@ export type LessonChangeHistory = {
 export type NotificationRow = {
   id: UUID;
   recipient_profile_id: UUID;
+  /** Identidade da operação que produziu a notificação (Etapa 8A). */
+  dedupe_key: string | null;
   organization_id: UUID | null;
   type: NotificationType;
   title: string;
@@ -1160,6 +1162,26 @@ export type TeacherLessonScheduleRecord = {
  * privadas nem — sobretudo — os colegas: numa aula de dois, uma contagem de
  * participantes seria o mesmo que dizer quem é o outro.
  */
+/**
+ * Caixa de notificações do próprio utilizador (Etapa 8A).
+ *
+ * Nunca traz destinatário, organização, payload em bruto nem a chave de
+ * deduplicação: quem lê é sempre o dono, e o resto é mecânica interna.
+ */
+export type UserNotificationRecord = {
+  id: UUID;
+  type: NotificationType;
+  title: string;
+  body: string;
+  lesson_id: UUID | null;
+  read_at: Timestamp | null;
+  created_at: Timestamp;
+  lesson_starts_at: Timestamp | null;
+  lesson_title: string | null;
+  location_name: string | null;
+  teacher_name: string | null;
+};
+
 export type StudentLessonRecord = {
   id: UUID;
   participation_id: UUID;
@@ -1653,6 +1675,10 @@ export type Database = {
       };
     };
     Views: {
+      user_notification_records: {
+        Row: UserNotificationRecord;
+        Relationships: [];
+      };
       org_directory: {
         Row: OrgDirectoryEntry;
         Relationships: [];
@@ -2234,6 +2260,20 @@ export type Database = {
        * aula". Não escreve em attendance nem move créditos. Devolve `false`
        * quando a participação já estava confirmada.
        */
+      /** Marca UMA notificação do próprio utilizador como lida. */
+      mark_notification_read: {
+        Args: { p_notification_id: UUID };
+        Returns: boolean;
+      };
+      /** Marca todas as próprias como lidas e devolve quantas mudaram. */
+      mark_all_notifications_read: {
+        Args: Record<string, never>;
+        Returns: number;
+      };
+      unread_notification_count: {
+        Args: Record<string, never>;
+        Returns: number;
+      };
       confirm_lesson_participation: {
         Args: { p_lesson_id: UUID };
         Returns: boolean;

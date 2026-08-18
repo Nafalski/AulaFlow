@@ -1258,6 +1258,91 @@ checks as (
   union all
   select
     'estrutura',
+    'a notificacao tem chave de deduplicacao unica',
+    exists (
+      select 1 from pg_indexes
+      where schemaname = 'public'
+        and tablename = 'notifications'
+        and indexname = 'notifications_dedupe_key_unique'
+    ),
+    'ok'
+
+  union all
+  select
+    'seguranca',
+    'o cliente nao escreve notificacoes diretamente',
+    not exists (
+      select 1
+      from information_schema.role_table_grants
+      where table_schema = 'public'
+        and table_name = 'notifications'
+        and grantee in ('authenticated', 'anon', 'PUBLIC')
+        and privilege_type in ('INSERT', 'UPDATE', 'DELETE')
+    ),
+    'ok'
+
+  union all
+  select
+    'seguranca',
+    'o escritor de notificacoes e interno',
+    not exists (
+      select 1
+      from pg_proc proc
+      join pg_namespace ns on ns.oid = proc.pronamespace
+      where ns.nspname = 'public'
+        and proc.proname in ('record_lesson_notification', 'lesson_notification_payload')
+        and has_function_privilege('authenticated', proc.oid, 'EXECUTE')
+    ),
+    'ok'
+
+  union all
+  select
+    'seguranca',
+    'anon nao le nem marca notificacoes',
+    not exists (
+      select 1
+      from pg_proc proc
+      join pg_namespace ns on ns.oid = proc.pronamespace
+      where ns.nspname = 'public'
+        and proc.proname in (
+          'mark_notification_read', 'mark_all_notifications_read', 'unread_notification_count'
+        )
+        and has_function_privilege('anon', proc.oid, 'EXECUTE')
+    ),
+    'ok'
+
+  union all
+  select
+    'privacidade',
+    'a caixa de notificacoes nao expoe destinatario nem payload',
+    not exists (
+      select 1
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'user_notification_records'
+        and column_name in ('recipient_profile_id', 'organization_id', 'payload', 'dedupe_key')
+    ),
+    'ok'
+
+  union all
+  select
+    'estrutura',
+    'os producers de notificacao estao ligados',
+    (
+      select count(*) = 3
+      from pg_trigger trigger_row
+      where not trigger_row.tgisinternal
+        and trigger_row.tgname in (
+          'notify_lesson_participant_created',
+          'notify_lesson_cancelled',
+          'notify_lesson_participation_cancelled'
+        )
+    ),
+    'ok'
+
+  union all
+  select
+    'estrutura',
     'as RPCs de criacao tem uma unica assinatura publica',
     (
       select count(*) = 3

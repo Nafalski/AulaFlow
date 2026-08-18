@@ -449,7 +449,7 @@ A estrutura fica pronta para notificações push (Fase 8).
 | **5** | Calendário e criação de aulas, com reserva de créditos | **Concluído** — disponibilidade, calendário, clubes, locais, recursos, criação/edição de aulas, conflitos atómicos, reserva atómica de créditos, recorrência semanal segura e revisão integrada |
 | **6** | Cancelamento, reagendamento, presenças, histórico | **Concluída** — 6A/6B: presença, falta/no-show, conclusão normal/mista e cancelamentos com `reserved -> available` ou `reserved -> used` seguros. 6C.1/1A/1B: contrato transacional de reagendamento, chave de idempotência obrigatória e concorrência real provada. 6C.2: interface operacional, com editar conteúdo e reagendar colocação separados no PostgreSQL |
 | **7** | Área do aluno: aulas, saldo, confirmação da participação | **Concluída** — 7A: contrato de confirmação individual, com `requires_confirmation` ligado, escrita direta fechada e RSVP separado de presença. 7B: o professor pede ao criar, o aluno responde pela própria participação, provado em browser e mobile |
-| **8** | Notificações, lembretes e expiração agendada | **Planeado** |
+| **8** | Notificações, lembretes e expiração agendada | **8A concluída** — a fundação da Fase 1 foi ligada: producers dos eventos de aula por trigger, caixa in-app do aluno, lida/por ler e contador de não lidas. Faltam a 8B (agendador, lembretes, saldo baixo, expiração automática) e a 8C (entrega por email a partir do outbox) |
 | **9** | Supabase real, concorrência, acessibilidade, deployment | **Parcialmente concluído** — Supabase/Auth reais validados até à 7A (506 verificações, repetíveis em execuções consecutivas); browser automatizado com sessão GoTrue real, em dev e em build de produção; deployment pendente |
 
 A ordem segue as prioridades pedidas: primeiro a área do professor ao computador, depois as regras seguras de créditos, depois o aluno no telemóvel.
@@ -1238,6 +1238,32 @@ Duas verificações da 6B — concluir e cancelar — alternavam entre verde e v
 **Ainda não implementado depois da 7B:** dizer que não vai, self-cancel, reconfirmação obrigatória depois de reagendar, confirmação de série inteira, lista de espera, janela e multas, e notificações. Nenhum email, push ou lembrete é enviado.
 
 **Ainda não implementado na 7A:** interface de pedir confirmação, interface de responder, decline/self-cancel do aluno, janela e multas, lista de espera, confirmação de série inteira e notificações.
+
+### Concluído na Etapa 8A — a fundação, ligada
+
+Estado: **eventos de aula e caixa in-app do aluno concluídos. O agendador é a 8B; a entrega por email é a 8C.**
+
+A auditoria começou por procurar o que já existia, e encontrou o subsistema inteiro desenhado na Fase 1 e nunca ligado: `notifications` com uma linha por destinatário e `payload` de snapshot, `notification_preferences` (D-06) e `notification_deliveries` (D-07). Criar `notification_events` + `user_notifications` ao lado teria sido uma segunda arquitetura para a mesma coisa.
+
+#### Os producers vivem em triggers
+
+Integrar a emissão dentro de `create_lesson()`, `reschedule_lesson()` e `cancel_lesson()` obrigaria a reescrever centenas de linhas que tratam de créditos, locks e cadeias de reagendamento. Um trigger corre na mesma transação — que é o requisito real — sem lhes tocar. Uma falha ao escrever a notificação desfaz a operação inteira, e é isso que impede o cenário em que a aula é cancelada mas o aviso se perde.
+
+`lesson_created` e `lesson_rescheduled` nascem do mesmo sítio: a participação a ser materializada. O que os distingue é `rescheduled_from_id` — para quem recebe, uma aula reagendada não é uma aula nova.
+
+#### O snapshot é o que torna a caixa um histórico
+
+Sem ele, a interface faria JOIN no estado atual e o aviso de "aula marcada às 18:00" passaria a dizer 20:00 depois de um reagendamento — apagando exatamente a informação que dá valor à caixa. O `payload` guarda título, horário, professor e local do momento; nunca pacote, saldos, colegas ou notas privadas.
+
+#### O que foi fechado no caminho
+
+A Fase 1 tinha dado ao cliente `GRANT UPDATE (read_at)` sobre `notifications`. É estreito, mas aceita qualquer valor: um `read_at` vindo do dispositivo, ou um regresso a `null` para fingir que nunca se leu. Foi revogado, e marcar como lido passou a ser `mark_notification_read()` / `mark_all_notifications_read()`, com a hora do servidor.
+
+#### O que a 8A deliberadamente NÃO faz
+
+Não emite `lesson_updated` — mudar o título não é uma alteração operacional, e abrir esse tipo exigiria decidir quais alterações merecem aviso. Não emite aviso de RSVP: a interface da 7B já mostra o resultado a quem clicou. Não notifica o professor da sua própria ação. E não toca em `lesson.status`.
+
+**Para a 8B:** `refresh_package_status()` é interna e **reativa** — recalcula `depleted`/`expired`/`not_started`/`active` a partir de `current_date` e só corre depois de uma movimentação de créditos (`assign`, `reserve`, `release`, `consume`, ajustes administrativos). Não existe tarefa agendada: um pacote que expirou ontem mantém o estado anterior até alguém lhe tocar. O limiar de saldo baixo existe hoje apenas como regra visual em `lib/domain/package-display.ts` (1–2 créditos), e uma regra visual não é política de notificação — falta decidir limiar, repetição, rearme e destinatário.
 
 ### Fase 2 — estado por item
 

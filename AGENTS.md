@@ -169,7 +169,8 @@ update public.profiles set role = 'admin' where email = 'voce@exemplo.pt';
 │   ├── ..._phase6c2_edit_placement_boundary.sql Fase 6C.2: editar deixa de mover a aula
 │   ├── ..._phase6c2_reschedule_declined_cast.sql Fase 6C.2: copiar participação não reservada
 │   ├── ..._phase6c2_reschedule_released_participation.sql Fase 6C.2: libertada continua libertada
-│   └── ..._phase7a_lesson_confirmation.sql Fase 7A: confirmação da participação pelo aluno
+│   ├── ..._phase7a_lesson_confirmation.sql Fase 7A: confirmação da participação pelo aluno
+│   └── ..._phase8a_notification_producers.sql Fase 8A: quem escreve as notificações
 │
 └── src/
     ├── proxy.ts             Renova a sessão e protege rotas (era middleware.ts)
@@ -566,6 +567,35 @@ Não existe forma de ligar ou desligar o pedido numa aula **já criada**, e é d
 
 **Ainda não implementado:** dizer que não vai, self-cancel, reconfirmação obrigatória depois de reagendar, confirmar a série inteira, lista de espera e notificações. **Nenhum email, push ou lembrete é enviado** — a interface não o promete em lado nenhum.
 
+### Notificações dentro da aplicação (Etapa 8A)
+
+**A fundação já existia desde a Fase 1, e nunca tinha sido ligada.** `notifications` (uma linha por destinatário, com `payload` de snapshot e `read_at`), `notification_preferences` (D-06) e `notification_deliveries` (D-07, o outbox) estavam todas criadas. O que faltava era **quem escrevesse lá**. Não se criou `notification_events` + `user_notifications`: seria uma segunda arquitetura para o que a tabela existente já é.
+
+**Os producers são triggers, não edições às RPCs.** `create_lesson()`, `reschedule_lesson()` e `cancel_lesson()` são funções longas que tratam de créditos e de locks; reescrevê-las só para acrescentar um INSERT convidaria a erros de transcrição. Um trigger corre na **mesma transação** — que é o que a decisão exige — sem lhes tocar.
+
+| Evento | Producer | Destinatário |
+|---|---|---|
+| `lesson_created` | INSERT em `lesson_participants` numa aula sem `rescheduled_from_id` | o participante |
+| `lesson_rescheduled` | o mesmo INSERT, quando a aula **tem** `rescheduled_from_id` | quem transitou para a substituta |
+| `lesson_cancelled` | UPDATE de `lessons.status` para `cancelled_by_teacher` | cada participante operacional |
+| `lesson_participant_removed` | UPDATE de `lesson_participants.status` para `declined` | **só** esse aluno |
+
+**Nada de rede dentro de uma operação de domínio.** Um trigger escreve numa tabela. O envio externo é trabalho de um worker futuro que lê o outbox — é isso que faz uma falha de email nunca poder fazer falhar um cancelamento. A 8A não escolhe provider, não instala biblioteca de email e não pede permissão de push.
+
+**A notificação é histórico, e o snapshot é o que a torna histórica.** Uma aula das 18:00 reagendada para as 20:00 não faz o aviso antigo passar a dizer 20:00: o `payload` guarda título, horário, professor e local do momento em que o evento aconteceu. Nunca guarda pacote, saldos, colegas, notas privadas, organização nem autoria.
+
+**Idempotência por `dedupe_key`.** Um retry de criar, reagendar ou cancelar reencontra a chave e não duplica a caixa de ninguém. A chave identifica a **operação** — para a participação cancelada é a participação, não a aula, porque um dia pode haver mais do que um evento do mesmo tipo para a mesma aula.
+
+**Um aluno sem conta ligada não gera linha.** Não há sessão onde a notificação apareça, e uma linha endereçada a um perfil inexistente seria lixo. O facto continua no domínio; quando a ficha for reclamada, as aulas seguintes notificam normalmente.
+
+**Escrita fechada, leitura só da própria caixa.** `notifications` não tem GRANT de INSERT, UPDATE nem DELETE para `authenticated` — o `GRANT UPDATE (read_at)` da Fase 1 foi revogado, porque aceitava um `read_at` do dispositivo ou um regresso a `null`. Marcar como lido passa por `mark_notification_read()` e `mark_all_notifications_read()`, e o contador do sino por `unread_notification_count()`. A projeção `user_notification_records` nunca devolve destinatário, organização, `payload` em bruto nem `dedupe_key`.
+
+**Só o aluno tem caixa nesta etapa.** Não se criou um sino para o professor: sem eventos de professor, seria uma página permanentemente vazia — e um canal que nunca tem nada ensina a ser ignorado. Notificar o professor da sua própria ação também não: ele acabou de a fazer.
+
+**As preferências governam ENTREGA, não a existência do facto.** O comentário da Fase 1 já o dizia — as horas de silêncio adiam o "empurrar", não escondem. Na 8A a notificação in-app é sempre escrita; os booleanos por tipo e por canal passam a ser lidos pelo worker de email na 8C. Nenhum valor por omissão foi alterado.
+
+**Ainda não implementado (8B):** lembretes, saldo baixo, pacote a expirar e expiração automática. `refresh_package_status()` é **interna e reativa**: recalcula `depleted`/`expired`/`not_started`/`active` a partir de `current_date` e só corre depois de uma movimentação de créditos. Não existe tarefa à meia-noite, e por isso um pacote que expirou ontem só muda de estado quando alguém lhe tocar. A 8B decide o agendador. **(8C):** entrega por email a partir do outbox. Push fica para depois; WhatsApp continua fora do MVP.
+
 ### Ao criar uma tabela nova
 
 ```sql
@@ -914,7 +944,7 @@ Interface em `/professor/clubes/[id]/calendario`, com filtro por professor no UR
 
 **Não implementado:** aulas, participantes, locais, campos, recursos, conflitos, reservas e créditos. Os únicos estados são disponível e indisponível — não escrever "ocupado", "reservado", "lotado", "vagas" ou "conflito", porque nada disso existe ainda para ser verdade.
 
-Ordem atual: Fases 6 e 7 concluídas. Segue a Fase 8: notificações, lembretes e expiração agendada.
+Ordem atual: Fases 6 e 7 concluídas; 8A fechada (fundação de eventos e caixa in-app). Seguem a 8B (agendador, lembretes, saldo baixo, expiração) e a 8C (entrega por email).
 
 ### `src/types/database.ts`
 
@@ -952,8 +982,8 @@ Não existe um comando de formatação separado. Use `npm run lint:fix` apenas p
 | 5 | Calendário e criação de aulas com reserva | **Concluído** — disponibilidade, projeção segura, refinamento visual, clubes/membros, calendário partilhado, locais com moradas manuais, campos/salas/áreas, criação/edição de aulas, conflitos atómicos, reserva atómica de créditos, recorrência semanal segura e revisão integrada |
 | 6 | Cancelamento, reagendamento, presenças e histórico | **Concluído** — 6A/6B: presença, falta/no-show, conclusão normal/mista, cancelamento de aula e de participação com `reserved -> available` ou `reserved -> used` seguros. 6C.1/6C.1A/6C.1B: contrato transacional de reagendamento, chave de idempotência obrigatória em namespace próprio e sete corridas de concorrência com JWTs reais. 6C.2: interface operacional, com a fronteira entre editar conteúdo e reagendar colocação imposta no PostgreSQL |
 | 7 | Área do aluno: aulas, créditos e confirmação | **Concluído** — 7A: contrato de confirmação individual, com `requires_confirmation` ligado, escrita direta na resposta fechada e RSVP separado de presença. 7B: o professor pede confirmação ao criar, o aluno responde pela sua própria participação, validado em browser e mobile |
-| 8 | Notificações, lembretes e expiração agendada | **Planeado** |
-| 9 | Supabase real, concorrência, acessibilidade e deployment | **Parcialmente concluído** — RLS em PGlite e validação real das Fases 4, 5, 6A e 6B feitas; concorrência real de aulas/créditos/recorrência/conclusão coberta; deployment pendente |
+| 8 | Notificações, lembretes e expiração agendada | **Em curso** — 8A: producers dos eventos de aula, caixa in-app do aluno, lida/por ler e contador. Faltam a 8B (agendador, lembretes, saldo baixo, expiração) e a 8C (entrega por email) |
+| 9 | Supabase real, concorrência, acessibilidade e deployment | **Parcialmente concluído** — RLS em PGlite e validação real com JWTs até à Fase 8A; concorrência real de aulas, créditos, recorrência, conclusão, reagendamento e confirmação coberta; browser em dev e em build de produção; deployment pendente |
 
 **Ao concluir uma fase ou etapa:** `npm run check`, corrigir tudo o que falhe, atualizar `implementation_plan.md`, e resumir o que foi criado e como testar manualmente.
 

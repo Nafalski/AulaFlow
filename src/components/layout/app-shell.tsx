@@ -3,6 +3,8 @@ import Link from "next/link";
 import type { ReactNode } from "react";
 
 import { BottomNav, PageTitle, Sidebar } from "./app-nav";
+import { unreadNotificationCount } from "@/lib/notifications/unread-count";
+
 import { navItemsForRole } from "./nav-items";
 import { Logo, LogoMark } from "@/components/brand/logo";
 import {
@@ -52,7 +54,7 @@ const CONTENT_WIDTH: Record<SessionUser["profile"]["role"], string> = {
  * a navegação atrás de um toque extra em todos os ecrãs, que é precisamente o
  * que se quer evitar em quem tem pouca experiência tecnológica.
  */
-export function AppShell({
+export async function AppShell({
   user,
   children,
   headerAction,
@@ -68,7 +70,19 @@ export function AppShell({
    */
   workspaceOptions?: readonly WorkspaceSwitcherOption[];
 }) {
-  const items = navItemsForRole(user.profile.role);
+  const baseItems = navItemsForRole(user.profile.role);
+
+  // Só o aluno tem eventos na 8A. Acrescentar um sino ao professor levaria a
+  // uma página permanentemente vazia — e um canal que nunca tem nada ensina a
+  // ser ignorado.
+  const unreadCount =
+    user.profile.role === "student" ? await unreadNotificationCount() : 0;
+
+  const items = unreadCount
+    ? baseItems.map((item) =>
+        item.href === "/aluno/notificacoes" ? { ...item, badgeCount: unreadCount } : item,
+      )
+    : baseItems;
   const roots = ["/professor", "/aluno", "/admin"];
   const hasWorkspaceSwitcher = Boolean(workspaceOptions && workspaceOptions.length > 0);
 
