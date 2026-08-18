@@ -14152,6 +14152,150 @@ check(
   "mas um facto novo entra normalmente no fluxo",
 );
 
+// ── (8C.1) O SILÊNCIO VALE NO INSTANTE DO ENVIO, NÃO NO DA CRIAÇÃO ────────
+//
+// `scheduled_for` é calculado quando o facto nasce. Se a pessoa configurar
+// silêncio DEPOIS disso, esse instante ficou desatualizado — e a 8C reavaliava
+// canal e tipo, mas não o horário. O email chegava durante o silêncio que ela
+// tinha acabado de pedir.
+const QUIET_NOW = "2026-09-10T09:00:00Z"; // 10:00 em Lisboa, verão.
+
+await setPreference(SCHED_PROFILE, { quiet_hours_start: null, quiet_hours_end: null });
+const quietLate = await notifyAndFetchDelivery(
+  SCHED_PROFILE,
+  "lesson_created",
+  "8c1:silencio-tardio",
+  QUIET_NOW,
+);
+check(
+  quietLate.delivery?.status === "pending" &&
+    quietLate.delivery?.scheduled_for.toISOString() === "2026-09-10T09:00:00.000Z",
+  "a entrega nasce fora de silêncio e agendada para o instante do facto",
+);
+
+// A pessoa configura silêncio das 10:00 às 12:00 locais, DEPOIS de a entrega
+// estar em fila.
+await setPreference(SCHED_PROFILE, { quiet_hours_start: "10:00", quiet_hours_end: "12:00" });
+
+const quietClaim = await rows(
+  `select * from public.claim_email_deliveries(50, 300, '${QUIET_NOW}'::timestamptz)`,
+);
+check(
+  !quietClaim.some((row) => row.delivery_id === quietLate.delivery.id),
+  "o worker não a reclama: o silêncio atual cobre este instante",
+);
+
+const quietRow = (await deliveriesOf(quietLate.notificationId))[0];
+check(quietRow.status === "pending", "a entrega continua pendente, e não suprimida");
+check(quietRow.attempts === 0, "reagendar por silêncio não gasta uma tentativa");
+check(quietRow.locked_at === null, "e não fica com o arrendamento preso");
+check(
+  quietRow.scheduled_for.toISOString() === "2026-09-10T11:00:00.000Z",
+  "passa a estar agendada para as 12:00 locais, o fim do silêncio",
+);
+check(
+  quietRow.recipient_email === "agendado@exemplo.pt",
+  "o destinatário mantém-se: nada foi reescrito além do horário",
+);
+
+// Passado o silêncio, sai normalmente.
+const afterQuiet = await rows(
+  `select * from public.claim_email_deliveries(50, 300, '2026-09-10T11:00:00Z'::timestamptz)`,
+);
+check(
+  afterQuiet.some((row) => row.delivery_id === quietLate.delivery.id),
+  "acabado o silêncio, a entrega é reclamada normalmente",
+);
+await db.query(`select public.finalize_email_delivery($1, 'sent', 'msg_quiet', null)`, [
+  quietLate.delivery.id,
+]);
+
+// ── (8C.1) O MESMO, COM O INTERVALO QUE ATRAVESSA A MEIA-NOITE ────────────
+await setPreference(SCHED_PROFILE, { quiet_hours_start: null, quiet_hours_end: null });
+const overnightLater = await notifyAndFetchDelivery(
+  SCHED_PROFILE,
+  "lesson_created",
+  "8c1:silencio-noturno",
+  "2026-09-10T20:00:00Z", // 21:00 em Lisboa: ainda fora de qualquer silêncio.
+);
+check(
+  overnightLater.delivery?.scheduled_for.toISOString() === "2026-09-10T20:00:00.000Z",
+  "a entrega noturna nasce agendada para já",
+);
+
+await setPreference(SCHED_PROFILE, { quiet_hours_start: "22:00", quiet_hours_end: "08:00" });
+const overnightClaim = await rows(
+  // 23:00 em Lisboa, já dentro do silêncio configurado entretanto.
+  `select * from public.claim_email_deliveries(50, 300, '2026-09-10T22:00:00Z'::timestamptz)`,
+);
+check(
+  !overnightClaim.some((row) => row.delivery_id === overnightLater.delivery.id),
+  "às 23:00 locais não sai: o silêncio noturno foi configurado depois do enqueue",
+);
+const overnightRow = (await deliveriesOf(overnightLater.notificationId))[0];
+check(
+  overnightRow.scheduled_for.toISOString() === "2026-09-11T07:00:00.000Z",
+  "fica para as 08:00 locais da manhã seguinte",
+);
+check(
+  overnightRow.status === "pending" && overnightRow.attempts === 0,
+  "e continua pendente, sem tentativas gastas",
+);
+
+// ── (8C.1) O FUSO É LIDO NO MOMENTO DO CLAIM ──────────────────────────────
+//
+// Quem muda de fuso depois do enqueue leva o silêncio consigo. No verão os
+// Açores estão em UTC+0 e Lisboa em UTC+1, por isso às 21:00Z são 22:00 em
+// Lisboa — já dentro do silêncio — e 21:00 nos Açores, ainda fora dele. É
+// exatamente aqui que reavaliar com o fuso ERRADO silenciaria alguém uma hora
+// antes do que pediu.
+//
+// A entrega tem de ser nova: a anterior já foi empurrada para a manhã seguinte,
+// e uma entrega agendada para o futuro nem sequer é candidata.
+const azoresDelivery = await notifyAndFetchDelivery(
+  SCHED_PROFILE,
+  "lesson_created",
+  "8c1:fuso",
+  "2026-09-10T20:00:00Z",
+);
+check(
+  azoresDelivery.delivery?.scheduled_for.toISOString() === "2026-09-10T20:00:00.000Z",
+  "a entrega do teste de fuso nasce agendada para já",
+);
+
+const lisbonBlocks = await rows(
+  `select * from public.claim_email_deliveries(50, 300, '2026-09-10T21:00:00Z'::timestamptz)`,
+);
+check(
+  !lisbonBlocks.some((row) => row.delivery_id === azoresDelivery.delivery.id),
+  "com o fuso de Lisboa, às 22:00 locais, o silêncio já começou e a entrega não sai",
+);
+
+await db.query(`update public.profiles set timezone = 'Atlantic/Azores' where id = $1`, [
+  SCHED_PROFILE,
+]);
+// A anterior foi reagendada para o fim do silêncio LISBOETA; agora que a conta
+// está nos Açores, o horário permitido é outro e ela volta a ser candidata.
+await db.query(
+  `update public.notification_deliveries set scheduled_for = '2026-09-10T20:00:00Z'
+    where id = $1`,
+  [azoresDelivery.delivery.id],
+);
+const azoresClaim = await rows(
+  `select * from public.claim_email_deliveries(50, 300, '2026-09-10T21:00:00Z'::timestamptz)`,
+);
+check(
+  azoresClaim.some((row) => row.delivery_id === azoresDelivery.delivery.id),
+  "mudar para os Açores torna o mesmo instante enviável, porque lá ainda são 21:00",
+);
+await db.query(`select public.finalize_email_delivery($1, 'sent', 'msg_azores', null)`, [
+  azoresDelivery.delivery.id,
+]);
+await db.query(`update public.profiles set timezone = 'Europe/Lisbon' where id = $1`, [
+  SCHED_PROFILE,
+]);
+await setPreference(SCHED_PROFILE, { quiet_hours_start: null, quiet_hours_end: null });
+
 // ── SEM CONTA LIGADA NÃO HÁ AVISO, E POR ISSO NÃO HÁ EMAIL ─────────────────
 //
 // Comportamento deliberado da 8C, e não uma falha silenciosa: o email de uma

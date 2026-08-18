@@ -181,7 +181,8 @@ update public.profiles set role = 'admin' where email = 'voce@exemplo.pt';
 │   ├── ..._phase8b1_scheduler_corrections.sql Fase 8B.1: título, episódio e contagens
 │   ├── ..._phase8b2_depleted_low_balance.sql Fase 8B.2: esgotado ainda é saldo baixo
 │   ├── ..._phase8c_email_outbox.sql Fase 8C: outbox, preferências e horas de silêncio
-│   └── ..._phase8c_email_worker_schedule.sql Fase 8C: o job que acorda o worker
+│   ├── ..._phase8c_email_worker_schedule.sql Fase 8C: o job que acorda o worker
+│   └── ..._phase8c1_quiet_hours_at_claim.sql Fase 8C.1: o silêncio vale no envio
 │
 └── src/
     ├── proxy.ts             Renova a sessão e protege rotas (era middleware.ts)
@@ -681,7 +682,11 @@ Duas consequências que valem por si:
 
 **`sent` não quer dizer "chegou à caixa de entrada".** Quer dizer que o fornecedor aceitou. Não escrever no produto que o email foi entregue.
 
-**As preferências decidem duas vezes.** Uma na materialização e outra no `claim`. Quem desliga o email entre as duas não recebe o que estava em fila — mas voltar a ligar **não** ressuscita uma entrega já `skipped`: essa terminou.
+**As preferências decidem duas vezes.** Uma na materialização e outra no `claim` — e no `claim` isso inclui **as horas de silêncio**, não só o canal e o tipo. `scheduled_for` foi calculado quando o facto nasceu; quem configura silêncio depois disso tem de ser respeitado na mesma, e a reavaliação usa a mesma `email_delivery_schedule()`, que lê `profiles.timezone` no momento — por isso também apanha quem mudou de fuso. Reagendar por silêncio deixa a entrega `pending`, sem arrendamento e **sem gastar uma tentativa**.
+
+A reavaliação é só na direção segura: encurtar ou desligar o silêncio não acorda de imediato uma entrega já adiada — ela sai quando esse instante chegar. O que nunca pode acontecer é enviar dentro do silêncio configurado.
+
+Quem desliga o email entre as duas decisões não recebe o que estava em fila — mas voltar a ligar **não** ressuscita uma entrega já `skipped`: essa terminou.
 
 **Preferências novas:** `package_expiring`, `package_expired` e `package_low_balance`, a nascer ligadas, seguindo D-06 (uma coluna, não uma tabela normalizada). Só o aluno as vê: o professor não recebe avisos de pacote nenhuns, e a Action usa um schema por papel — um schema único faria o parser estrito ler a ausência desses campos no formulário do professor como `false`.
 
@@ -704,6 +709,14 @@ Duas consequências que valem por si:
 **O conteúdo vem do snapshot.** O `claim` não faz JOIN a `lessons`: um aviso de criação escrito às 18:00 não passa a dizer 20:00 porque a aula foi reagendada. Todo o texto dinâmico é escapado antes de entrar em HTML; não há imagens remotas, pixel de rastreio nem scripts. Os links vão para `/aluno/notificacoes` e `/aluno/perfil` — rotas que existem — e nunca levam token.
 
 **Dois jobs, porque são dois trabalhos.** `aulaflow-scheduled-notifications` (`5 * * * *`) produz factos; `aulaflow-email-worker` (`* * * * *`) consome o outbox. Juntá-los amarraria a produção de factos à latência do fornecedor. O job de email chama `dispatch_email_worker()`, que lê URL e token do **Vault** e faz o POST por `pg_net`. Nenhum segredo entra numa migração.
+
+**O 409 do fornecedor não se lê pelo estado.** O Resend usa-o para duas coisas opostas, e distingue-as pelo nome estruturado do erro: `concurrent_idempotent_requests` é transitório e volta a ser tentado; `invalid_idempotent_request` — mesma chave, corpo diferente — não melhora com repetição e falha logo. Um 409 desconhecido é tratado como transitório, porque a incerteza aqui é sobre concorrência e o limite de cinco tentativas impede o ciclo. Lê-se o campo, nunca uma substring da mensagem.
+
+**O worker identifica-se com `User-Agent: AulaFlow/1.0`** — explícito, estável, sem versão de ambiente nem identificadores.
+
+**A lógica do worker vive em `handler.ts`, não no entrypoint.** Autenticação, fornecedor por configurar, o ciclo reclamar→enviar→fechar e a privacidade da resposta são TypeScript puro, com dependências injetadas, testados sem rede nem segredos. O `index.ts` só liga as dependências reais. Uma falha a **fechar** não é o fornecedor ter falhado: não se inventa desfecho, a entrega fica protegida pelo arrendamento e é retomada depois.
+
+**O entrypoint Deno é verificado.** `supabase/functions/deno-env.d.ts` declara o mínimo do ambiente, e por isso `npm run lint` e `npm run typecheck` cobrem-no como ao resto do projeto. Não substitui um `deno check` — o projeto não tem Deno instalado, e a CLI do Supabase não oferece bundle sem deploy.
 
 **A Edge Function corre com `verify_jwt = false`** — quem a invoca é o `pg_cron`, não uma pessoa — e exige o cabeçalho `x-aulaflow-worker-token`, comparado com `AULAFLOW_EMAIL_WORKER_TOKEN`. Sem esse segredo configurado, recusa tudo. A resposta é um resumo (`claimed`/`sent`/`retried`/`failed`) e nunca contém endereços, corpos, identificadores nem chaves.
 

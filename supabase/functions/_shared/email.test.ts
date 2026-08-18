@@ -9,9 +9,11 @@ import {
 import {
   classifyProviderResult,
   networkFailureResult,
+  providerErrorName,
   providerIdempotencyKey,
   sanitizeProviderError,
   sendEmailViaResend,
+  USER_AGENT,
 } from "./email-transport.ts";
 
 describe("escapeHtml", () => {
@@ -109,6 +111,49 @@ describe("classifyProviderResult", () => {
     expect(classifyProviderResult(401)).toBe("failed");
     expect(classifyProviderResult(422)).toBe("failed");
   });
+
+  // O 409 é o caso em que o estado sozinho não chega: o Resend usa-o para duas
+  // situações opostas e distingue-as pelo nome do erro.
+  it("409 com pedido concorrente é transitório", () => {
+    expect(classifyProviderResult(409, "concurrent_idempotent_requests")).toBe("retry");
+  });
+
+  it("409 com a mesma chave e corpo diferente não melhora com repetição", () => {
+    expect(classifyProviderResult(409, "invalid_idempotent_request")).toBe("failed");
+  });
+
+  it("um 409 desconhecido é tratado como transitório", () => {
+    // A incerteza aqui é sobre concorrência, e um atraso custa menos do que dar
+    // por perdida uma mensagem que ainda podia sair. O limite de cinco
+    // tentativas continua a impedir um ciclo.
+    expect(classifyProviderResult(409, "algo_novo_do_fornecedor")).toBe("retry");
+    expect(classifyProviderResult(409, null)).toBe("retry");
+    expect(classifyProviderResult(409)).toBe("retry");
+  });
+});
+
+describe("providerErrorName", () => {
+  it("lê o campo estruturado, e não uma frase escrita para humanos", () => {
+    expect(providerErrorName('{"name":"invalid_idempotent_request"}')).toBe(
+      "invalid_idempotent_request",
+    );
+    expect(providerErrorName('{"type":"concurrent_idempotent_requests"}')).toBe(
+      "concurrent_idempotent_requests",
+    );
+  });
+
+  it("um corpo que não é JSON não inventa um nome", () => {
+    expect(providerErrorName("erro qualquer")).toBeNull();
+    expect(providerErrorName("")).toBeNull();
+  });
+
+  it("uma mensagem parecida não é confundida com o campo", () => {
+    // Procurar substrings numa mensagem seria frágil de uma forma que não se
+    // nota logo: o fornecedor reescreve a frase e a classificação muda.
+    expect(
+      providerErrorName('{"message":"invalid_idempotent_request algures"}'),
+    ).toBeNull();
+  });
 });
 
 describe("sanitizeProviderError", () => {
@@ -173,6 +218,46 @@ describe("sendEmailViaResend", () => {
     expect((init.headers as Record<string, string>)["Idempotency-Key"]).toBe(
       "aulaflow-email/abc",
     );
+  });
+
+  it("identifica-se com um User-Agent estável e anónimo", async () => {
+    // Explícito, e não o que o runtime acrescentaria por sua conta: esse mudaria
+    // com a versão do Deno e não identificaria o AulaFlow.
+    const fetchImpl = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: "msg_1" }), { status: 200 }),
+    );
+
+    await sendEmailViaResend(request, fetchImpl);
+
+    const init = fetchImpl.mock.calls[0]?.[1] as RequestInit;
+    const headers = init.headers as Record<string, string>;
+    expect(headers["User-Agent"]).toBe(USER_AGENT);
+    expect(USER_AGENT).toBe("AulaFlow/1.0");
+    expect(USER_AGENT).not.toMatch(/\d+\.\d+\.\d+|deno|node|@/i);
+  });
+
+  it("409 concorrente volta a ser tentado, com a mesma chave", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ name: "concurrent_idempotent_requests" }), { status: 409 }),
+    );
+
+    const result = await sendEmailViaResend(request, fetchImpl);
+
+    expect(result.outcome).toBe("retry");
+    const init = fetchImpl.mock.calls[0]?.[1] as RequestInit;
+    expect((init.headers as Record<string, string>)["Idempotency-Key"]).toBe(
+      "aulaflow-email/abc",
+    );
+  });
+
+  it("409 por corpo diferente na mesma chave é definitivo", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ name: "invalid_idempotent_request" }), { status: 409 }),
+    );
+
+    const result = await sendEmailViaResend(request, fetchImpl);
+
+    expect(result.outcome).toBe("failed");
   });
 
   it("429 volta a ser tentado", async () => {

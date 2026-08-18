@@ -25,8 +25,29 @@ export type ProviderResult = {
  *
  * Gerar um UUID novo por tentativa destruiria exatamente essa proteção.
  */
+/** O que o fornecedor vê nos registos dele. Nada de ambiente, versão ou conta. */
+export const USER_AGENT = "AulaFlow/1.0";
+
 export function providerIdempotencyKey(deliveryId: string): string {
   return `aulaflow-email/${deliveryId}`;
+}
+
+/**
+ * O identificador de erro que o Resend devolve no corpo.
+ *
+ * Só se lê o campo estruturado. Procurar substrings numa mensagem escrita para
+ * humanos é frágil de uma forma que não se nota logo: o fornecedor reescreve a
+ * frase, e o worker passa a classificar mal sem nada falhar visivelmente.
+ */
+export function providerErrorName(rawBody: string): string | null {
+  try {
+    const parsed = JSON.parse(rawBody) as { name?: unknown; type?: unknown };
+    if (typeof parsed.name === "string") return parsed.name;
+    if (typeof parsed.type === "string") return parsed.type;
+  } catch {
+    return null;
+  }
+  return null;
 }
 
 /**
@@ -38,11 +59,34 @@ export function providerIdempotencyKey(deliveryId: string): string {
  * - 4xx restantes: o pedido está errado e vai continuar errado. Endereço
  *   inválido, remetente não verificado, chave sem permissões — repetir cinco
  *   vezes não muda nenhuma dessas coisas, e só atrasa a fila.
+ *
+ * O 409 É O CASO EM QUE O ESTADO SOZINHO NÃO CHEGA.
+ *
+ * O Resend usa-o para duas situações opostas, e distingue-as pelo nome do erro:
+ *
+ *   `concurrent_idempotent_requests` — já há um pedido com esta chave a ser
+ *   processado. É transitório por definição: daqui a pouco terá acabado, e a
+ *   chave estável faz o fornecedor reconhecê-lo. RETRY.
+ *
+ *   `invalid_idempotent_request` — a mesma chave foi usada com um corpo
+ *   diferente. Repetir manda exatamente o mesmo corpo diferente, e o fornecedor
+ *   volta a recusar. Cinco vezes seguidas seria gastar tentativas a confirmar o
+ *   que já se sabe. FAILED.
+ *
+ * Um 409 que não seja nenhum dos dois é tratado como transitório: a incerteza
+ * aqui é sobre concorrência, e um atraso custa menos do que dar por perdida uma
+ * mensagem que ainda podia sair. O limite de cinco tentativas continua a impedir
+ * que isso se torne um ciclo infinito.
  */
-export function classifyProviderResult(status: number): ProviderOutcome {
+export function classifyProviderResult(status: number, errorName?: string | null): ProviderOutcome {
   if (status >= 200 && status < 300) return "sent";
   if (status === 408 || status === 429) return "retry";
   if (status >= 500) return "retry";
+
+  if (status === 409) {
+    return errorName === "invalid_idempotent_request" ? "failed" : "retry";
+  }
+
   return "failed";
 }
 
@@ -104,6 +148,11 @@ export async function sendEmailViaResend(
         Authorization: `Bearer ${request.apiKey}`,
         "Content-Type": "application/json",
         "Idempotency-Key": request.idempotencyKey,
+        // Explícito, estável e anónimo. O runtime acrescentaria algo por sua
+        // conta, mas isso mudaria com a versão do Deno e não identificaria o
+        // AulaFlow — e é o AulaFlow que o fornecedor vê nos seus registos.
+        // Sem versão de ambiente, sem identificadores, sem dados pessoais.
+        "User-Agent": USER_AGENT,
       },
       body: JSON.stringify({
         from: request.from,
@@ -117,8 +166,8 @@ export async function sendEmailViaResend(
     return networkFailureResult(error instanceof Error ? error.message : "network failure");
   }
 
-  const outcome = classifyProviderResult(response.status);
   const raw = await response.text().catch(() => "");
+  const outcome = classifyProviderResult(response.status, providerErrorName(raw));
 
   if (outcome !== "sent") {
     return { outcome, error: sanitizeProviderError(raw || `HTTP ${response.status}`) };

@@ -1374,6 +1374,18 @@ A decisão D-07 estava escrita desde a Fase 1 e explicava-se a si própria: *com
 
 **Dois jobs `pg_cron`, porque são dois trabalhos**: o da 8B produz factos de hora a hora; o da 8C consome o outbox ao minuto. Juntá-los amarraria a produção de factos à latência do fornecedor. O segredo do worker vive no Vault e é lido em cada execução — nunca numa migração.
 
+#### Corrigido na 8C.1 — o silêncio vale no instante do envio
+
+`scheduled_for` é calculado quando a notificação nasce. O `claim` reavaliava as preferências de canal e de tipo, mas não o horário, e entre as duas coisas há uma janela real: um aviso criado às 10:00 sem silêncio configurado saía às 10:01, mesmo que a pessoa tivesse pedido silêncio das 10:00 às 12:00 vinte segundos depois. A preferência mais recente é a que vale, e "não me mandes emails agora" não pode ficar um passo atrás.
+
+A reavaliação usa a **mesma** `email_delivery_schedule()` da materialização — duas cópias da regra divergiriam exatamente no caso raro — e, como ela lê `profiles.timezone` no momento da chamada, também apanha quem mudou de fuso depois do enqueue. Se o silêncio atual ainda cobre o instante, a entrega é reagendada para o fim dele e não sai no lote: continua `pending`, sem arrendamento e **sem gastar uma tentativa**.
+
+A correção é só na direção segura. Encurtar ou desligar o silêncio não acorda de imediato uma entrega já adiada; ela sai quando esse instante chegar. Um atraso não incomoda ninguém, e um trigger sobre as preferências só para adiantar emails antigos seria muita máquina para o lado que não faz mal.
+
+Corrigido na mesma passagem, do lado do transporte: o **409** do fornecedor deixou de ser lido pelo estado sozinho. `concurrent_idempotent_requests` é transitório e volta a ser tentado; `invalid_idempotent_request` falha logo, porque repetir manda o mesmo corpo diferente. O nome vem do campo estruturado, e não de uma substring da mensagem. O worker passou também a identificar-se com `User-Agent: AulaFlow/1.0`.
+
+E a lógica do worker saiu do entrypoint para `handler.ts`, com dependências injetadas: autenticação, fornecedor por configurar, o ciclo e a privacidade da resposta ficaram cobertos por testes que correm sem rede e sem segredos. Uma falha a **fechar** deixou de poder ser confundida com o fornecedor ter falhado. O entrypoint Deno, que estava fora do `tsc` e do ESLint, passou a ser verificado por ambos através de `supabase/functions/deno-env.d.ts`.
+
 #### O que ficou por verificar
 
 O projeto de desenvolvimento **não tem `RESEND_API_KEY`, remetente verificado nem os segredos da Edge Function configurados**, e criar uma conta no fornecedor em nome do utilizador não é decisão de quem implementa. Toda a lógica está validada contra um transporte simulado — sucesso, 429, 500, falha de rede, 422 definitivo, limite de tentativas, arrendamento expirado e concorrência —, mas **não houve envio real**.

@@ -1570,6 +1570,30 @@ checks as (
 
   union all
   select
+    'contrato',
+    'o silencio e reavaliado no claim, e nao so na materializacao (8C.1)',
+    (
+      select count(*) from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+      where n.nspname = 'public'
+        and p.proname = 'claim_email_deliveries'
+        and p.prosrc like '%email_delivery_schedule%'
+    ) = 1,
+    'ok'
+
+  union all
+  select
+    'contrato',
+    'reagendar por silencio nao gasta uma tentativa',
+    (
+      select count(*) from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+      where n.nspname = 'public'
+        and p.proname = 'claim_email_deliveries'
+        and p.prosrc !~ 'attempts\s*=\s*attempts'
+    ) = 1,
+    'ok'
+
+  union all
+  select
     'estrutura',
     'existem exatamente dois jobs agendados',
     (select count(*) from cron.job) = 2,
