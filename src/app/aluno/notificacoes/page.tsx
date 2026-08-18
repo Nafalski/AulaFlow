@@ -105,6 +105,7 @@ export default async function StudentNotificationsPage() {
               return (
                 <li
                   key={notification.id}
+                  data-notification-id={notification.id}
                   data-unread={isUnread ? "true" : "false"}
                   className={`rounded-[var(--radius-card)] border bg-surface p-4 shadow-card ${
                     isUnread ? "border-brand/40" : "border-line"

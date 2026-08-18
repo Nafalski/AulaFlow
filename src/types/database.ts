@@ -85,7 +85,11 @@ export type NotificationType =
   | "lesson_reminder_2h"
   | "confirmation_requested"
   | "account_blocked"
-  | "account_reactivated";
+  | "account_reactivated"
+  // Avisos produzidos pelo agendador (Etapa 8B).
+  | "package_expiring"
+  | "package_expired"
+  | "package_low_balance";
 
 export type NotificationChannel = "in_app" | "email" | "whatsapp";
 

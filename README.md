@@ -76,7 +76,7 @@ Instruções completas — incluindo a configuração do Supabase — em [`AGENT
 
 `/professor/clubes` gere contextos, clubes e membros; `/professor/clubes/[id]/calendario` mostra a disponibilidade partilhada do clube; `/professor/convites` mostra os convites recebidos. `/professor/pacotes` gere modelos reutilizáveis, atribuição, consulta e ajustes administrativos dos pacotes atribuídos. `/professor/pacotes/historico` mostra a auditoria global. `/professor/definicoes/disponibilidade` guarda a fonte de verdade da agenda do professor. `/professor/calendario` e `/aluno/calendario` mostram disponibilidade e aulas em Dia/Semana/Mês. `/aluno/pacotes` mostra apenas os próprios pacotes e movimentos básicos.
 
-A **Etapa 8A** ligou a fundação de notificações que existia desde a Fase 1: marcar, reagendar ou cancelar uma aula deixa um aviso na caixa do aluno, com o horário do momento em que aconteceu. Os avisos marcam-se como lidos e o sino mostra quantos faltam. **Nenhum email, push ou WhatsApp é enviado** — a entrega externa é a 8C, e o agendador de lembretes, saldo baixo e expiração é a 8B. O professor independente continua totalmente suportado, com workspace pessoal privado e agenda própria, e não precisa criar clube nenhum.
+A **Etapa 8A** ligou a fundação de notificações que existia desde a Fase 1: marcar, reagendar ou cancelar uma aula deixa um aviso na caixa do aluno, com o horário do momento em que aconteceu. Os avisos marcam-se como lidos e o sino mostra quantos faltam. A **Etapa 8B** acrescentou o agendador: um trabalho no próprio PostgreSQL corre de hora a hora e envia lembretes na véspera e duas horas antes, avisa quando um pacote está a acabar ou a expirar, e dá por expirado o pacote cuja validade passou — sem mexer em créditos nenhuns. **Nenhum email, push ou WhatsApp é enviado** — a entrega externa é a 8C. O professor independente continua totalmente suportado, com workspace pessoal privado e agenda própria, e não precisa criar clube nenhum.
 
 Entrar num clube **não** partilha a agenda: `calendar_sharing_enabled` nasce desativado e só o próprio membro o altera — proprietários, gestores e a administração da plataforma não têm caminho para forçar a partilha de outra pessoa. Os locais e os seus campos já são partilhados com o clube; alunos, pacotes, turmas e disponibilidade continuam ligados ao workspace pessoal, e a interface diz isso explicitamente em vez de o esconder.
 
@@ -84,7 +84,7 @@ Criar ou reagendar uma aula impede sobreposição de aulas ativas do professor, 
 
 Ainda não existe política configurável de cancelamento, janela de 12h/24h, cancelamento self-service do aluno, reativação de participação cancelada, notificações nem pagamentos.
 
-Sem um bucket de Storage configurado, os avatares usam iniciais. Preparar a ligação de um aluno ainda não envia email sem um Supabase remoto; a interface identifica essa limitação. As preferências de email ficam guardadas, mas a entrega automática e os lembretes agendados pertencem à Fase 8.
+Sem um bucket de Storage configurado, os avatares usam iniciais. Preparar a ligação de um aluno ainda não envia email sem um Supabase remoto; a interface identifica essa limitação. As preferências de email ficam guardadas, mas quem as vai ler é o worker de entrega da Etapa 8C: os lembretes da 8B aparecem dentro da aplicação e não são enviados para fora.
 
 ## Stack
 

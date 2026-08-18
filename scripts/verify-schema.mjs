@@ -12646,6 +12646,643 @@ check(
   "marcar todos como lidos limpa o aviso antigo e zera o contador",
 );
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Fase 8B — o tempo produz avisos
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Nenhum teste desta secção depende da hora a que a suite corre: o runner recebe
+// o instante. É por isso que não há `sleep()` nem espera por cron nenhum.
+
+const runScheduler = (now) =>
+  one(`select public.run_scheduled_notifications($1::timestamptz) as result`, [now]);
+
+const notificationsOfType = (profileId, type) =>
+  rows(
+    `select id, title, body, payload, dedupe_key
+       from public.notifications
+      where recipient_profile_id = $1 and type = $2::public.notification_type
+      order by created_at`,
+    [profileId, type],
+  );
+
+// O mesmo aluno tem vários pacotes nesta secção. Contar todos os avisos de um
+// tipo misturaria episódios independentes.
+const packageNotifications = (profileId, type, packageId) =>
+  rows(
+    `select id, title, body, payload, dedupe_key
+       from public.notifications
+      where recipient_profile_id = $1
+        and type = $2::public.notification_type
+        and dedupe_key like '%:' || $3::text || ':%'
+      order by created_at`,
+    [profileId, type, packageId],
+  );
+
+const packageStatusOf = async (packageId) =>
+  (await one(`select status::text, credits_available, credits_reserved, credits_used
+                from public.student_packages where id = $1`, [packageId]));
+
+// Um aluno próprio para a 8B: as contagens desta secção não podem ser
+// perturbadas pelos avisos que as fases anteriores deixaram na caixa da Ana.
+const SCHED_UID = "5b5b5b5b-5b5b-5b5b-5b5b-5b5b5b5b5b5b";
+await db.query(
+  `insert into auth.users (id, email, email_confirmed_at, raw_user_meta_data)
+   values ($1,'agendado@exemplo.pt', now(), '{"full_name":"Aluno Agendado","role":"student"}'::jsonb)
+   on conflict (id) do nothing`,
+  [SCHED_UID],
+);
+const schedStudent = await one(
+  `insert into public.student_profiles (organization_id, created_by_teacher_id, full_name, email)
+   values ($1,$2,'Aluno Agendado','agendado@exemplo.pt') returning id`,
+  [org, teacher.id],
+);
+await db.query(`update public.student_profiles set profile_id = $1 where id = $2`, [
+  SCHED_UID,
+  schedStudent.id,
+]);
+
+// ── Expiração automática ───────────────────────────────────────────────────
+
+const schedPack = await assignPackageAs(TEACHER_UID, {
+  student: schedStudent.id,
+  name: "Pacote a expirar 8B",
+  credits: 10,
+  sportId: sport,
+  starts: "2026-01-01",
+  expires: "2027-10-10",
+});
+
+// Uma reserva viva: expirar não pode fazê-la desaparecer.
+const schedLesson = await reschedulableLesson({
+  title: "Aula do pacote a expirar 8B",
+  start: "2027-10-05 09:00+00",
+  end: "2027-10-05 10:00+00",
+  students: [[schedStudent.id, schedPack.id]],
+});
+void schedLesson;
+
+const beforeExpiry = await packageStatusOf(schedPack.id);
+await runScheduler("2027-10-10T12:00:00Z");
+const onLastDay = await packageStatusOf(schedPack.id);
+check(
+  onLastDay.status === "active",
+  "no último dia de validade o pacote continua ativo",
+  `estado ${onLastDay.status}`,
+);
+check(
+  (await notificationsOfType(SCHED_UID, "package_expired")).length === 0,
+  "no último dia ainda não há aviso de pacote expirado",
+);
+
+await runScheduler("2027-10-11T12:00:00Z");
+const afterExpiry = await packageStatusOf(schedPack.id);
+check(afterExpiry.status === "expired", "no dia seguinte o pacote fica expirado");
+check(
+  afterExpiry.credits_available === beforeExpiry.credits_available &&
+    afterExpiry.credits_reserved === beforeExpiry.credits_reserved &&
+    afterExpiry.credits_used === beforeExpiry.credits_used,
+  "expirar muda o estado e não mexe em nenhum dos três saldos",
+);
+check(
+  afterExpiry.credits_reserved > 0,
+  "a reserva de uma aula já marcada sobrevive à expiração",
+);
+
+const expiredNotifications = await notificationsOfType(SCHED_UID, "package_expired");
+check(
+  expiredNotifications.length === 1 &&
+    expiredNotifications[0].body.includes("10/10/2027"),
+  "o aluno recebe um aviso de pacote expirado com a data da validade",
+);
+check(
+  !("student_package_id" in (expiredNotifications[0]?.payload ?? {})) &&
+    !("organization_id" in (expiredNotifications[0]?.payload ?? {})) &&
+    !("paid_amount_cents" in (expiredNotifications[0]?.payload ?? {})),
+  "o aviso de pacote não expõe identificadores internos nem valores",
+);
+
+// Repetir o runner não duplica nem mexe mais no estado.
+await runScheduler("2027-10-11T13:00:00Z");
+await runScheduler("2027-10-12T12:00:00Z");
+check(
+  (await notificationsOfType(SCHED_UID, "package_expired")).length === 1,
+  "correr o runner outra vez não duplica o aviso de expiração",
+);
+
+// ── A expiração não escreve no livro-razão ─────────────────────────────────
+
+const ledgerBeforeExpiryRun = await ledgerRows();
+const schedPack2 = await assignPackageAs(TEACHER_UID, {
+  student: schedStudent.id,
+  name: "Pacote sem movimento 8B",
+  credits: 4,
+  sportId: sport,
+  starts: "2026-01-01",
+  expires: "2027-11-01",
+});
+const ledgerAfterAssign = await ledgerRows();
+await runScheduler("2027-11-02T12:00:00Z");
+check(
+  (await packageStatusOf(schedPack2.id)).status === "expired" &&
+    (await ledgerRows()) === ledgerAfterAssign,
+  "expirar não escreve nenhuma movimentação no livro-razão",
+);
+void ledgerBeforeExpiryRun;
+
+// ── Estados decididos por uma pessoa não são tocados ───────────────────────
+
+const sched_suspendedPack = await assignPackageAs(TEACHER_UID, {
+  student: schedStudent.id,
+  name: "Pacote suspenso 8B",
+  credits: 5,
+  sportId: sport,
+  starts: "2026-01-01",
+  expires: "2027-12-01",
+});
+await db.query(`update public.student_packages set status = 'suspended' where id = $1`, [
+  sched_suspendedPack.id,
+]);
+const sched_cancelledPack = await assignPackageAs(TEACHER_UID, {
+  student: schedStudent.id,
+  name: "Pacote cancelado 8B",
+  credits: 5,
+  sportId: sport,
+  starts: "2026-01-01",
+  expires: "2027-12-01",
+});
+await db.query(`update public.student_packages set status = 'cancelled' where id = $1`, [
+  sched_cancelledPack.id,
+]);
+
+await runScheduler("2027-12-05T12:00:00Z");
+check(
+  (await packageStatusOf(sched_suspendedPack.id)).status === "suspended" &&
+    (await packageStatusOf(sched_cancelledPack.id)).status === "cancelled",
+  "o agendador não expira nem reativa pacotes suspensos ou cancelados",
+);
+check(
+  (await notificationsOfType(SCHED_UID, "package_expiring")).every(
+    (row) => !row.body.includes("suspenso") && !row.body.includes("cancelado"),
+  ),
+  "pacotes suspensos e cancelados não geram avisos de validade",
+);
+
+// ── `depleted` mantém a prioridade que já tinha ────────────────────────────
+
+const sched_depletedPack = await assignPackageAs(TEACHER_UID, {
+  student: schedStudent.id,
+  name: "Pacote esgotado 8B",
+  credits: 1,
+  sportId: sport,
+  starts: "2026-01-01",
+  expires: "2027-12-20",
+});
+await db.query(
+  `update public.student_packages
+      set credits_available = 0, credits_reserved = 0, credits_used = 1
+    where id = $1`,
+  [sched_depletedPack.id],
+);
+await runScheduler("2027-12-25T12:00:00Z");
+check(
+  (await packageStatusOf(sched_depletedPack.id)).status === "depleted",
+  "um pacote sem saldo fica esgotado, e não expirado: a prioridade não mudou",
+);
+
+// ── Aviso de validade próxima ──────────────────────────────────────────────
+
+const sched_expiringPack = await assignPackageAs(TEACHER_UID, {
+  student: schedStudent.id,
+  name: "Pacote com validade próxima 8B",
+  credits: 8,
+  sportId: sport,
+  starts: "2026-01-01",
+  expires: "2028-03-10",
+});
+
+await runScheduler("2028-03-01T12:00:00Z");
+check(
+  (await packageNotifications(SCHED_UID, "package_expiring", sched_expiringPack.id)).length === 0,
+  "a oito dias da validade ainda não há aviso",
+);
+
+await runScheduler("2028-03-03T12:00:00Z");
+const expiringFirst = await packageNotifications(
+  SCHED_UID,
+  "package_expiring",
+  sched_expiringPack.id,
+);
+check(
+  expiringFirst.length === 1 && expiringFirst[0].body.includes("10/03/2028"),
+  "a sete dias da validade o aluno é avisado",
+);
+
+await runScheduler("2028-03-09T12:00:00Z");
+await runScheduler("2028-03-10T12:00:00Z");
+check(
+  (await packageNotifications(SCHED_UID, "package_expiring", sched_expiringPack.id)).length === 1,
+  "o aviso de validade não se repete todos os dias",
+);
+
+// Corrigir a validade rearma o aviso: é outra data, é outro episódio.
+await db.query(`update public.student_packages set expires_on = '2028-06-20' where id = $1`, [
+  sched_expiringPack.id,
+]);
+await runScheduler("2028-03-11T12:00:00Z");
+check(
+  (await packageNotifications(SCHED_UID, "package_expiring", sched_expiringPack.id)).length === 1,
+  "estender a validade não gera aviso enquanto a nova data estiver longe",
+);
+await runScheduler("2028-06-15T12:00:00Z");
+const expiringAfterExtension = await packageNotifications(
+  SCHED_UID,
+  "package_expiring",
+  sched_expiringPack.id,
+);
+check(
+  expiringAfterExtension.length === 2 &&
+    expiringAfterExtension[1].body.includes("20/06/2028"),
+  "quando a nova validade se aproxima, há um aviso novo e legítimo",
+);
+
+// ── Saldo baixo: episódios, não repetição diária ───────────────────────────
+
+const sched_lowPack = await assignPackageAs(TEACHER_UID, {
+  student: schedStudent.id,
+  name: "Pacote de saldo 8B",
+  credits: 5,
+  sportId: sport,
+  starts: "2026-01-01",
+  expires: "2029-12-31",
+});
+
+// Um pacote pequeno acabado de atribuir NÃO é saldo baixo: vender duas aulas não
+// é o mesmo que ficar quase sem aulas.
+const sched_smallPack = await assignPackageAs(TEACHER_UID, {
+  student: schedStudent.id,
+  name: "Pacote pequeno 8B",
+  credits: 2,
+  sportId: sport,
+  starts: "2026-01-01",
+  expires: "2029-12-31",
+});
+void sched_smallPack;
+await runScheduler("2026-08-20T12:00:00Z");
+check(
+  (await notificationsOfType(SCHED_UID, "package_low_balance")).length === 0,
+  "atribuir um pacote de duas aulas não dispara aviso de saldo baixo",
+);
+
+const spendCredits = async (packageId, quantity, reason) => {
+  await asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.admin_adjust_package_credits($1,$2,$3,$4::uuid)`, [
+      packageId,
+      -quantity,
+      reason,
+      randomUUID(),
+    ]),
+  );
+};
+
+// 5 → 3: ainda fora da faixa baixa.
+await spendCredits(sched_lowPack.id, 2, "Ajuste de teste 8B");
+await runScheduler("2026-08-21T12:00:00Z");
+check(
+  (await notificationsOfType(SCHED_UID, "package_low_balance")).length === 0,
+  "descer de 5 para 3 não avisa: 3 ainda não é saldo baixo",
+);
+
+// 3 → 2: a queda para a faixa baixa.
+await spendCredits(sched_lowPack.id, 1, "Ajuste de teste 8B");
+await runScheduler("2026-08-22T12:00:00Z");
+const lowFirst = await notificationsOfType(SCHED_UID, "package_low_balance");
+check(
+  lowFirst.length === 1 && lowFirst[0].body.includes("Restam 2 aulas"),
+  "descer de 3 para 2 avisa uma vez, e diz quantas restam",
+);
+
+// 2 → 1 → 0: mesmo episódio, sem repetir.
+await spendCredits(sched_lowPack.id, 1, "Ajuste de teste 8B");
+await runScheduler("2026-08-23T12:00:00Z");
+await spendCredits(sched_lowPack.id, 1, "Ajuste de teste 8B");
+await runScheduler("2026-08-24T12:00:00Z");
+check(
+  (await notificationsOfType(SCHED_UID, "package_low_balance")).length === 1,
+  "continuar a descer dentro da faixa baixa não gera avisos novos",
+);
+await runScheduler("2026-08-25T12:00:00Z");
+check(
+  (await notificationsOfType(SCHED_UID, "package_low_balance")).length === 1,
+  "correr o runner outra vez não repete o aviso de saldo baixo",
+);
+
+// Repor créditos rearma; voltar a cair avisa outra vez.
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(`select public.admin_adjust_package_credits($1,$2,$3,$4::uuid)`, [
+    sched_lowPack.id,
+    5,
+    "Reposição de teste 8B",
+    randomUUID(),
+  ]),
+);
+await runScheduler("2026-08-26T12:00:00Z");
+check(
+  (await notificationsOfType(SCHED_UID, "package_low_balance")).length === 1,
+  "repor créditos não gera aviso nenhum",
+);
+
+await spendCredits(sched_lowPack.id, 3, "Ajuste de teste 8B");
+await runScheduler("2026-08-27T12:00:00Z");
+check(
+  (await notificationsOfType(SCHED_UID, "package_low_balance")).length === 2,
+  "cair outra vez na faixa baixa é um episódio novo, e avisa outra vez",
+);
+
+// ── Lembretes de aula ──────────────────────────────────────────────────────
+
+const reminderPack = await assignPackageAs(TEACHER_UID, {
+  student: schedStudent.id,
+  name: "Pacote de lembretes 8B",
+  credits: 20,
+  sportId: sport,
+  starts: "2026-01-01",
+  expires: "2029-12-31",
+});
+
+const reminderLesson = async (title, start, end) =>
+  reschedulableLesson({
+    title,
+    start,
+    end,
+    students: [[schedStudent.id, reminderPack.id]],
+  });
+
+await reminderLesson(
+  "Aula com lembrete 8B",
+  "2029-05-10 10:00+00",
+  "2029-05-10 11:00+00",
+);
+
+// A 25 horas ainda não é altura.
+await runScheduler("2029-05-09T09:00:00Z");
+check(
+  (await notificationsOfType(SCHED_UID, "lesson_reminder_24h")).length === 0,
+  "a 25 horas da aula ainda não há lembrete",
+);
+
+// A 23 horas, sim.
+await runScheduler("2029-05-09T11:00:00Z");
+const reminder24 = await notificationsOfType(SCHED_UID, "lesson_reminder_24h");
+check(
+  reminder24.length === 1 && reminder24[0].body.includes("10/05/2029"),
+  "a 23 horas o aluno recebe o lembrete de 24h",
+);
+
+// Repetir o runner dentro da mesma janela não duplica.
+await runScheduler("2029-05-09T15:00:00Z");
+await runScheduler("2029-05-10T07:00:00Z");
+check(
+  (await notificationsOfType(SCHED_UID, "lesson_reminder_24h")).length === 1,
+  "o lembrete de 24h não se repete a cada passagem",
+);
+
+// A 1h30, o lembrete de 2h — que é outro evento, não uma duplicação.
+await runScheduler("2029-05-10T08:30:00Z");
+const reminder2 = await notificationsOfType(SCHED_UID, "lesson_reminder_2h");
+check(reminder2.length === 1, "perto da hora o aluno recebe o lembrete de 2h");
+check(
+  (await notificationsOfType(SCHED_UID, "lesson_reminder_24h")).length === 1,
+  "o lembrete de 2h não duplica o de 24h: são eventos diferentes",
+);
+await runScheduler("2029-05-10T09:30:00Z");
+check(
+  (await notificationsOfType(SCHED_UID, "lesson_reminder_2h")).length === 1,
+  "o lembrete de 2h também não se repete",
+);
+
+// Uma aula marcada em cima da hora não recebe um "faltam 24 horas" absurdo.
+const lastMinuteLesson = await reminderLesson(
+  "Aula em cima da hora 8B",
+  "2029-06-07 10:00+00",
+  "2029-06-07 11:00+00",
+);
+await runScheduler("2029-06-07T09:00:00Z");
+check(
+  (
+    await rows(
+      `select id from public.notifications
+        where recipient_profile_id=$1 and lesson_id=$2
+          and type = 'lesson_reminder_24h'::public.notification_type`,
+      [SCHED_UID, lastMinuteLesson.id],
+    )
+  ).length === 0,
+  "uma aula marcada a uma hora do início não recebe lembrete de 24h",
+);
+
+// Aula passada, cancelada e original reagendada não geram lembrete.
+const sched_pastLesson = await reminderLesson(
+  "Aula já passada 8B",
+  "2029-07-05 10:00+00",
+  "2029-07-05 11:00+00",
+);
+await runScheduler("2029-07-06T10:00:00Z");
+
+const sched_cancelledLesson = await reminderLesson(
+  "Aula cancelada 8B",
+  "2029-08-09 10:00+00",
+  "2029-08-09 11:00+00",
+);
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(`select public.cancel_lesson($1)`, [sched_cancelledLesson.id]),
+);
+
+// A original fica DENTRO da janela do lembrete de propósito: o que a exclui tem
+// de ser o estado `rescheduled`, e não o facto de já ter passado.
+// 2029-09-10 é uma segunda-feira, que é o dia em que o professor de teste tem
+// disponibilidade declarada.
+const toRescheduleLesson = await reminderLesson(
+  "Aula a reagendar 8B",
+  "2029-09-10 10:00+00",
+  "2029-09-10 11:00+00",
+);
+const rescheduledReplacement = await rescheduleAs(TEACHER_UID, {
+  lessonId: toRescheduleLesson.id,
+  start: "2029-09-10 14:00+00",
+  end: "2029-09-10 15:00+00",
+  reason: "Mudar de hora antes do lembrete",
+  idempotencyKey: randomUUID(),
+});
+
+await runScheduler("2029-08-08T11:00:00Z");
+await runScheduler("2029-09-09T15:00:00Z");
+
+const remindersFor = async (lessonId) =>
+  rows(
+    `select type::text from public.notifications
+      where recipient_profile_id=$1 and lesson_id=$2
+        and type in ('lesson_reminder_24h','lesson_reminder_2h')`,
+    [SCHED_UID, lessonId],
+  );
+
+check(
+  (await remindersFor(sched_pastLesson.id)).length === 0,
+  "uma aula que já aconteceu não gera lembrete",
+);
+check(
+  (await remindersFor(sched_cancelledLesson.id)).length === 0,
+  "uma aula cancelada não gera lembrete",
+);
+check(
+  (await remindersFor(toRescheduleLesson.id)).length === 0,
+  "a aula original de um reagendamento não gera lembrete",
+);
+check(
+  (await remindersFor(rescheduledReplacement.id)).length === 1,
+  "a aula substituta gera lembrete normalmente",
+);
+
+// Participação cancelada não recebe lembrete; o colega recebe o dele.
+// Pacotes próprios com validade longa: correr o agendador em 2029 expira todos
+// os pacotes das fases anteriores, e uma reserva num pacote expirado é recusada.
+const reminderAnaPack = await assignPackageAs(TEACHER_UID, {
+  student: ana.id,
+  name: "Pacote lembrete turma Ana 8B",
+  credits: 5,
+  sportId: sport,
+  starts: "2026-01-01",
+  expires: "2031-12-31",
+});
+const reminderBrunoPack = await assignPackageAs(TEACHER_UID, {
+  student: bruno.id,
+  name: "Pacote lembrete turma Bruno 8B",
+  credits: 5,
+  sportId: sport,
+  starts: "2026-01-01",
+  expires: "2031-12-31",
+});
+const groupReminderLesson = await reschedulableLesson({
+  title: "Turma com lembrete 8B",
+  start: "2029-10-04 10:00+00",
+  end: "2029-10-04 11:00+00",
+  groupId: managedGroup.id,
+  students: [
+    [ana.id, reminderAnaPack.id],
+    [bruno.id, reminderBrunoPack.id],
+  ],
+});
+const groupReminderParticipant = await one(
+  `select id from public.lesson_participants where lesson_id=$1 and student_id=$2`,
+  [groupReminderLesson.id, bruno.id],
+);
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(`select public.cancel_lesson_participation($1,$2)`, [
+    groupReminderLesson.id,
+    groupReminderParticipant.id,
+  ]),
+);
+await runScheduler("2029-10-03T11:00:00Z");
+
+const anaGroupReminders = await rows(
+  `select id from public.notifications
+    where recipient_profile_id=$1 and lesson_id=$2
+      and type = 'lesson_reminder_24h'::public.notification_type`,
+  [ANA_UID, groupReminderLesson.id],
+);
+const brunoGroupReminders = await rows(
+  `select id from public.notifications
+    where recipient_profile_id=$1 and lesson_id=$2
+      and type = 'lesson_reminder_24h'::public.notification_type`,
+  [BRUNO_UID, groupReminderLesson.id],
+);
+check(
+  anaGroupReminders.length === 1 && brunoGroupReminders.length === 0,
+  "numa turma, quem continua inscrito recebe lembrete e quem cancelou não",
+);
+
+const anaGroupReminderRow = await one(
+  `select payload, body from public.notifications where id = $1`,
+  [anaGroupReminders[0]?.id],
+);
+check(
+  !JSON.stringify(anaGroupReminderRow.payload).includes(bruno.id) &&
+    !JSON.stringify(anaGroupReminderRow.payload).includes("package"),
+  "o lembrete de turma não menciona colegas nem pacotes",
+);
+
+// ── O runner é interno ─────────────────────────────────────────────────────
+
+await mustReject("um aluno não corre o agendador", () =>
+  asDatabaseRole("authenticated", ANA_UID, () =>
+    db.query(`select public.run_scheduled_notifications(now())`),
+  ),
+);
+await mustReject("um professor não corre o agendador", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select public.run_scheduled_notifications(now())`),
+  ),
+);
+await mustReject("um administrador não corre o agendador", () =>
+  asDatabaseRole("authenticated", ADMIN_UID, () =>
+    db.query(`select public.run_scheduled_notifications(now())`),
+  ),
+);
+await mustReject("anónimo não corre o agendador", () =>
+  asDatabaseRole("anon", null, () =>
+    db.query(`select public.run_scheduled_notifications(now())`),
+  ),
+);
+
+const schedulerFunctionGrants = await rows(
+  `select proc.proname from pg_proc proc
+     join pg_namespace ns on ns.oid = proc.pronamespace
+    where ns.nspname='public'
+      and proc.proname in ('run_scheduled_notifications','record_package_notification')
+      and (has_function_privilege('authenticated', proc.oid, 'EXECUTE')
+        or has_function_privilege('anon', proc.oid, 'EXECUTE'))`,
+);
+check(
+  schedulerFunctionGrants.length === 0,
+  "nem o agendador nem o escritor de avisos de pacote têm EXECUTE para o cliente",
+);
+
+// ── A data civil é a portuguesa, não a UTC ─────────────────────────────────
+//
+// 00:30 em Lisboa no verão é ainda 23:30 do dia anterior em UTC. Um pacote que
+// venceu ontem em Portugal tem de estar expirado — e `current_date` diria que
+// ainda estamos ontem.
+
+check(
+  (await one(`select public.lisbon_date('2027-07-15T23:30:00Z'::timestamptz) as day`)).day
+    .toISOString()
+    .startsWith("2027-07-16"),
+  "meia-noite e meia em Lisboa já é o dia seguinte, mesmo sendo 23:30 UTC",
+);
+check(
+  (await one(`select public.lisbon_date('2027-01-15T23:30:00Z'::timestamptz) as day`)).day
+    .toISOString()
+    .startsWith("2027-01-15"),
+  "no inverno Lisboa coincide com UTC, e a data não salta",
+);
+
+const sched_winterPack = await assignPackageAs(TEACHER_UID, {
+  student: schedStudent.id,
+  name: "Pacote de fuso 8B",
+  credits: 3,
+  sportId: sport,
+  starts: "2026-01-01",
+  expires: "2027-07-15",
+});
+await runScheduler("2027-07-15T22:00:00Z");
+check(
+  (await packageStatusOf(sched_winterPack.id)).status === "active",
+  "às 23:00 de Lisboa do último dia o pacote ainda é válido",
+);
+await runScheduler("2027-07-15T23:30:00Z");
+check(
+  (await packageStatusOf(sched_winterPack.id)).status === "expired",
+  "passada a meia-noite de Lisboa o pacote expira, mesmo antes da meia-noite UTC",
+);
+
 // ── Resultado ────────────────────────────────────────────────────────────────
 
 console.log(

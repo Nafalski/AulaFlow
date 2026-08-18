@@ -2260,7 +2260,11 @@ try {
       // criar qualquer fixture, por isso tudo o que existe aqui e de execucoes
       // anteriores — incluindo as de hoje. Filtrar por data de criacao deixava
       // a banda entupida com o lixo das execucoes do proprio dia.
-      .gte("exception_date", dateOnlyFromNow(150));
+      // O piso desceu de 150 para 100 dias: as bandas usadas pelos seletores
+      // começam nos 120, e reciclar só acima dos 150 deixava-as encher até
+      // "Sem data E2E livre". As fixtures dedicadas do calendário continuam
+      // protegidas pelas notas, e a da 5D2 volta a ficar ativa sozinha.
+      .gte("exception_date", dateOnlyFromNow(100));
     if (stale.error) {
       throw new Error(`Reformar excecoes E2E: ${summarizeError(stale.error)}`);
     }
@@ -2802,12 +2806,30 @@ try {
     // `${keyPrefix}:${runId}` fixo, a primeira execucao de sempre fixava a
     // janela e nenhuma execucao seguinte a conseguia alargar. Uma janela
     // diferente e uma intencao diferente, e tem de ter chave diferente.
+    // `p_exception_id` e `p_is_active` sao o que torna isto durável: a RPC é
+    // idempotente pela chave, por isso uma exceção que foi REFORMADA continuaria
+    // inativa para sempre se o upsert seguinte não a apontasse explicitamente.
+    const existingForKey = await supabase
+      .from("teacher_availability_exception_records")
+      .select("id")
+      .eq("exception_date", dateOnly)
+      .eq("mode", "replace")
+      .eq("starts_at", `${startsAt}:00`)
+      .eq("ends_at", `${endsAt}:00`)
+      .order("created_at", { ascending: true })
+      .limit(1);
+    if (existingForKey.error) {
+      throw new Error(`${label}: excecao existente: ${summarizeError(existingForKey.error)}`);
+    }
+
     const { error } = await supabase.rpc("upsert_teacher_availability_exception", {
       p_exception_date: dateOnly,
       p_starts_at: startsAt,
       p_ends_at: endsAt,
       p_mode: "replace",
       p_idempotency_key: deterministicUuid(`${keyPrefix}:${runId}:${startsAt}-${endsAt}`),
+      p_exception_id: existingForKey.data?.[0]?.id ?? null,
+      p_is_active: true,
     });
     if (error) throw new Error(`${label}: ${summarizeError(error)}`);
   };
@@ -3840,7 +3862,10 @@ try {
       }
       retired += 1;
     }
-    if (retired > 0) {
+    // Sempre, mesmo com zero: uma linha que so aparece quando ha trabalho faz o
+    // total da suite oscilar entre execucoes, e um total que oscila e um total
+    // em que ninguem repara quando desce.
+    {
       ok(`Fixtures 6C do Professor B retiradas (${retired})`);
     }
   };
@@ -6410,7 +6435,10 @@ try {
   // RSVP nao e presenca. Esta seccao existe sobretudo para provar, com JWTs
   // reais, que confirmar NAO escreve em attendance e NAO mexe em creditos.
 
-  const phase7aDate = dateOnlyFromNow(await pickUnusedAvailabilityOffset(120, 150));
+  // Banda própria, longe das já ocupadas: a 8A usa 155–185, a 6C.1 usa 280–316,
+  // e a antiga 120–150 encheu-se de aulas de execuções anteriores que nenhum
+  // retirement varre.
+  const phase7aDate = dateOnlyFromNow(await pickUnusedAvailabilityOffset(200, 240));
   await prepareException(
     teacherClient,
     "Disponibilidade 7A",
@@ -7198,6 +7226,133 @@ try {
       notifyParticipant.credits_consumed === 0 &&
       notifyParticipant.attendance_status === null,
     "Os avisos nao criaram presenca nem consumo: o credito voltou pelo cancelamento",
+  );
+
+  section("Trabalho agendado de notificacoes (8B)");
+
+  // O runner e interno. Nenhuma destas sessoes o pode chamar — e e isso que
+  // impede alguem de mexer no relogio do dominio passando um `p_now` a escolha.
+  await mustReject("Aluno nao corre o agendador", async () =>
+    studentClient.rpc("run_scheduled_notifications"),
+  );
+  await mustReject("Professor nao corre o agendador", async () =>
+    teacherClient.rpc("run_scheduled_notifications"),
+  );
+  await mustReject("Admin nao corre o agendador", async () =>
+    adminClient.rpc("run_scheduled_notifications"),
+  );
+  await mustReject("Anonimo nao corre o agendador", async () =>
+    anonClient.rpc("run_scheduled_notifications"),
+  );
+  await mustReject("Aluno nao passa um instante ao agendador", async () =>
+    studentClient.rpc("run_scheduled_notifications", {
+      p_now: new Date(Date.now() + 86_400_000).toISOString(),
+    }),
+  );
+  await mustReject("Aluno nao escreve avisos de pacote", async () =>
+    studentClient.rpc("record_package_notification"),
+  );
+
+  // Uma aula proxima o suficiente para o lembrete de 24h ser elegivel, criada
+  // pelo contrato oficial. O agendador do remoto corre de hora a hora; aqui
+  // exercita-se o contrato, nao o relogio.
+  // A data da 8A ja tem janela preparada, e este teste nao corre o agendador:
+  // verifica o CONTRATO — que o lembrete ainda nao existe e que ninguem de fora
+  // consegue chamar o runner.
+  const reminderSlot = phase8aSlot(4);
+  const reminderDate = phase8aDate;
+
+  const { data: reminderLessonId, error: reminderLessonError } = await createLesson(
+    teacherClient,
+    {
+      p_starts_at: lisbonInstant(reminderDate, reminderSlot.startsAt),
+      p_ends_at: lisbonInstant(reminderDate, reminderSlot.endsAt),
+      p_title: `Aula E2E 8B lembrete ${phase6RunSuffix}`,
+      p_location_id: null,
+      p_location_resource_id: null,
+      p_student_id: studentsA.id,
+      p_idempotency_key: deterministicUuid(`lesson-8b-reminder:${phase6RunSuffix}`),
+    },
+  );
+  if (reminderLessonError || !reminderLessonId) {
+    throw new Error(`Aula de lembrete 8B: ${summarizeError(reminderLessonError)}`);
+  }
+
+  const reminderInbox = await studentClient
+    .from("user_notification_records")
+    .select("id, type, lesson_id")
+    .eq("lesson_id", reminderLessonId);
+  if (reminderInbox.error) {
+    throw new Error(`Caixa do aluno 8B: ${summarizeError(reminderInbox.error)}`);
+  }
+  check(
+    (reminderInbox.data ?? []).some((row) => row.type === "lesson_created"),
+    "A aula de lembrete existe e ja notificou a criacao",
+  );
+  check(
+    !(reminderInbox.data ?? []).some((row) => row.type.startsWith("lesson_reminder")),
+    "O lembrete ainda nao existe antes de o agendador correr",
+  );
+
+  // ── A caixa aceita os tipos novos e continua privada ──
+  const notificationTypesSeen = await studentClient
+    .from("user_notification_records")
+    .select("type")
+    .limit(200);
+  check(
+    !notificationTypesSeen.error,
+    `A projecao aceita os tipos novos${
+      notificationTypesSeen.error ? `: ${summarizeError(notificationTypesSeen.error)}` : ""
+    }`,
+  );
+
+  const packageAlertsAsOther = await studentBClient
+    .from("user_notification_records")
+    .select("id, type")
+    .in("type", ["package_expiring", "package_expired", "package_low_balance"]);
+  const packageAlertsAsOwner = await studentClient
+    .from("user_notification_records")
+    .select("id, type")
+    .in("type", ["package_expiring", "package_expired", "package_low_balance"]);
+  check(
+    !packageAlertsAsOther.error && !packageAlertsAsOwner.error,
+    "Os avisos de pacote sao legiveis pela projecao propria",
+  );
+  const ownerIds = new Set((packageAlertsAsOwner.data ?? []).map((row) => row.id));
+  check(
+    !(packageAlertsAsOther.data ?? []).some((row) => ownerIds.has(row.id)),
+    "Um aluno nunca ve os avisos de pacote de outro",
+  );
+  await mustReturnNoRows("Professor nao le avisos de pacote do aluno", () =>
+    teacherClient
+      .from("user_notification_records")
+      .select("id")
+      .in("type", ["package_expiring", "package_expired", "package_low_balance"])
+      .limit(1),
+  );
+  await mustReturnNoRows("Admin nao le avisos de pacote do aluno", () =>
+    adminClient
+      .from("user_notification_records")
+      .select("id")
+      .in("type", ["package_expiring", "package_expired", "package_low_balance"])
+      .limit(1),
+  );
+  await mustReturnNoRows("Conta bloqueada nao le avisos de pacote", () =>
+    blockedClient
+      .from("user_notification_records")
+      .select("id")
+      .in("type", ["package_expiring", "package_expired", "package_low_balance"])
+      .limit(1),
+  );
+
+  // ── Escrita direta continua fechada para os tipos novos ──
+  await mustReject("Aluno nao fabrica um aviso de pacote", async () =>
+    studentClient.from("notifications").insert({
+      recipient_profile_id: studentsA.id,
+      type: "package_expired",
+      title: "Forjado",
+      body: "Forjado",
+    }),
   );
 
   section("Conta bloqueada e anonimo");

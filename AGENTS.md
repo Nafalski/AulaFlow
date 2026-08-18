@@ -170,7 +170,10 @@ update public.profiles set role = 'admin' where email = 'voce@exemplo.pt';
 │   ├── ..._phase6c2_reschedule_declined_cast.sql Fase 6C.2: copiar participação não reservada
 │   ├── ..._phase6c2_reschedule_released_participation.sql Fase 6C.2: libertada continua libertada
 │   ├── ..._phase7a_lesson_confirmation.sql Fase 7A: confirmação da participação pelo aluno
-│   └── ..._phase8a_notification_producers.sql Fase 8A: quem escreve as notificações
+│   ├── ..._phase8a_notification_producers.sql Fase 8A: quem escreve as notificações
+│   ├── ..._phase8b_notification_types.sql Fase 8B: tipos de aviso do agendador
+│   ├── ..._phase8b_scheduled_notifications.sql Fase 8B: o trabalho agendado
+│   └── ..._phase8b_scheduler.sql  Fase 8B: o job `pg_cron` que lhe toca à campainha
 │
 └── src/
     ├── proxy.ts             Renova a sessão e protege rotas (era middleware.ts)
@@ -594,7 +597,50 @@ Não existe forma de ligar ou desligar o pedido numa aula **já criada**, e é d
 
 **As preferências governam ENTREGA, não a existência do facto.** O comentário da Fase 1 já o dizia — as horas de silêncio adiam o "empurrar", não escondem. Na 8A a notificação in-app é sempre escrita; os booleanos por tipo e por canal passam a ser lidos pelo worker de email na 8C. Nenhum valor por omissão foi alterado.
 
-**Ainda não implementado (8B):** lembretes, saldo baixo, pacote a expirar e expiração automática. `refresh_package_status()` é **interna e reativa**: recalcula `depleted`/`expired`/`not_started`/`active` a partir de `current_date` e só corre depois de uma movimentação de créditos. Não existe tarefa à meia-noite, e por isso um pacote que expirou ontem só muda de estado quando alguém lhe tocar. A 8B decide o agendador. **(8C):** entrega por email a partir do outbox. Push fica para depois; WhatsApp continua fora do MVP.
+**Ainda não implementado (8C):** entrega por email a partir do outbox. Push fica para depois; WhatsApp continua fora do MVP.
+
+### O agendador (Etapa 8B)
+
+**O agendador é o `pg_cron`, e corre no PostgreSQL.** Não há processo Node, não há `setInterval` no browser e não há tarefa numa Vercel Function. O job chama-se `aulaflow-scheduled-notifications`, corre **de hora a hora ao minuto 5** e executa uma única instrução:
+
+```sql
+select public.run_scheduled_notifications();
+```
+
+A migração que o instala é condicional: o Supabase tem `pg_cron`, o PGlite do `db:verify` não. Não é uma concessão — é o que permite testar a lógica milhares de vezes por dia sem esperar por relógio nenhum.
+
+**Uma função, cinco secções.** `run_scheduled_notifications(p_now timestamptz default now())` faz tudo numa passagem e devolve as contagens em `jsonb`. Ter cinco jobs separados multiplicaria por cinco as ligações e tornaria "correu tudo?" uma pergunta com cinco respostas.
+
+| Secção | Quando dispara | Chave de deduplicação |
+|---|---|---|
+| Expiração automática | `expires_on < hoje` e estado `active`/`not_started` | `package_expired:<pacote>:<expires_on>` |
+| Pacote a expirar | `expires_on` entre hoje e hoje + 7 | `package_expiring:<pacote>:<expires_on>` |
+| Saldo baixo | travessia de `> 2` para `<= 2` no livro-razão | `package_low_balance:<movimento>` |
+| Lembrete de 24 h | início entre `agora + 2h` e `agora + 24h` | `lesson_reminder_24h:<aula>:<aluno>` |
+| Lembrete de 2 h | início entre `agora` e `agora + 2h` | `lesson_reminder_2h:<aula>:<aluno>` |
+
+**`p_now` é para testes deterministas e execução interna — nunca para o cliente.** `run_scheduled_notifications()` não tem `EXECUTE` para `authenticated`, `anon` nem `PUBLIC`. Nenhuma Server Action o chama, e nenhum formulário envia um instante. Um parâmetro de relógio exposto ao browser deixaria qualquer pessoa adiantar o tempo do domínio e expirar o pacote de outra.
+
+**Mudar de estado por passagem do tempo NÃO é uma movimentação de crédito.** A expiração escreve `student_packages.status = 'expired'` e mais nada: os três baldes ficam intactos, nenhuma reserva é libertada e **não há linha no livro-razão**. Um pacote com créditos reservados numa aula futura continua a ter esses créditos reservados. Devolver, cobrar ou perdoar créditos por expiração é uma decisão de produto que ninguém tomou.
+
+Pacotes `suspended` e `cancelled` não são tocados: `refresh_package_status()` sai cedo para esses estados, e o agendador respeita-o.
+
+**Datas civis de Lisboa, sempre.** `refresh_package_status()` usava `current_date` — a data do servidor, que corre em UTC. Entre a meia-noite de Lisboa e a meia-noite UTC isso dava, no verão, uma hora inteira em que um pacote válido até hoje já aparecia expirado. Passou a usar `public.lisbon_date(now())`. A **ordem de prioridade não mudou**: `depleted` → `expired` → `not_started` → `active`.
+
+**O saldo baixo é um EPISÓDIO, não um estado.** A dedupe eterna por pacote diria uma vez na vida e calava-se para sempre; disparar por "tem ≤ 2" repetiria o aviso a cada hora. A chave é a **movimentação** que atravessou o limiar — `available_before > 2 and available_after <= 2` — lida do livro-razão, que é append-only e por isso a fonte honesta de "isto aconteceu agora".
+
+Duas consequências que valem por si:
+
+- Um pacote **vendido com 2 créditos** não gera aviso nenhum. A linha de criação tem `available_before = 0`, e 0 não é `> 2`. Não há nada de anormal em comprar um pacote pequeno.
+- Recarregar e voltar a descer gera um aviso **novo**, porque é uma travessia nova, com um identificador de movimento novo.
+
+**O atraso é tolerado, o salto não.** As janelas dos lembretes são intervalos com largura (2 h e 22 h), não instantes. Uma passagem por hora nunca perde a de 2 horas, e um job atrasado dez minutos continua a apanhar tudo o que devia. O que a janela **não** faz é inventar um lembrete de "amanhã" para uma aula marcada em cima da hora: se a aula nasceu já dentro das 2 horas, só recebe o lembrete de 2 horas.
+
+**Correr duas vezes não duplica.** Provado em PostgreSQL real com duas invocações em paralelo, em processos e ligações distintas: zero chaves repetidas em `notifications`. A garantia é estrutural — índice único **total** sobre `dedupe_key` mais `on conflict do nothing` — e não uma verificação prévia, que perderia a corrida entre o `select` e o `insert`.
+
+**Corrigir a validade rearma o aviso.** A chave de "a expirar" inclui `expires_on`. Estender a validade de um pacote muda a chave, e o aviso volta a poder ser dado para a data nova — que é o que se quer, porque é informação diferente.
+
+**Continua a não haver envio nenhum.** Nem email, nem push, nem WhatsApp. O agendador escreve em tabelas; a entrega externa é a 8C e é trabalho de um worker que lê o outbox. As preferências de `notification_preferences` governam **entrega**, e por isso ainda não são lidas por ninguém.
 
 ### Ao criar uma tabela nova
 
@@ -944,7 +990,7 @@ Interface em `/professor/clubes/[id]/calendario`, com filtro por professor no UR
 
 **Não implementado:** aulas, participantes, locais, campos, recursos, conflitos, reservas e créditos. Os únicos estados são disponível e indisponível — não escrever "ocupado", "reservado", "lotado", "vagas" ou "conflito", porque nada disso existe ainda para ser verdade.
 
-Ordem atual: Fases 6 e 7 concluídas; 8A fechada (fundação de eventos e caixa in-app). Seguem a 8B (agendador, lembretes, saldo baixo, expiração) e a 8C (entrega por email).
+Ordem atual: Fases 6 e 7 concluídas; 8A fechada (fundação de eventos e caixa in-app) e 8B fechada (agendador `pg_cron`, lembretes, alertas de pacote e expiração automática). Falta a 8C (entrega por email a partir do outbox).
 
 ### `src/types/database.ts`
 
@@ -982,8 +1028,8 @@ Não existe um comando de formatação separado. Use `npm run lint:fix` apenas p
 | 5 | Calendário e criação de aulas com reserva | **Concluído** — disponibilidade, projeção segura, refinamento visual, clubes/membros, calendário partilhado, locais com moradas manuais, campos/salas/áreas, criação/edição de aulas, conflitos atómicos, reserva atómica de créditos, recorrência semanal segura e revisão integrada |
 | 6 | Cancelamento, reagendamento, presenças e histórico | **Concluído** — 6A/6B: presença, falta/no-show, conclusão normal/mista, cancelamento de aula e de participação com `reserved -> available` ou `reserved -> used` seguros. 6C.1/6C.1A/6C.1B: contrato transacional de reagendamento, chave de idempotência obrigatória em namespace próprio e sete corridas de concorrência com JWTs reais. 6C.2: interface operacional, com a fronteira entre editar conteúdo e reagendar colocação imposta no PostgreSQL |
 | 7 | Área do aluno: aulas, créditos e confirmação | **Concluído** — 7A: contrato de confirmação individual, com `requires_confirmation` ligado, escrita direta na resposta fechada e RSVP separado de presença. 7B: o professor pede confirmação ao criar, o aluno responde pela sua própria participação, validado em browser e mobile |
-| 8 | Notificações, lembretes e expiração agendada | **Em curso** — 8A: producers dos eventos de aula, caixa in-app do aluno, lida/por ler e contador. Faltam a 8B (agendador, lembretes, saldo baixo, expiração) e a 8C (entrega por email) |
-| 9 | Supabase real, concorrência, acessibilidade e deployment | **Parcialmente concluído** — RLS em PGlite e validação real com JWTs até à Fase 8A; concorrência real de aulas, créditos, recorrência, conclusão, reagendamento e confirmação coberta; browser em dev e em build de produção; deployment pendente |
+| 8 | Notificações, lembretes e expiração agendada | **Em curso** — 8A: producers dos eventos de aula, caixa in-app do aluno, lida/por ler e contador. 8B: agendador `pg_cron` de hora a hora, lembretes de 24 h e 2 h, saldo baixo por episódio, pacote a expirar e expiração automática em datas civis de Lisboa. Falta a 8C (entrega por email) |
+| 9 | Supabase real, concorrência, acessibilidade e deployment | **Parcialmente concluído** — RLS em PGlite e validação real com JWTs até à Fase 8B; concorrência real de aulas, créditos, recorrência, conclusão, reagendamento e confirmação coberta; browser em dev e em build de produção; deployment pendente |
 
 **Ao concluir uma fase ou etapa:** `npm run check`, corrigir tudo o que falhe, atualizar `implementation_plan.md`, e resumir o que foi criado e como testar manualmente.
 

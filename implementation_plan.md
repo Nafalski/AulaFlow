@@ -449,8 +449,8 @@ A estrutura fica pronta para notificações push (Fase 8).
 | **5** | Calendário e criação de aulas, com reserva de créditos | **Concluído** — disponibilidade, calendário, clubes, locais, recursos, criação/edição de aulas, conflitos atómicos, reserva atómica de créditos, recorrência semanal segura e revisão integrada |
 | **6** | Cancelamento, reagendamento, presenças, histórico | **Concluída** — 6A/6B: presença, falta/no-show, conclusão normal/mista e cancelamentos com `reserved -> available` ou `reserved -> used` seguros. 6C.1/1A/1B: contrato transacional de reagendamento, chave de idempotência obrigatória e concorrência real provada. 6C.2: interface operacional, com editar conteúdo e reagendar colocação separados no PostgreSQL |
 | **7** | Área do aluno: aulas, saldo, confirmação da participação | **Concluída** — 7A: contrato de confirmação individual, com `requires_confirmation` ligado, escrita direta fechada e RSVP separado de presença. 7B: o professor pede ao criar, o aluno responde pela própria participação, provado em browser e mobile |
-| **8** | Notificações, lembretes e expiração agendada | **8A concluída** — a fundação da Fase 1 foi ligada: producers dos eventos de aula por trigger, caixa in-app do aluno, lida/por ler e contador de não lidas. Faltam a 8B (agendador, lembretes, saldo baixo, expiração automática) e a 8C (entrega por email a partir do outbox) |
-| **9** | Supabase real, concorrência, acessibilidade, deployment | **Parcialmente concluído** — Supabase/Auth reais validados até à 8A (526 verificações, verdes em duas execuções consecutivas); 908 verificações de esquema em PGlite; browser automatizado com sessão GoTrue real, verde em dev e em build de produção; deployment pendente |
+| **8** | Notificações, lembretes e expiração agendada | **8A e 8B concluídas** — a fundação da Fase 1 foi ligada (producers por trigger, caixa in-app, lida/por ler e contador) e o agendador `pg_cron` corre de hora a hora com lembretes de 24 h e 2 h, saldo baixo por episódio, pacote a expirar e expiração automática em datas civis de Lisboa. Falta a 8C (entrega por email a partir do outbox) |
+| **9** | Supabase real, concorrência, acessibilidade, deployment | **Parcialmente concluído** — Supabase/Auth reais validados até à 8B (540 verificações, verdes em duas execuções consecutivas); 954 verificações de esquema em PGlite; agendador `pg_cron` instalado e provado no remoto, incluindo duas execuções em paralelo sem duplicar; browser automatizado com sessão GoTrue real, verde em dev e em build de produção; deployment pendente |
 
 A ordem segue as prioridades pedidas: primeiro a área do professor ao computador, depois as regras seguras de créditos, depois o aluno no telemóvel.
 
@@ -1271,7 +1271,60 @@ A página passou a usar a mesma RPC do sino, e a saber quantos avisos existem ao
 
 A regressão está fixada em `db:verify` com o cenário exato: 51 avisos, os 50 mais recentes lidos, o mais antigo por ler — o contador global vê-o, a projeção conta 51, e `mark_all_notifications_read()` limpa-o.
 
-**Para a 8B:** `refresh_package_status()` é interna e **reativa** — recalcula `depleted`/`expired`/`not_started`/`active` a partir de `current_date` e só corre depois de uma movimentação de créditos (`assign`, `reserve`, `release`, `consume`, ajustes administrativos). Não existe tarefa agendada: um pacote que expirou ontem mantém o estado anterior até alguém lhe tocar. O limiar de saldo baixo existe hoje apenas como regra visual em `lib/domain/package-display.ts` (1–2 créditos), e uma regra visual não é política de notificação — falta decidir limiar, repetição, rearme e destinatário.
+### Concluído na Etapa 8B — o agendador
+
+A 8A deixou uma pergunta em aberto: quem toca à campainha? A resposta é o **`pg_cron`**, dentro do próprio PostgreSQL. O job `aulaflow-scheduled-notifications` corre **de hora a hora ao minuto 5** e executa `select public.run_scheduled_notifications();`. Não há processo Node, nem `setInterval` no browser, nem função serverless a fingir de relógio.
+
+A migração que o instala é condicional — o Supabase tem a extensão, o PGlite do `db:verify` não. É essa separação que permite testar a lógica com um relógio fixo, milhares de vezes por dia, sem esperar por hora nenhuma.
+
+#### Uma função, cinco secções
+
+`run_scheduled_notifications(p_now timestamptz default now())` faz tudo numa passagem e devolve as contagens em `jsonb`. Cinco jobs separados multiplicariam as ligações e tornariam "correu tudo?" uma pergunta com cinco respostas.
+
+| Secção | Quando dispara | Chave de deduplicação |
+|---|---|---|
+| Expiração automática | `expires_on < hoje`, estado `active`/`not_started` | `package_expired:<pacote>:<expires_on>` |
+| Pacote a expirar | `expires_on` entre hoje e hoje + 7 | `package_expiring:<pacote>:<expires_on>` |
+| Saldo baixo | travessia de `> 2` para `<= 2` no livro-razão | `package_low_balance:<movimento>` |
+| Lembrete de 24 h | início entre `agora + 2h` e `agora + 24h` | `lesson_reminder_24h:<aula>:<aluno>` |
+| Lembrete de 2 h | início entre `agora` e `agora + 2h` | `lesson_reminder_2h:<aula>:<aluno>` |
+
+#### Mudar de estado por passagem do tempo não é uma movimentação de crédito
+
+A expiração escreve `student_packages.status = 'expired'` e mais nada. Os três baldes ficam intactos, nenhuma reserva é libertada, e **não existe linha no livro-razão** — o que faz sentido, porque nenhum saldo mudou. Um pacote com créditos reservados numa aula futura continua com esses créditos reservados. Devolver, cobrar ou perdoar por expiração é uma decisão de produto que ninguém tomou, e inventá-la aqui seria mexer no dinheiro de alguém sem mandato.
+
+`suspended` e `cancelled` não são tocados: `refresh_package_status()` sai cedo nesses estados, e o agendador respeita-o.
+
+#### Datas civis de Lisboa
+
+`refresh_package_status()` usava `current_date` — a data do **servidor**, que corre em UTC. No verão, entre a meia-noite de Lisboa e a meia-noite UTC, havia uma hora inteira em que um pacote válido até hoje já aparecia expirado. Passou a usar `public.lisbon_date(now())`. A ordem de prioridade não mudou: `depleted` → `expired` → `not_started` → `active`.
+
+#### O saldo baixo é um episódio, não um estado
+
+Uma dedupe eterna por pacote avisaria uma vez na vida. Disparar por "tem ≤ 2" repetiria o aviso de hora a hora. A chave é a **movimentação que atravessou o limiar** — `available_before > 2 and available_after <= 2` —, lida do livro-razão, que é append-only e por isso a fonte honesta de "isto aconteceu agora".
+
+Duas consequências valem por si:
+
+- Um pacote **vendido com 2 créditos** não gera aviso. A linha de criação tem `available_before = 0`, e 0 não é `> 2`. Comprar um pacote pequeno não tem nada de anormal.
+- Recarregar e voltar a descer gera um aviso **novo** — é uma travessia nova, com identificador de movimento novo.
+
+#### O atraso é tolerado; o salto não
+
+As janelas dos lembretes têm largura (2 h e 22 h), não são instantes. Uma passagem por hora nunca perde a de 2 horas, e um job atrasado dez minutos continua a apanhar tudo. O que a janela não faz é inventar um "amanhã" para uma aula marcada em cima da hora: se nasceu já dentro das 2 horas, recebe apenas o lembrete de 2 horas.
+
+#### Correr duas vezes não duplica
+
+Provado em PostgreSQL real com duas invocações em paralelo, em processos e ligações distintas: zero chaves repetidas em `notifications`. A garantia é estrutural — índice único **total** sobre `dedupe_key` mais `on conflict do nothing` — e não uma verificação prévia, que perderia a corrida entre o `select` e o `insert`. O invariante ficou fixado na suite remota.
+
+Corrigir a validade **rearma** o aviso: a chave de "a expirar" inclui `expires_on`, por isso estender a validade permite avisar outra vez para a data nova, que é informação diferente.
+
+#### `p_now` é para testes deterministas, nunca para o cliente
+
+`run_scheduled_notifications()` não tem `EXECUTE` para `authenticated`, `anon` nem `PUBLIC`. Nenhuma Server Action o chama e nenhum formulário envia um instante. Um parâmetro de relógio ao alcance do browser deixaria qualquer pessoa adiantar o tempo do domínio e expirar o pacote de outra. A suite Auth recusa-o explicitamente a aluno, professor, admin e anónimo — incluindo com um `p_now` forjado.
+
+#### O que a 8B deliberadamente não faz
+
+Nenhum envio: nem email, nem push, nem WhatsApp. O agendador escreve em tabelas; a entrega externa é a 8C e é trabalho de um worker que lê o outbox. `notification_preferences` governa **entrega**, e por isso continua sem ser lida por ninguém. Não há aviso ao professor, não há limiar configurável por organização e não há cancelamento automático de nada.
 
 ### Fase 2 — estado por item
 
@@ -1287,7 +1340,7 @@ A regressão está fixada em `db:verify` com o cenário exato: 51 avisos, os 50 
 | Preferências de notificação | **Concluído** | Persistência de canais/eventos; entrega automática continua planeada para a Fase 8 |
 | Diretório administrativo | **Concluído** | Pesquisa, filtros, professores, detalhe, estados vazios/erro/loading e resposta mobile/desktop |
 | Bloqueio e reativação | **Concluído** | RPC exclusiva de admin, sem auto-bloqueio, motivo, auditoria e revogação efetiva por RLS |
-| Validação num Supabase remoto | **Concluído para as Fases 4, 5, 6, 7 e 8A** | Migrações, catálogo remoto, GoTrue/Auth, JWT/PostgREST, contas reais, calendário seguro, aulas, conflitos, reserva, recorrência, presença, conclusão, privacidade e concorrência validados por RPC/Auth real |
+| Validação num Supabase remoto | **Concluído para as Fases 4, 5, 6, 7, 8A e 8B** | Migrações, catálogo remoto, GoTrue/Auth, JWT/PostgREST, contas reais, calendário seguro, aulas, conflitos, reserva, recorrência, presença, conclusão, privacidade e concorrência validados por RPC/Auth real |
 
 ### Concluído na Fase 2
 

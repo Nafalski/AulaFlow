@@ -32,7 +32,15 @@
 
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { exec } from "node:child_process";
+import { rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
+
 import { createClient } from "@supabase/supabase-js";
+
+const execAsync = promisify(exec);
 import { chromium } from "playwright-core";
 
 // ── Ambiente ────────────────────────────────────────────────────────────────
@@ -459,11 +467,16 @@ async function billableStudent(client) {
 // Títulos distintos e sem prefixo comum: os cartões do aluno são localizados
 // pelo título, e "confirmavel" seria também encontrado dentro de
 // "confirmavel reagendar".
+// O carimbo por execucao e o que impede o cartao JA CONFIRMADO de uma execucao
+// anterior de ser encontrado primeiro: os titulos eram estaveis, a lista vem
+// por hora de inicio, e a fixture antiga comeca sempre mais cedo do que a nova.
+const RUN_STAMP = Date.now().toString(36);
+
 const CONFIRMATION_TITLES = {
-  confirmable: "rsvp pendente",
-  plain: "rsvp sem pedido",
-  forReschedule: "rsvp a reagendar",
-  series: "rsvp serie",
+  confirmable: `rsvp pendente ${RUN_STAMP}`,
+  plain: `rsvp sem pedido ${RUN_STAMP}`,
+  forReschedule: `rsvp a reagendar ${RUN_STAMP}`,
+  series: `rsvp serie ${RUN_STAMP}`,
 };
 
 /**
@@ -1717,6 +1730,13 @@ async function studentNotificationsScenario(browser, apiClient) {
   // A descida prova-se de forma inequívoca: marcar TODOS como lidos e ver o
   // contador desaparecer. Com a caixa a mostrar "99+", subtrair um não seria
   // observável.
+  // Os IDENTIFICADORES dos avisos por ler antes do clique. Comparar textos nao
+  // servia: dois lembretes seguidos podem ler-se quase igual, e a afirmacao tem
+  // de ser sobre ESTES avisos, nao sobre avisos parecidos.
+  const unreadBeforeMarkAll = await page
+    .locator('main li[data-unread="true"]')
+    .evaluateAll((items) => items.map((item) => item.getAttribute("data-notification-id")));
+
   const markAll = page.getByRole("button", { name: /Marcar todos como lidos/ });
   if ((await markAll.count()) > 0) {
     // Este botão fica desativado DEPOIS do sucesso, de propósito: marcar todos
@@ -1737,14 +1757,39 @@ async function studentNotificationsScenario(browser, apiClient) {
     await page.getByRole("heading", { name: "Avisos" }).first().waitFor({ timeout: 20_000 });
   }
 
+  // A AFIRMACAO E SOBRE OS AVISOS QUE ESTAVAM LA, NAO SOBRE A CAIXA INTEIRA.
+  //
+  // Desde a Etapa 8B existe um agendador a correr de hora a hora no remoto. Se
+  // ele passar entre o clique e a leitura, escreve um aviso novo — legitimamente
+  // por ler — e um "o sino tem de estar a zero" acusaria o produto de um defeito
+  // que e, na verdade, o produto a funcionar.
+  //
+  // O que "marcar todos como lidos" promete e que nada do que estava por ler
+  // NAQUELE MOMENTO continua por ler.
+  // Espera pelo ESTADO, nao por um atributo do botao. O controlo fica desativado
+  // assim que a Action responde, mas a lista so mostra o resultado no repintar
+  // seguinte — e numa build de producao esse repintar chega mais tarde do que em
+  // dev. Reler ate o estado bater certo e o que a verificacao afirma mesmo.
+  let leftover = [];
+  for (let attempt = 1; attempt <= 6; attempt += 1) {
+    const stillUnread = await page
+      .locator('main li[data-unread="true"]')
+      .evaluateAll((items) => items.map((item) => item.getAttribute("data-notification-id")));
+    leftover = stillUnread.filter((id) => unreadBeforeMarkAll.includes(id));
+    if (leftover.length === 0) break;
+    await page.waitForTimeout(1_500);
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.getByRole("heading", { name: "Avisos" }).first().waitFor({ timeout: 20_000 });
+  }
+
   check(
-    (await badge.count()) === 0,
-    "Depois de marcar todos como lidos, o contador do sino desaparece",
-    `ainda mostra ${(await badge.count()) > 0 ? await badge.first().innerText() : "—"}`,
+    leftover.length === 0,
+    "Depois de marcar todos como lidos, nenhum dos avisos anteriores fica por ler",
+    `${leftover.length} ainda por ler`,
   );
   check(
-    !(await panelText(page)).includes("Por ler"),
-    "Nenhum aviso fica marcado como por ler",
+    unreadBeforeMarkAll.length > 0,
+    "Havia mesmo avisos por ler para marcar",
   );
 
   // ── Reagendar acrescenta um aviso e não reescreve o antigo ──
@@ -1811,6 +1856,225 @@ async function studentNotificationsScenario(browser, apiClient) {
 }
 
 /** A caixa de avisos no telemóvel. */
+/**
+ * O agendador, corrido como o `pg_cron` o corre: pela base de dados.
+ *
+ * Nao e uma sessao a fingir — `run_scheduled_notifications()` nao tem EXECUTE
+ * para `authenticated`, e e assim de proposito. Quem lhe toca a campainha no
+ * remoto e o proprio PostgreSQL; aqui usa-se a mesma ligacao da CLI, que e o
+ * equivalente honesto de esperar pela hora certa.
+ *
+ * `p_now` existe exatamente para isto: adiantar o relogio do DOMINIO num teste
+ * determinista, sem nunca gravar uma data falsa numa tabela.
+ */
+async function runScheduler(nowExpression = "now()") {
+  const file = join(tmpdir(), `aulaflow-scheduler-${randomUUID()}.sql`);
+  writeFileSync(file, `select public.run_scheduled_notifications(${nowExpression});`, "utf8");
+  try {
+    // Via shell, com o comando ja montado: no Windows o Node recusa lancar um
+    // `.cmd` diretamente desde a correcao do CVE-2024-27980, e passar args
+    // separados com `shell: true` e o que a plataforma desaconselha — nada os
+    // escapa. O unico valor interpolado e um caminho gerado aqui.
+    // A CLI abre uma ligacao nova a cada invocacao e, encadeadas, uma delas
+    // falha de vez em quando ainda a inicializar o login role. Uma repeticao
+    // resolve-o; duas falhas seguidas sao um problema a serio e sobem com o
+    // stderr, senao a mensagem seria so "Command failed".
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        const { stdout } = await execAsync(
+          `npx --yes supabase db query --linked --file "${file}"`,
+          { maxBuffer: 8 * 1024 * 1024 },
+        );
+        return stdout;
+      } catch (error) {
+        if (attempt >= 3) {
+          throw new Error(`Agendador: ${(error.stderr || error.message).trim().slice(0, 300)}`);
+        }
+        await new Promise((resolve) => setTimeout(resolve, 3_000));
+      }
+    }
+  } finally {
+    rmSync(file, { force: true });
+  }
+}
+
+/**
+ * Cenarios A-D da Etapa 8B, com sessao real do aluno.
+ *
+ * As fixtures sao preparadas pelas RPCs OFICIAIS do professor — atribuir um
+ * pacote e ajustar creditos sao operacoes que ele faz mesmo. Nada e escrito
+ * diretamente numa tabela, e nenhum saldo e mexido a mao.
+ */
+async function scheduledNotificationsScenario(browser, apiClient) {
+  section("Aluno — avisos do agendador (8B)");
+
+  const billable = await billableStudent(apiClient);
+  if (!billable) {
+    check(false, "Existe um aluno com pacote para preparar os avisos 8B");
+    return;
+  }
+
+  const stamp = Date.now().toString(36);
+  const today = new Date();
+  const civilDay = (offset) =>
+    new Date(today.getTime() + offset * 86_400_000).toLocaleDateString("en-CA", {
+      timeZone: "Europe/Lisbon",
+    });
+
+  // ── (B) e (D): dois pacotes com validade curta ──
+  //
+  // Pacotes NOVOS, e nao os existentes: encurtar a validade de um pacote que a
+  // suite Auth usa para criar aulas deixaria as execucoes seguintes sem saldo.
+  const assign = async (label, credits, expiresOn) => {
+    const { data, error } = await apiClient.rpc("assign_student_package", {
+      p_student_id: billable.studentId,
+      p_template_id: null,
+      p_credits: credits,
+      p_name: label,
+      p_sport_id: billable.sportId,
+      p_starts_on: civilDay(0),
+      p_expires_on: expiresOn,
+      p_paid_amount_cents: null,
+      p_notes: "e2e_aulaflow_8b",
+      p_origin: "manual",
+      p_assignment_idempotency_key: randomUUID(),
+    });
+    if (error || !data) throw new Error(`${label}: ${error?.message ?? "sem id"}`);
+    return data;
+  };
+
+  const expiringName = `8B a expirar ${stamp}`;
+  const expiredName = `8B expirado ${stamp}`;
+  const lowName = `8B saldo baixo ${stamp}`;
+
+  const expiringId = await assign(expiringName, 4, civilDay(3));
+  const expiredId = await assign(expiredName, 4, civilDay(1));
+
+  // ── (C) saldo baixo por uma OPERACAO LEGITIMA de creditos ──
+  //
+  // 5 → 2 num unico ajuste: o episodio nasce da travessia do limiar registada
+  // no livro-razao, e nao de o pacote ter sido vendido pequeno.
+  const lowId = await assign(lowName, 5, civilDay(60));
+  const { error: adjustError } = await apiClient.rpc("admin_adjust_package_credits", {
+    p_package_id: lowId,
+    p_delta: -3,
+    p_reason: "Correcao E2E da Etapa 8B",
+    p_idempotency_key: randomUUID(),
+  });
+  check(
+    !adjustError,
+    "O saldo desce por ajuste oficial, nao por escrita direta",
+    adjustError?.message,
+  );
+
+  // ── (A) uma aula dentro da janela do lembrete de 24 horas ──
+  //
+  // A janela e `agora + 2h` a `agora + 24h`. Se a agenda de desenvolvimento nao
+  // tiver nenhum slot la dentro, diz-se em vez de saltar em silencio.
+  // A aula fica no primeiro horario livre — seja ele daqui a tres dias — e e o
+  // RELOGIO que se move ate a janela, nao a agenda que tem de colaborar. Exigir
+  // um slot nas proximas 24 horas fazia o cenario depender do estado da agenda
+  // de desenvolvimento, e saltar em silencio quando ela estava cheia.
+  const slot = await findFreeSlot(apiClient);
+  let reminderStartsAt = null;
+  if (!slot) {
+    check(false, "(A) Existe um horario livre para a aula do lembrete");
+  } else {
+    const startsAt = lisbonCivilToInstant(slot.day, slot.time);
+    const { error } = await apiClient.rpc("create_lesson", {
+      p_sport_id: billable.sportId,
+      p_starts_at: startsAt.toISOString(),
+      p_ends_at: new Date(startsAt.getTime() + 30 * 60_000).toISOString(),
+      p_title: `${FIXTURE_PREFIX}lembrete ${stamp}`,
+      p_context_kind: "personal",
+      p_club_organization_id: null,
+      p_location_id: null,
+      p_location_resource_id: null,
+      p_student_id: billable.studentId,
+      p_group_id: null,
+      p_notes_for_students: null,
+      p_private_notes: null,
+      p_requires_confirmation: false,
+      p_idempotency_key: randomUUID(),
+    });
+    check(!error, "(A) A aula do lembrete e criada pelo contrato oficial", error?.message);
+    if (!error) reminderStartsAt = startsAt;
+  }
+
+  // ── O agendador corre tres vezes, cada uma com o seu relogio ──
+  //
+  // Agora, para os avisos que ja sao verdade hoje; tres horas antes da aula,
+  // para cair na janela das 24 horas; e dois dias a frente, para o pacote que
+  // expira amanha ser mesmo dado como expirado.
+  await runScheduler();
+  if (reminderStartsAt) {
+    const threeHoursBefore = new Date(reminderStartsAt.getTime() - 3 * 3_600_000);
+    await runScheduler(`timestamptz '${threeHoursBefore.toISOString()}'`);
+  }
+  await runScheduler("now() + interval '2 days'");
+
+  // ── A verificacao e feita com a sessao REAL do aluno ──
+  const context = await browser.newContext();
+  context.on("page", (page) => {
+    page.on("console", (message) => {
+      if (message.type() === "error") consoleErrors.push(message.text().slice(0, 160));
+    });
+    page.on("pageerror", (error) => consoleErrors.push(error.message.slice(0, 160)));
+  });
+  const page = await signIn(context, ACCOUNTS.student);
+  await page.goto(`${BASE_URL}/aluno/notificacoes`, { waitUntil: "domcontentloaded" });
+  await page.getByRole("heading", { name: "Avisos" }).first().waitFor({ timeout: 20_000 });
+
+  const inbox = await page.locator("main").innerText();
+
+  check(inbox.includes(expiringName), "(B) O aviso de pacote a expirar aparece na caixa");
+  check(inbox.includes(expiredName), "(D) O aviso de pacote expirado aparece na caixa");
+  check(inbox.includes(lowName), "(C) O aviso de saldo baixo aparece na caixa");
+  if (reminderStartsAt) {
+    check(/Lembrete/.test(inbox), "(A) O lembrete da aula aparece na caixa");
+  }
+
+  // ── Nada de privado escapa para a caixa ──
+  check(
+    !/e2e_aulaflow_8b|Correcao E2E|reservado|utilizados|centimos/i.test(inbox),
+    "Os avisos nao expoem observacoes, origem, saldos internos nem valores",
+  );
+
+  // ── Uma segunda passagem nao duplica nada ──
+  const cardsBefore = await page.locator("main li").count();
+  await runScheduler();
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.getByRole("heading", { name: "Avisos" }).first().waitFor({ timeout: 20_000 });
+  check(
+    (await page.locator("main li").count()) === cardsBefore,
+    "Correr o agendador outra vez nao duplica avisos",
+  );
+
+  // ── 390px: sem overflow horizontal ──
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.getByRole("heading", { name: "Avisos" }).first().waitFor({ timeout: 20_000 });
+  const overflow = await page.evaluate(
+    () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+  );
+  check(overflow <= 1, "Os avisos do agendador cabem em 390px", `overflow ${overflow}px`);
+
+  await context.close();
+
+  // Os tres ficam cancelados. `select_package_for_student()` escolhe o que
+  // expira MAIS CEDO, por isso um pacote destes deixado para tras passaria a ser
+  // o escolhido das aulas seguintes — e recusaria a data por ja nao a cobrir.
+  //
+  // O construtor do supabase-js e um thenable, nao uma Promise: tem `then`, mas
+  // nao tem `catch`. O `await` resolve-o, e o erro vem no objeto devolvido.
+  for (const packageId of [lowId, expiringId, expiredId]) {
+    await apiClient.rpc("admin_cancel_student_package", {
+      p_package_id: packageId,
+      p_reason: "Fixture E2E da Etapa 8B",
+    });
+  }
+}
+
 async function mobileNotificationsScenario(browser) {
   section("Telemóvel — avisos a 390×844");
 
@@ -2032,6 +2296,7 @@ async function main() {
     );
     await mobileStudentConfirmationScenario(browser);
     await studentNotificationsScenario(browser, lessons.client);
+    await scheduledNotificationsScenario(browser, lessons.client);
     await mobileNotificationsScenario(browser);
 
     await mobileScenario(browser, lessons.operable ?? lessons.cancellable);

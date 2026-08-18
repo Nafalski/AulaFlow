@@ -1258,12 +1258,104 @@ checks as (
   union all
   select
     'estrutura',
+    'os tipos de aviso de pacote existem no enum',
+    (
+      select count(*) = 3
+      from unnest(enum_range(null::public.notification_type)) as value
+      where value::text in ('package_expiring', 'package_expired', 'package_low_balance')
+    ),
+    'ok'
+
+  union all
+  select
+    'seguranca',
+    'o agendador nao e chamavel pelo cliente',
+    not exists (
+      select 1
+      from pg_proc proc
+      join pg_namespace ns on ns.oid = proc.pronamespace
+      where ns.nspname = 'public'
+        and proc.proname in ('run_scheduled_notifications', 'record_package_notification')
+        and (has_function_privilege('authenticated', proc.oid, 'EXECUTE')
+          or has_function_privilege('anon', proc.oid, 'EXECUTE'))
+    ),
+    'ok'
+
+  union all
+  select
+    'estrutura',
+    'o agendador tem search_path fixo',
+    (
+      select count(*) = 1
+      from pg_proc proc
+      join pg_namespace ns on ns.oid = proc.pronamespace
+      where ns.nspname = 'public'
+        and proc.proname = 'run_scheduled_notifications'
+        and proc.prosecdef
+        and array_to_string(coalesce(proc.proconfig, array[]::text[]), ',')
+            like '%search_path=public, pg_temp%'
+    ),
+    'ok'
+
+  union all
+  select
+    'estrutura',
+    'a data civil portuguesa tem helper proprio',
+    exists (
+      select 1
+      from pg_proc proc
+      join pg_namespace ns on ns.oid = proc.pronamespace
+      where ns.nspname = 'public' and proc.proname = 'lisbon_date'
+    ),
+    'ok'
+
+  union all
+  select
+    'agendamento',
+    'o job do agendador esta instalado e ativo',
+    exists (
+      select 1
+      from cron.job
+      where jobname = 'aulaflow-scheduled-notifications'
+        and active
+        and schedule = '5 * * * *'
+        and command like '%run_scheduled_notifications%'
+    ),
+    'ok'
+
+  union all
+  select
+    'estrutura',
     'a notificacao tem chave de deduplicacao unica',
     exists (
       select 1 from pg_indexes
       where schemaname = 'public'
         and tablename = 'notifications'
         and indexname = 'notifications_dedupe_key_unique'
+    ),
+    'ok'
+
+  union all
+  select
+    'estrutura',
+    'duas passagens do agendador nunca duplicaram um aviso',
+    not exists (
+      select 1
+      from public.notifications
+      where dedupe_key is not null
+      group by dedupe_key
+      having count(*) > 1
+    ),
+    'ok'
+
+  union all
+  select
+    'estrutura',
+    'expirar um pacote nao moveu creditos',
+    not exists (
+      select 1
+      from public.package_credit_transactions
+      where reason ilike '%expir%'
     ),
     'ok'
 
