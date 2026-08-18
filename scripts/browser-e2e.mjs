@@ -1946,6 +1946,7 @@ async function scheduledNotificationsScenario(browser, apiClient) {
   const expiringName = `8B a expirar ${stamp}`;
   const expiredName = `8B expirado ${stamp}`;
   const lowName = `8B saldo baixo ${stamp}`;
+  const zeroName = `8B sem aulas ${stamp}`;
 
   const expiringId = await assign(expiringName, 4, civilDay(3));
   const expiredId = await assign(expiredName, 4, civilDay(1));
@@ -1965,6 +1966,31 @@ async function scheduledNotificationsScenario(browser, apiClient) {
     !adjustError,
     "O saldo desce por ajuste oficial, nao por escrita direta",
     adjustError?.message,
+  );
+
+  // ── (8B.2) 3 → 0: o pacote fica `depleted` na mesma transacao ──
+  //
+  // `admin_adjust_package_credits()` chama `refresh_package_status()` a seguir a
+  // escrever no livro-razao, por isso o estado terminal chega muito antes de o
+  // cron passar. Ate a 8B.1 isso apagava o aviso exatamente no caso mais grave.
+  const zeroId = await assign(zeroName, 3, civilDay(60));
+  const { error: zeroError } = await apiClient.rpc("admin_adjust_package_credits", {
+    p_package_id: zeroId,
+    p_delta: -3,
+    p_reason: "Correcao E2E da Etapa 8B2",
+    p_idempotency_key: randomUUID(),
+  });
+  check(!zeroError, "(8B.2) O pacote e esvaziado pela RPC oficial", zeroError?.message);
+
+  const zeroStatus = await apiClient
+    .from("teacher_package_records")
+    .select("status, credits_available")
+    .eq("id", zeroId)
+    .single();
+  check(
+    zeroStatus.data?.status === "depleted" && zeroStatus.data?.credits_available === 0,
+    "(8B.2) O pacote esta depleted antes de o agendador passar",
+    `estado ${zeroStatus.data?.status ?? "?"}`,
   );
 
   // ── (A) uma aula dentro da janela do lembrete de 24 horas ──
@@ -2030,6 +2056,17 @@ async function scheduledNotificationsScenario(browser, apiClient) {
   check(inbox.includes(expiringName), "(B) O aviso de pacote a expirar aparece na caixa");
   check(inbox.includes(expiredName), "(D) O aviso de pacote expirado aparece na caixa");
   check(inbox.includes(lowName), "(C) O aviso de saldo baixo aparece na caixa");
+  check(
+    inbox.includes(zeroName),
+    "(8B.2) O aviso do pacote esgotado aparece na caixa",
+  );
+  const zeroCard = page.locator("main li").filter({ hasText: zeroName }).first();
+  const zeroText = (await zeroCard.count()) > 0 ? await zeroCard.innerText() : "";
+  check(
+    /Já não há aulas disponíveis/.test(zeroText),
+    "(8B.2) A mensagem corresponde a zero creditos",
+    zeroText.slice(0, 80),
+  );
   if (reminderStartsAt) {
     check(/Lembrete/.test(inbox), "(A) O lembrete da aula aparece na caixa");
 
@@ -2096,7 +2133,7 @@ async function scheduledNotificationsScenario(browser, apiClient) {
   //
   // O construtor do supabase-js e um thenable, nao uma Promise: tem `then`, mas
   // nao tem `catch`. O `await` resolve-o, e o erro vem no objeto devolvido.
-  for (const packageId of [lowId, expiringId, expiredId]) {
+  for (const packageId of [lowId, expiringId, expiredId, zeroId]) {
     await apiClient.rpc("admin_cancel_student_package", {
       p_package_id: packageId,
       p_reason: "Fixture E2E da Etapa 8B",

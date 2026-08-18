@@ -1322,6 +1322,16 @@ Três coisas que a revisão apanhou, sem tocar na arquitetura, no `pg_cron`, na 
 
 Para isso foi preciso um produtor que devolva se escreveu. Ele nasceu com **nome novo** — `record_lesson_notification_if_new()` — em vez de mudar o retorno do antigo: a migração da 8A já está aplicada, não se edita, e um tipo de retorno diferente faria a reaplicação dela falhar com *cannot change return type*. O nome que os triggers da 8A conhecem passou a delegar nele.
 
+#### Corrigido na 8B.2 — um pacote esgotado continua a ter saldo baixo
+
+A 8B.1 escolhia candidatos em `active`/`not_started`. Faltava uma transição: `admin_adjust_package_credits()` altera o saldo, escreve no livro-razão e chama `refresh_package_status()` — tudo na mesma transação. Um pacote com 3 créditos disponíveis e nenhum reservado, ajustado para 0, fica `depleted` de imediato.
+
+A travessia ficava registada corretamente (`available_before = 3`, `available_after = 0`), mas quando o agendador passava uma hora depois o pacote já não era candidato. O aviso perdia-se exatamente no caso mais grave da faixa: o aluno tinha ficado sem aulas nenhumas.
+
+`depleted` passou a ser candidato **na secção do saldo baixo, e só nela**. A travessia real continua obrigatória — o `LATERAL` é um `cross join`, por isso um pacote sem linha de travessia não produz candidato: um pacote vendido com 2 créditos e gasto até zero nunca avisa. A precedência de estados fica igual, `depleted` continua fora de `package_expiring`, os limiares não mudam, a expiração automática continua a não mexer em créditos, as contagens `new_*` mantêm o significado, e o job `pg_cron` continua a apontar para a mesma função.
+
+Uma linha executável mudou face à 8B.1.
+
 #### O atraso é tolerado; o salto não
 
 As janelas dos lembretes têm largura (2 h e 22 h), não são instantes. Uma passagem por hora nunca perde a de 2 horas, e um job atrasado dez minutos continua a apanhar tudo. O que a janela não faz é inventar um "amanhã" para uma aula marcada em cima da hora: se nasceu já dentro das 2 horas, recebe apenas o lembrete de 2 horas.

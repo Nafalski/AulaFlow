@@ -13099,6 +13099,188 @@ check(
   "o episodio novo tambem nao se repete a cada passagem",
 );
 
+// ── (8B.2) FICAR SEM AULAS É O EXTREMO DO SALDO BAIXO ──────────────────────
+//
+// `admin_adjust_package_credits()` altera o saldo, escreve no livro-razão e chama
+// `refresh_package_status()` — tudo na mesma transação. Uma retirada de 3 para 0
+// deixa portanto o pacote `depleted` muito antes de o cron passar, e a consulta
+// da 8B.1, que só aceitava `active`/`not_started`, perdia o aviso exatamente no
+// caso mais grave: o aluno ficou sem aulas nenhumas.
+const sched_zeroPack = await assignPackageAs(TEACHER_UID, {
+  student: schedStudent.id,
+  name: "Pacote esgotado 8B2",
+  credits: 3,
+  sportId: sport,
+  starts: "2026-01-01",
+  expires: "2029-12-31",
+});
+
+const zeroBefore = await packageStatusOf(sched_zeroPack.id);
+check(
+  zeroBefore.credits_available === 3 && zeroBefore.credits_reserved === 0,
+  "o pacote parte de 3 disponiveis e nenhum reservado",
+);
+
+// A retirada passa pela RPC oficial: o episódio tem de nascer de uma operação
+// real, e não de um UPDATE à mão.
+await spendCredits(sched_zeroPack.id, 3, "Ajuste de teste 8B2");
+
+const zeroCrossing = await one(
+  `select id, available_before, available_after
+     from public.package_credit_transactions
+    where student_package_id = $1
+      and available_before > 2 and available_after <= 2
+    order by created_at desc limit 1`,
+  [sched_zeroPack.id],
+);
+check(
+  zeroCrossing.available_before === 3 && zeroCrossing.available_after === 0,
+  "o livro-razao registou a travessia de 3 para 0",
+);
+
+const zeroAfter = await packageStatusOf(sched_zeroPack.id);
+check(
+  zeroAfter.status === "depleted" && zeroAfter.credits_available === 0,
+  "o ajuste deixou o pacote depleted antes de o agendador passar",
+);
+check(
+  (await lowBalanceNotifications(SCHED_UID, sched_zeroPack.id)).length === 0,
+  "antes do agendador nao existe aviso nenhum: quem avisa e o runner",
+);
+
+const zeroRun = (await runScheduler("2027-05-04T12:00:00Z")).result;
+const zeroAlert = await lowBalanceNotifications(SCHED_UID, sched_zeroPack.id);
+check(
+  zeroAlert.length === 1,
+  "um pacote esgotado por ajuste oficial recebe o aviso de saldo baixo",
+);
+check(
+  zeroAlert.length === 1 && zeroAlert[0].body.includes("Já não há aulas disponíveis"),
+  "a mensagem corresponde a zero creditos",
+);
+check(
+  zeroAlert.length === 1 &&
+    zeroAlert[0].dedupe_key === `package_low_balance:${zeroCrossing.id}`,
+  "a chave continua a ser a da travessia, sem chave especial para depleted",
+);
+check(
+  zeroRun.new_low_balance >= 1,
+  "a passagem que cria o aviso conta-o em new_low_balance",
+);
+
+// O estado ficou terminal: correr outra vez não pode reabrir nem repetir.
+const zeroRerun = (await runScheduler("2027-05-04T13:00:00Z")).result;
+check(
+  (await lowBalanceNotifications(SCHED_UID, sched_zeroPack.id)).length === 1,
+  "correr o agendador outra vez nao repete o aviso do pacote esgotado",
+);
+check(
+  zeroRerun.new_low_balance === 0,
+  "a segunda passagem sem alteracoes conta zero em new_low_balance",
+);
+check(
+  (await packageStatusOf(sched_zeroPack.id)).status === "depleted",
+  "avisar nao reabre o pacote: continua depleted",
+);
+
+// `depleted` entrou apenas na secção do saldo baixo. A validade deste pacote está
+// dentro dos 7 dias na data seguinte, e continua a não gerar aviso de expiração.
+await runScheduler("2029-12-27T12:00:00Z");
+check(
+  (
+    await packageNotifications(SCHED_UID, "package_expiring", sched_zeroPack.id)
+  ).length === 0,
+  "um pacote esgotado nao passa a avisar que a validade esta a acabar",
+);
+check(
+  (await packageStatusOf(sched_zeroPack.id)).status === "depleted",
+  "depleted mantem a precedencia sobre expired",
+);
+
+// ── (8B.2) REPOR E VOLTAR A CAIR É UM EPISÓDIO NOVO ───────────────────────
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  db.query(`select public.admin_adjust_package_credits($1,$2,$3,$4::uuid)`, [
+    sched_zeroPack.id,
+    5,
+    "Reposicao 8B2",
+    randomUUID(),
+  ]),
+);
+const revivedStatus = await packageStatusOf(sched_zeroPack.id);
+check(
+  revivedStatus.credits_available === 5 && revivedStatus.status !== "depleted",
+  "repor creditos devolve o pacote ao estado operacional",
+);
+await runScheduler("2027-05-05T12:00:00Z");
+check(
+  (await lowBalanceNotifications(SCHED_UID, sched_zeroPack.id)).length === 1,
+  "repor creditos nao gera aviso nenhum",
+);
+
+await spendCredits(sched_zeroPack.id, 5, "Queda B 8B2");
+const secondCrossing = await one(
+  `select id from public.package_credit_transactions
+    where student_package_id = $1
+      and available_before > 2 and available_after <= 2
+    order by created_at desc limit 1`,
+  [sched_zeroPack.id],
+);
+const rearmRun = (await runScheduler("2027-05-06T12:00:00Z")).result;
+const rearmAlerts = await lowBalanceNotifications(SCHED_UID, sched_zeroPack.id);
+check(
+  rearmAlerts.length === 2,
+  "cair outra vez depois de repor e um episodio novo, mesmo terminando em zero",
+);
+check(
+  rearmAlerts.length === 2 &&
+    rearmAlerts[1].dedupe_key === `package_low_balance:${secondCrossing.id}`,
+  "o segundo aviso identifica a travessia nova",
+);
+check(
+  rearmRun.new_low_balance >= 1,
+  "a passagem do segundo episodio conta-o em new_low_balance",
+);
+
+// ── (8B.2) `depleted` NÃO É PRODUTOR POR SI SÓ ────────────────────────────
+//
+// Um pacote vendido pequeno e gasto até zero nunca tem uma linha em que o saldo
+// caia de mais de 2 para 2 ou menos. Sem travessia, o `cross join lateral` não
+// produz candidato — e é por isso que acrescentar `depleted` não abriu a porta a
+// avisos inventados.
+const sched_tinyPack = await assignPackageAs(TEACHER_UID, {
+  student: schedStudent.id,
+  name: "Pacote de duas gasto 8B2",
+  credits: 2,
+  sportId: sport,
+  starts: "2026-01-01",
+  expires: "2029-12-31",
+});
+await spendCredits(sched_tinyPack.id, 2, "Gastar as duas 8B2");
+check(
+  (await packageStatusOf(sched_tinyPack.id)).status === "depleted",
+  "um pacote de duas aulas gasto ate ao fim fica depleted",
+);
+check(
+  (
+    await rows(
+      `select id from public.package_credit_transactions
+        where student_package_id = $1
+          and available_before > 2 and available_after <= 2`,
+      [sched_tinyPack.id],
+    )
+  ).length === 0,
+  "um pacote de duas aulas nunca tem travessia: nunca teve mais de 2",
+);
+const tinyRun = (await runScheduler("2027-05-07T12:00:00Z")).result;
+check(
+  (await lowBalanceNotifications(SCHED_UID, sched_tinyPack.id)).length === 0,
+  "estar depleted nao basta: sem travessia no livro-razao nao ha aviso",
+);
+check(
+  tinyRun.new_low_balance === 0,
+  "a passagem do pacote sem travessia nao conta nada",
+);
+
 // ── Lembretes de aula ──────────────────────────────────────────────────────
 
 const reminderPack = await assignPackageAs(TEACHER_UID, {

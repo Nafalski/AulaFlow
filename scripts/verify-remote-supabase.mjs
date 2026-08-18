@@ -1360,6 +1360,39 @@ checks as (
   union all
   select
     'contrato',
+    'um pacote esgotado continua candidato ao aviso de saldo baixo',
+    exists (
+      select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+      where n.nspname = 'public' and p.proname = 'run_scheduled_notifications'
+        and p.prosrc like '%not_started'', ''depleted%'
+    ),
+    'ok'
+
+  union all
+  select
+    'contrato',
+    'depleted entrou so no saldo baixo, e nao no aviso de validade',
+    (
+      select count(*)
+        from pg_proc p
+        join pg_namespace n on n.oid = p.pronamespace
+       where n.nspname = 'public'
+         and p.proname = 'run_scheduled_notifications'
+         and p.prosrc like '%not_started'', ''depleted%'
+    ) = 1
+    and (
+      select array_length(
+        string_to_array(p.prosrc, 'not_started'', ''depleted'), 1
+      )
+        from pg_proc p
+        join pg_namespace n on n.oid = p.pronamespace
+       where n.nspname = 'public' and p.proname = 'run_scheduled_notifications'
+    ) = 2,
+    'ok'
+
+  union all
+  select
+    'contrato',
     'as contagens do agendador dizem que sao novas',
     exists (
       select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace

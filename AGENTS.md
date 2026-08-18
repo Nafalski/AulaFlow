@@ -174,7 +174,8 @@ update public.profiles set role = 'admin' where email = 'voce@exemplo.pt';
 │   ├── ..._phase8b_notification_types.sql Fase 8B: tipos de aviso do agendador
 │   ├── ..._phase8b_scheduled_notifications.sql Fase 8B: o trabalho agendado
 │   ├── ..._phase8b_scheduler.sql  Fase 8B: o job `pg_cron` que lhe toca à campainha
-│   └── ..._phase8b1_scheduler_corrections.sql Fase 8B.1: título, episódio e contagens
+│   ├── ..._phase8b1_scheduler_corrections.sql Fase 8B.1: título, episódio e contagens
+│   └── ..._phase8b2_depleted_low_balance.sql Fase 8B.2: esgotado ainda é saldo baixo
 │
 └── src/
     ├── proxy.ts             Renova a sessão e protege rotas (era middleware.ts)
@@ -631,6 +632,8 @@ Pacotes `suspended` e `cancelled` não são tocados: `refresh_package_status()` 
 **O saldo baixo é um EPISÓDIO, não um estado.** A dedupe eterna por pacote diria uma vez na vida e calava-se para sempre; disparar por "tem ≤ 2" repetiria o aviso a cada hora. A chave é a **movimentação** que atravessou o limiar — `available_before > 2 and available_after <= 2` — lida do livro-razão, que é append-only e por isso a fonte honesta de "isto aconteceu agora".
 
 **Não há limite de idade.** Um saldo que desceu há 31 dias e nunca subiu continua baixo hoje; calá-lo por causa do calendário esconderia exatamente o caso mais preocupante. O que impede um episódio antigo **já resolvido** de ressuscitar não é uma data — é o pacote ter voltado a ter mais de 2 créditos e, por isso, não entrar sequer na consulta.
+
+**Ficar sem aulas é o extremo da faixa baixa, não a sua ausência.** `admin_adjust_package_credits()` escreve a movimentação e chama `refresh_package_status()` na mesma transação, por isso uma retirada de 3 para 0 deixa o pacote `depleted` muito antes de o cron passar. Um pacote nesse estado continua elegível para o aviso da travessia — mas **só** se a travessia existir mesmo no livro-razão: `depleted` não é produtor por si só, e um pacote vendido com 2 créditos e gasto até zero nunca avisa. `depleted` entrou apenas nesta secção, mantém a precedência sobre `expired` e continua fora de `package_expiring`.
 
 **A consulta parte dos pacotes, não do livro-razão.** Escolhem-se os pacotes operacionais com 2 ou menos créditos disponíveis — que são poucos — e, para cada um, um `LATERAL` procura a travessia mais recente usando `credit_transactions_package_idx`, o índice `(student_package_id, created_at desc)` que já existia desde a Fase 1.5. Nenhum índice novo foi preciso, e o trabalho horário deixa de crescer com o tamanho do histórico.
 
