@@ -112,6 +112,10 @@ update public.profiles set role = 'admin' where email = 'voce@exemplo.pt';
 ## Estrutura do projeto
 
 ```
+├── supabase/functions/
+│   ├── _shared/             Composição do email e transporte — TypeScript puro, testado
+│   └── notification-email-worker/  A Edge Function (Deno) que esvazia o outbox
+│
 ├── scripts/
 │   ├── verify-schema.mjs    Migrações + regras de créditos contra PostgreSQL (WASM)
 │   └── generate-icons.mjs   Ícones PNG provisórios da PWA, sem dependências
@@ -175,7 +179,9 @@ update public.profiles set role = 'admin' where email = 'voce@exemplo.pt';
 │   ├── ..._phase8b_scheduled_notifications.sql Fase 8B: o trabalho agendado
 │   ├── ..._phase8b_scheduler.sql  Fase 8B: o job `pg_cron` que lhe toca à campainha
 │   ├── ..._phase8b1_scheduler_corrections.sql Fase 8B.1: título, episódio e contagens
-│   └── ..._phase8b2_depleted_low_balance.sql Fase 8B.2: esgotado ainda é saldo baixo
+│   ├── ..._phase8b2_depleted_low_balance.sql Fase 8B.2: esgotado ainda é saldo baixo
+│   ├── ..._phase8c_email_outbox.sql Fase 8C: outbox, preferências e horas de silêncio
+│   └── ..._phase8c_email_worker_schedule.sql Fase 8C: o job que acorda o worker
 │
 └── src/
     ├── proxy.ts             Renova a sessão e protege rotas (era middleware.ts)
@@ -652,7 +658,58 @@ Duas consequências que valem por si:
 
 **Corrigir a validade rearma o aviso.** A chave de "a expirar" inclui `expires_on`. Estender a validade de um pacote muda a chave, e o aviso volta a poder ser dado para a data nova — que é o que se quer, porque é informação diferente.
 
-**Continua a não haver envio nenhum.** Nem email, nem push, nem WhatsApp. O agendador escreve em tabelas; a entrega externa é a 8C e é trabalho de um worker que lê o outbox. As preferências de `notification_preferences` governam **entrega**, e por isso ainda não são lidas por ninguém.
+**O agendador não envia nada por si.** Escreve em tabelas; quem fala com o mundo é o worker da 8C, abaixo.
+
+### O email transacional (Etapa 8C)
+
+**A operação de domínio nunca espera pelo fornecedor de email.** É a decisão D-07, escrita na Fase 1 e só agora ligada. `notification_deliveries` é o outbox — não se criou tabela nova, porque a que existe já tinha `channel`, `status`, `attempts`, `last_error`, `scheduled_for`, `sent_at` e `unique (notification_id, channel)`.
+
+**Um trigger, sobre `notifications`.** `materialize_email_delivery()` corre `after insert` e escreve a entrega na **mesma transação** do facto. Os nove tipos que a 8A e a 8B produzem passam todos por ele sem que nenhuma função de aula ou de pacote saiba que o email existe. Se a operação fizer rollback, notificação e entrega desaparecem juntas.
+
+**Nenhuma rede dentro do PostgreSQL.** O trigger escreve uma linha e acaba. `db:verify` e a suite remota verificam estruturalmente que nem `create_lesson`, nem `cancel_lesson`, nem `reschedule_lesson`, nem `run_scheduled_notifications`, nem os producers fazem `net.http_post`. A única rede vive na Edge Function.
+
+**Email é entrega, não evento.** Não se cria uma segunda notificação para dizer "email enviado": a caixa e o email são duas representações do mesmo facto.
+
+| Estado | Significado |
+|---|---|
+| `pending` | por enviar, com `scheduled_for` já calculado |
+| `skipped` | deliberadamente suprimida, com `skip_reason` |
+| `sent` | **o fornecedor aceitou a mensagem para processamento** |
+| `failed` | erro definitivo, ou limite de tentativas |
+
+`skip_reason` é estruturado — `email_disabled`, `event_disabled`, `event_not_deliverable`, `recipient_email_unavailable`, `preferences_missing` — e nunca vai para `last_error`: uma preferência desligada não é um erro.
+
+**`sent` não quer dizer "chegou à caixa de entrada".** Quer dizer que o fornecedor aceitou. Não escrever no produto que o email foi entregue.
+
+**As preferências decidem duas vezes.** Uma na materialização e outra no `claim`. Quem desliga o email entre as duas não recebe o que estava em fila — mas voltar a ligar **não** ressuscita uma entrega já `skipped`: essa terminou.
+
+**Preferências novas:** `package_expiring`, `package_expired` e `package_low_balance`, a nascer ligadas, seguindo D-06 (uma coluna, não uma tabela normalizada). Só o aluno as vê: o professor não recebe avisos de pacote nenhuns, e a Action usa um schema por papel — um schema único faria o parser estrito ler a ausência desses campos no formulário do professor como `false`.
+
+**O interruptor "avisos dentro do AulaFlow" desapareceu da interface.** A 8A decidiu que a notificação in-app é o histórico do facto e é sempre escrita; um interruptor que não desliga nada é uma promessa falsa. A coluna `in_app_enabled` fica na tabela por compatibilidade e nenhum formulário lhe toca. **Não** começar a esconder linhas da caixa com base nela.
+
+**Horas de silêncio, em horas civis de quem recebe.** `email_delivery_schedule()` usa `profiles.timezone` — a aplicação serve Lisboa, Madeira e Açores, e assumir `Europe/Lisbon` para todos silenciaria um açoriano uma hora antes do que ele pediu. Suporta intervalo normal (13:00→15:00) e o que atravessa a meia-noite (22:00→08:00). **Uma hora sozinha, ou início igual a fim, são recusados** por constraint: `start = end` tanto se leria como "zero horas" como "vinte e quatro", e adivinhar errado significa ou nunca enviar, ou enviar sempre.
+
+**O destinatário vem da conta Auth.** `profiles.email` é espelho de `auth.users.email`, e a confirmação lê-se na origem: um endereço por confirmar fica `skipped`, não é tentado. O endereço é guardado em snapshot no outbox, o que faz da entrega um trabalho autocontido — e a tabela não tem GRANT nenhum, nem view que a exponha.
+
+**Uma ficha sem conta ligada não recebe email.** Não há notificação in-app, logo não há entrega. É contrato deliberado desta etapa, não falha silenciosa; o email para fichas por reclamar fica para outra altura.
+
+**Reclamar é atómico.** `claim_email_deliveries()` usa `for update ... skip locked` mais um arrendamento em `locked_at`: dois workers em paralelo nunca apanham a mesma entrega, e um arrendamento **expirado** deixa outro worker recuperar o trabalho de um que morreu. O estado vive todo na base de dados.
+
+**`attempts` conta tentativas REAIS de envio**, e sobe no `finalize`, não no `claim`. Reclamar e não enviar (porque a preferência mudou) não é uma tentativa. O recuo é 1 min, 5 min, 15 min, 1 h, 4 h, e ao fim de cinco tentativas a entrega passa a `failed` — uma entrega falhada nunca bloqueia as seguintes.
+
+**A chave de idempotência do fornecedor é estável por entrega:** `aulaflow-email/<delivery_id>`. É a segunda defesa, não a primeira — a primeira é `unique (notification_id, channel)`. Cobre a janela em que o fornecedor aceitou e o worker morreu antes de gravar `sent`.
+
+**Não se promete exactly-once.** Base de dados, arrendamento, constraint única e idempotência do fornecedor reduzem muito os duplicados, mas um HTTP externo tem uma janela em que não se sabe se a aceitação se perdeu no regresso. Não escrever que é matematicamente impossível duplicar.
+
+**O conteúdo vem do snapshot.** O `claim` não faz JOIN a `lessons`: um aviso de criação escrito às 18:00 não passa a dizer 20:00 porque a aula foi reagendada. Todo o texto dinâmico é escapado antes de entrar em HTML; não há imagens remotas, pixel de rastreio nem scripts. Os links vão para `/aluno/notificacoes` e `/aluno/perfil` — rotas que existem — e nunca levam token.
+
+**Dois jobs, porque são dois trabalhos.** `aulaflow-scheduled-notifications` (`5 * * * *`) produz factos; `aulaflow-email-worker` (`* * * * *`) consome o outbox. Juntá-los amarraria a produção de factos à latência do fornecedor. O job de email chama `dispatch_email_worker()`, que lê URL e token do **Vault** e faz o POST por `pg_net`. Nenhum segredo entra numa migração.
+
+**A Edge Function corre com `verify_jwt = false`** — quem a invoca é o `pg_cron`, não uma pessoa — e exige o cabeçalho `x-aulaflow-worker-token`, comparado com `AULAFLOW_EMAIL_WORKER_TOKEN`. Sem esse segredo configurado, recusa tudo. A resposta é um resumo (`claimed`/`sent`/`retried`/`failed`) e nunca contém endereços, corpos, identificadores nem chaves.
+
+**Sem fornecedor configurado nada é enviado, e nada é dado como falhado:** a função responde 503, não reclama, e as entregas ficam pendentes.
+
+**Ainda não implementado:** webhooks de bounce, complaint, abertura ou clique; push; service worker; WhatsApp. Nenhum destes está no MVP, e a 8C não é uma plataforma de marketing.
 
 ### Ao criar uma tabela nova
 
@@ -1002,7 +1059,7 @@ Interface em `/professor/clubes/[id]/calendario`, com filtro por professor no UR
 
 **Não implementado:** aulas, participantes, locais, campos, recursos, conflitos, reservas e créditos. Os únicos estados são disponível e indisponível — não escrever "ocupado", "reservado", "lotado", "vagas" ou "conflito", porque nada disso existe ainda para ser verdade.
 
-Ordem atual: Fases 6 e 7 concluídas; 8A fechada (fundação de eventos e caixa in-app) e 8B fechada (agendador `pg_cron`, lembretes, alertas de pacote e expiração automática). Falta a 8C (entrega por email a partir do outbox).
+Ordem atual: Fases 6 e 7 concluídas; 8A e 8B fechadas. A 8C está implementada e validada de ponta a ponta contra um fornecedor simulado — falta a verificação com credencial real do fornecedor, e por isso **não está formalmente fechada**. A revisão integrada da Fase 8 (8D) continua pendente.
 
 ### `src/types/database.ts`
 
@@ -1040,7 +1097,7 @@ Não existe um comando de formatação separado. Use `npm run lint:fix` apenas p
 | 5 | Calendário e criação de aulas com reserva | **Concluído** — disponibilidade, projeção segura, refinamento visual, clubes/membros, calendário partilhado, locais com moradas manuais, campos/salas/áreas, criação/edição de aulas, conflitos atómicos, reserva atómica de créditos, recorrência semanal segura e revisão integrada |
 | 6 | Cancelamento, reagendamento, presenças e histórico | **Concluído** — 6A/6B: presença, falta/no-show, conclusão normal/mista, cancelamento de aula e de participação com `reserved -> available` ou `reserved -> used` seguros. 6C.1/6C.1A/6C.1B: contrato transacional de reagendamento, chave de idempotência obrigatória em namespace próprio e sete corridas de concorrência com JWTs reais. 6C.2: interface operacional, com a fronteira entre editar conteúdo e reagendar colocação imposta no PostgreSQL |
 | 7 | Área do aluno: aulas, créditos e confirmação | **Concluído** — 7A: contrato de confirmação individual, com `requires_confirmation` ligado, escrita direta na resposta fechada e RSVP separado de presença. 7B: o professor pede confirmação ao criar, o aluno responde pela sua própria participação, validado em browser e mobile |
-| 8 | Notificações, lembretes e expiração agendada | **Em curso** — 8A: producers dos eventos de aula, caixa in-app do aluno, lida/por ler e contador. 8B: agendador `pg_cron` de hora a hora, lembretes de 24 h e 2 h, saldo baixo por episódio, pacote a expirar e expiração automática em datas civis de Lisboa. Falta a 8C (entrega por email) |
+| 8 | Notificações, lembretes e expiração agendada | **Em curso** — 8A: producers dos eventos de aula, caixa in-app do aluno, lida/por ler e contador. 8B: agendador `pg_cron` de hora a hora, lembretes de 24 h e 2 h, saldo baixo por episódio, pacote a expirar e expiração automática em datas civis de Lisboa. 8C: outbox materializado por trigger na mesma transação, worker em Edge Function, preferências por tipo, horas de silêncio no fuso da conta, recuo, arrendamento e idempotência do fornecedor — **por fechar até haver credencial real do fornecedor**. Falta a 8D (revisão integrada) |
 | 9 | Supabase real, concorrência, acessibilidade e deployment | **Parcialmente concluído** — RLS em PGlite e validação real com JWTs até à Fase 8B; concorrência real de aulas, créditos, recorrência, conclusão, reagendamento e confirmação coberta; browser em dev e em build de produção; deployment pendente |
 
 **Ao concluir uma fase ou etapa:** `npm run check`, corrigir tudo o que falhe, atualizar `implementation_plan.md`, e resumir o que foi criado e como testar manualmente.

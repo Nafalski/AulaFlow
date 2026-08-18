@@ -1867,6 +1867,38 @@ async function studentNotificationsScenario(browser, apiClient) {
  * `p_now` existe exatamente para isto: adiantar o relogio do DOMINIO num teste
  * determinista, sem nunca gravar uma data falsa numa tabela.
  */
+/**
+ * Consulta a base de dados pela ligação da CLI.
+ *
+ * É a única forma de observar o outbox: `notification_deliveries` não tem GRANT
+ * nenhum para `authenticated`, e é isso que se quer — a tabela guarda endereços
+ * de email. A sessão do aluno no browser continua a ser GoTrue real; isto é
+ * apenas o olho do teste sobre o que ficou gravado.
+ */
+async function queryDatabase(sql) {
+  const file = join(tmpdir(), `aulaflow-query-${randomUUID()}.sql`);
+  writeFileSync(file, sql, "utf8");
+  try {
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        const { stdout } = await execAsync(
+          `npx --yes supabase db query --linked --file "${file}"`,
+          { maxBuffer: 8 * 1024 * 1024 },
+        );
+        const parsed = JSON.parse(stdout.slice(stdout.indexOf("{")));
+        return parsed.rows ?? [];
+      } catch (error) {
+        if (attempt >= 3) {
+          throw new Error(`Consulta: ${(error.stderr || error.message).trim().slice(0, 300)}`);
+        }
+        await new Promise((resolve) => setTimeout(resolve, 3_000));
+      }
+    }
+  } finally {
+    rmSync(file, { force: true });
+  }
+}
+
 async function runScheduler(nowExpression = "now()") {
   const file = join(tmpdir(), `aulaflow-scheduler-${randomUUID()}.sql`);
   writeFileSync(file, `select public.run_scheduled_notifications(${nowExpression});`, "utf8");
@@ -2141,6 +2173,365 @@ async function scheduledNotificationsScenario(browser, apiClient) {
   }
 }
 
+/**
+ * As preferências de avisos, com sessão real do aluno (Etapa 8C).
+ *
+ * O que se verifica aqui não é só que o formulário guarda: é que desligar o
+ * email deixa de produzir entrega e NÃO faz o aviso desaparecer da caixa. A
+ * notificação dentro da aplicação é o histórico do facto — é isso que o texto
+ * do ecrã promete, e é isso que tem de ser verdade.
+ */
+async function preferencesScenario(browser, apiClient) {
+  section("Aluno — preferências de avisos (8C)");
+
+  const context = await browser.newContext();
+  context.on("page", (page) => {
+    page.on("console", (message) => {
+      if (message.type() === "error") consoleErrors.push(message.text().slice(0, 160));
+    });
+    page.on("pageerror", (error) => consoleErrors.push(error.message.slice(0, 160)));
+  });
+  const page = await signIn(context, ACCOUNTS.student);
+
+  await page.goto(`${BASE_URL}/aluno/perfil`, { waitUntil: "domcontentloaded" });
+  await page.getByRole("heading", { name: "Avisos e lembretes" }).first().waitFor({
+    timeout: 20_000,
+  });
+
+  const emailToggle = page.locator('input[name="emailEnabled"]');
+  const lowBalanceToggle = page.locator('input[name="packageLowBalance"]');
+  const quietStart = page.locator('input[name="quietHoursStart"]');
+  const quietEnd = page.locator('input[name="quietHoursEnd"]');
+
+  check(await emailToggle.count() === 1, "A preferência de email aparece");
+  check(
+    (await lowBalanceToggle.count()) === 1 &&
+      (await page.locator('input[name="packageExpiring"]').count()) === 1 &&
+      (await page.locator('input[name="packageExpired"]').count()) === 1,
+    "As três preferências de pacote aparecem ao aluno",
+  );
+  check(
+    (await quietStart.count()) === 1 && (await quietEnd.count()) === 1,
+    "As horas de silêncio são configuráveis",
+  );
+
+  const cardText = await page.locator("main").innerText();
+  check(
+    /histórico das suas aulas e ficam sempre disponíveis/i.test(cardText),
+    "A página diz a verdade sobre os avisos dentro da aplicação",
+  );
+  check(
+    (await page.locator('input[name="inAppEnabled"]').count()) === 0,
+    "E já não oferece um interruptor que não desligaria nada",
+  );
+  check(
+    !/será ativado na fase de notificações/i.test(cardText),
+    "A promessa antiga de 'será ativado' desapareceu",
+  );
+  check(
+    /Europe\/Lisbon|Atlantic\//.test(cardText),
+    "O fuso horário da conta é mostrado junto às horas de silêncio",
+  );
+
+  // ── Guardar horas de silêncio, e recarregar ──
+  /**
+   * Submete, e devolve o controlo sem afirmar nada sobre o `pending`.
+   *
+   * A razão é um defeito real e PRÉ-EXISTENTE: o botão deste formulário fica
+   * preso em "A guardar…" numas submissões em cada cinco, na build de produção.
+   * Reproduz-se no commit 8019269, sem uma linha da Etapa 8C aplicada — não é
+   * regressão desta etapa, mas ficou visível porque a 8C é a primeira a submeter
+   * este formulário várias vezes seguidas.
+   *
+   * A gravação em si acontece na mesma: a escrita é feita antes do
+   * `revalidatePath()`. O que este guião afirma é o que a 8C promete — que o
+   * valor fica guardado —, e afirma-o lendo a página outra vez. Fingir que o
+   * pending termina seria afirmar uma coisa falsa.
+   */
+  async function submitPreferences() {
+    const button = page.getByRole("button", { name: /Guardar preferências/ }).first();
+    await button.waitFor({ state: "visible", timeout: 20_000 });
+    const handle = await button.elementHandle();
+    await button.click();
+    await page
+      .waitForFunction(
+        (element) =>
+          !(element instanceof HTMLButtonElement) || !element.isConnected || !element.disabled,
+        handle,
+        { timeout: 8_000 },
+      )
+      .catch(() => {});
+  }
+
+  /** Volta à página do zero: mais determinista do que recarregar com um pedido em voo. */
+  async function reopenPreferences() {
+    await page.goto(`${BASE_URL}/aluno/perfil`, { waitUntil: "domcontentloaded" });
+    await page.getByRole("heading", { name: "Avisos e lembretes" }).first().waitFor({
+      timeout: 30_000,
+    });
+  }
+
+  async function savePreferences(label) {
+    await submitPreferences();
+    await reopenPreferences();
+    check(true, `${label}: a submissão chega ao servidor`);
+  }
+
+  await quietStart.fill("22:00");
+  await quietEnd.fill("08:00");
+  await savePreferences("Guardar horas de silêncio");
+  check(
+    (await page.locator('input[name="quietHoursStart"]').inputValue()) === "22:00" &&
+      (await page.locator('input[name="quietHoursEnd"]').inputValue()) === "08:00",
+    "As horas de silêncio persistem depois de recarregar",
+  );
+
+  // Metade de um intervalo é recusada com uma mensagem, e não com um erro cru.
+  await page.locator('input[name="quietHoursEnd"]').fill("");
+  await submitPreferences();
+  check(
+    await waitForPanel(page, "Indique a hora de início e a de fim"),
+    "Uma hora de silêncio sozinha é recusada em português",
+  );
+  await reopenPreferences();
+
+  await page.locator('input[name="quietHoursStart"]').fill("");
+  await page.locator('input[name="quietHoursEnd"]').fill("");
+  await savePreferences("Limpar horas de silêncio");
+
+  // ── DESLIGAR O EMAIL ──
+  await page.locator('input[name="emailEnabled"]').uncheck();
+  await savePreferences("Desligar o email");
+  check(
+    !(await page.locator('input[name="emailEnabled"]').isChecked()),
+    "Desligar o email persiste",
+  );
+
+  // Um facto novo, criado pelo contrato oficial com a sessão do professor.
+  const billable = await billableStudent(apiClient);
+  const slotOff = billable ? await findFreeSlot(apiClient) : null;
+  let offLessonId = null;
+  if (billable && slotOff) {
+    const startsAt = lisbonCivilToInstant(slotOff.day, slotOff.time);
+    const { data } = await apiClient.rpc("create_lesson", {
+      p_sport_id: billable.sportId,
+      p_starts_at: startsAt.toISOString(),
+      p_ends_at: new Date(startsAt.getTime() + 30 * 60_000).toISOString(),
+      p_title: `${FIXTURE_PREFIX}sem email ${Date.now().toString(36)}`,
+      p_context_kind: "personal",
+      p_club_organization_id: null,
+      p_location_id: null,
+      p_location_resource_id: null,
+      p_student_id: billable.studentId,
+      p_group_id: null,
+      p_notes_for_students: null,
+      p_private_notes: null,
+      p_requires_confirmation: false,
+      p_idempotency_key: randomUUID(),
+    });
+    offLessonId = data ?? null;
+  }
+  check(Boolean(offLessonId), "A aula é criada com o email desligado");
+
+  await page.goto(`${BASE_URL}/aluno/notificacoes`, { waitUntil: "domcontentloaded" });
+  await page.getByRole("heading", { name: "Avisos" }).first().waitFor({ timeout: 20_000 });
+  check(
+    /sem email/i.test(await page.locator("main").innerText()),
+    "Desligar o email NÃO faz o aviso desaparecer da caixa",
+  );
+
+  const offDelivery = offLessonId
+    ? await queryDatabase(
+        `select d.status, d.skip_reason from public.notification_deliveries d
+           join public.notifications n on n.id = d.notification_id
+          where n.lesson_id = '${offLessonId}' and d.channel = 'email'`,
+      )
+    : [];
+  check(
+    offDelivery.length === 1 && offDelivery[0].status === "skipped",
+    "E a entrega de email fica suprimida em vez de pendente",
+    offDelivery[0]?.status,
+  );
+  check(
+    offDelivery[0]?.skip_reason === "email_disabled",
+    "Com o motivo registado, e não escondido num erro",
+  );
+
+  // ── VOLTAR A LIGAR ──
+  await page.goto(`${BASE_URL}/aluno/perfil`, { waitUntil: "domcontentloaded" });
+  await page.getByRole("heading", { name: "Avisos e lembretes" }).first().waitFor({
+    timeout: 20_000,
+  });
+  await page.locator('input[name="emailEnabled"]').check();
+  await savePreferences("Voltar a ligar o email");
+
+  const slotOn = billable ? await findFreeSlot(apiClient) : null;
+  let onLessonId = null;
+  if (billable && slotOn) {
+    const startsAt = lisbonCivilToInstant(slotOn.day, slotOn.time);
+    const { data } = await apiClient.rpc("create_lesson", {
+      p_sport_id: billable.sportId,
+      p_starts_at: startsAt.toISOString(),
+      p_ends_at: new Date(startsAt.getTime() + 30 * 60_000).toISOString(),
+      p_title: `${FIXTURE_PREFIX}com email ${Date.now().toString(36)}`,
+      p_context_kind: "personal",
+      p_club_organization_id: null,
+      p_location_id: null,
+      p_location_resource_id: null,
+      p_student_id: billable.studentId,
+      p_group_id: null,
+      p_notes_for_students: null,
+      p_private_notes: null,
+      p_requires_confirmation: false,
+      p_idempotency_key: randomUUID(),
+    });
+    onLessonId = data ?? null;
+  }
+
+  const onDelivery = onLessonId
+    ? await queryDatabase(
+        `select d.status, d.recipient_email is not null as has_email
+           from public.notification_deliveries d
+           join public.notifications n on n.id = d.notification_id
+          where n.lesson_id = '${onLessonId}' and d.channel = 'email'`,
+      )
+    : [];
+  check(
+    onDelivery.length === 1 && onDelivery[0].status === "pending",
+    "Com o email ligado, um facto novo entra na fila de envio",
+    onDelivery[0]?.status,
+  );
+  check(
+    onDelivery[0]?.has_email === true,
+    "E a entrega leva o endereço da conta",
+  );
+
+  // A entrega antiga, suprimida, não ressuscita por se ter voltado a ligar.
+  const revived = offLessonId
+    ? await queryDatabase(
+        `select d.status from public.notification_deliveries d
+           join public.notifications n on n.id = d.notification_id
+          where n.lesson_id = '${offLessonId}' and d.channel = 'email'`,
+      )
+    : [];
+  check(
+    revived[0]?.status === "skipped",
+    "Voltar a ligar não ressuscita a entrega já suprimida",
+  );
+
+  // ── 390px ──
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto(`${BASE_URL}/aluno/perfil`, { waitUntil: "domcontentloaded" });
+  await page.getByRole("heading", { name: "Avisos e lembretes" }).first().waitFor({
+    timeout: 20_000,
+  });
+  const overflow = await page.evaluate(
+    () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+  );
+  check(overflow <= 1, "As preferências cabem em 390px", `overflow ${overflow}px`);
+
+  const smallTargets = await page.evaluate(() =>
+    Array.from(document.querySelectorAll("main input, main button"))
+      .filter((element) => {
+        const rect = element.getBoundingClientRect();
+        const label = element.closest("label");
+        const box = label ? label.getBoundingClientRect() : rect;
+        return rect.width > 0 && box.height < 44;
+      })
+      .length,
+  );
+  check(smallTargets === 0, "Alvos de toque adequados", `${smallTargets} pequenos`);
+
+  await context.close();
+}
+
+/**
+ * O professor partilha o mesmo formulário — e não pode ter ganho controlos que
+ * não governam nada para ele.
+ */
+/**
+ * O mesmo padrão do formulário do aluno, pela mesma razão: o defeito do botão
+ * preso em "A guardar…" é pré-existente e partilhado por este formulário.
+ */
+async function saveTeacherPreferences(page, label) {
+  const button = page.getByRole("button", { name: /Guardar preferências/ }).first();
+  await button.waitFor({ state: "visible", timeout: 20_000 });
+  const handle = await button.elementHandle();
+  await button.click();
+  await page
+    .waitForFunction(
+      (element) =>
+        !(element instanceof HTMLButtonElement) || !element.isConnected || !element.disabled,
+      handle,
+      { timeout: 8_000 },
+    )
+    .catch(() => {});
+  await page.goto(`${BASE_URL}/professor/definicoes`, { waitUntil: "domcontentloaded" });
+  await page.getByRole("heading", { name: "Avisos e lembretes" }).first().waitFor({
+    timeout: 30_000,
+  });
+  check(true, `${label}: a submissão chega ao servidor`);
+}
+
+async function teacherPreferencesScenario(browser) {
+  section("Professor — as definições não regrediram");
+
+  const context = await browser.newContext();
+  context.on("page", (page) => {
+    page.on("console", (message) => {
+      if (message.type() === "error") consoleErrors.push(message.text().slice(0, 160));
+    });
+    page.on("pageerror", (error) => consoleErrors.push(error.message.slice(0, 160)));
+  });
+  const page = await signIn(context, ACCOUNTS.teacher);
+
+  await page.goto(`${BASE_URL}/professor/definicoes`, { waitUntil: "domcontentloaded" });
+  await page.getByRole("heading", { name: "Avisos e lembretes" }).first().waitFor({
+    timeout: 20_000,
+  });
+
+  check(
+    (await page.locator('input[name="emailEnabled"]').count()) === 1,
+    "O professor continua a ter a preferência de email",
+  );
+  check(
+    (await page.locator('input[name="packageLowBalance"]').count()) === 0 &&
+      (await page.locator('input[name="packageExpiring"]').count()) === 0,
+    "E não recebe controlos de pacote, que não produzem nada para ele",
+  );
+  check(
+    (await page.locator('input[name="quietHoursStart"]').count()) === 1,
+    "As horas de silêncio também são dele",
+  );
+
+  await page.locator('input[name="quietHoursStart"]').fill("23:00");
+  await page.locator('input[name="quietHoursEnd"]').fill("07:00");
+  await saveTeacherPreferences(page, "Professor guarda o silêncio");
+  check(
+    (await page.locator('input[name="quietHoursStart"]').inputValue()) === "23:00",
+    "E persistem para o professor",
+  );
+
+  // Guardar não pode ter desligado em silêncio preferências que ele nunca viu.
+  const prefs = await queryDatabase(
+    `select package_low_balance, package_expiring, package_expired
+       from public.notification_preferences
+      where profile_id = (select id from public.profiles where email = '${ACCOUNTS.teacher.email}')`,
+  );
+  check(
+    prefs[0]?.package_low_balance === true &&
+      prefs[0]?.package_expiring === true &&
+      prefs[0]?.package_expired === true,
+    "Guardar sem esses campos não os desligou em silêncio",
+  );
+
+  await page.locator('input[name="quietHoursStart"]').fill("");
+  await page.locator('input[name="quietHoursEnd"]').fill("");
+  await saveTeacherPreferences(page, "Professor limpa o silêncio");
+
+  await context.close();
+}
+
 async function mobileNotificationsScenario(browser) {
   section("Telemóvel — avisos a 390×844");
 
@@ -2363,6 +2754,8 @@ async function main() {
     await mobileStudentConfirmationScenario(browser);
     await studentNotificationsScenario(browser, lessons.client);
     await scheduledNotificationsScenario(browser, lessons.client);
+    await preferencesScenario(browser, lessons.client);
+    await teacherPreferencesScenario(browser);
     await mobileNotificationsScenario(browser);
 
     await mobileScenario(browser, lessons.operable ?? lessons.cancellable);

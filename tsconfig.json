@@ -24,6 +24,9 @@
         "name": "next"
       }
     ],
+    // Os módulos partilhados do worker importam-se com `.ts` explícito, como o
+    // Deno exige. Com `noEmit` isto não afeta nenhum output.
+    "allowImportingTsExtensions": true,
     "paths": {
       "@/*": ["./src/*"]
     }
@@ -36,5 +39,13 @@
     ".next/dev/types/**/*.ts",
     "**/*.mts"
   ],
-  "exclude": ["node_modules", ".next", "out"]
+  "exclude": [
+    "node_modules",
+    ".next",
+    "out",
+    // O entrypoint do worker corre em Deno: usa `Deno.serve`, `Deno.env` e
+    // importa por URL. Os módulos de `_shared` continuam a ser verificados —
+    // são TypeScript puro, e é isso que permite testá-los com Vitest.
+    "supabase/functions/notification-email-worker"
+  ]
 }

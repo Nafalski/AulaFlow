@@ -11,9 +11,12 @@ import {
   notificationPreferencesSchema,
   readAccountProfileFormData,
   readNotificationPreferencesFormData,
+  readStudentNotificationPreferencesFormData,
   readTeacherPublicProfileFormData,
+  studentNotificationPreferencesSchema,
   teacherPublicProfileSchema,
   type NotificationPreferencesInput,
+  type StudentNotificationPreferencesInput,
 } from "@/lib/validation/profile";
 import type { UserRole } from "@/types/database";
 
@@ -126,9 +129,19 @@ async function updateAccount(
   }
 }
 
+/**
+ * O objeto de update.
+ *
+ * `in_app_enabled` NÃO entra aqui. A coluna continua na tabela por
+ * compatibilidade, mas a Etapa 8A decidiu que o aviso dentro da aplicação é o
+ * histórico do facto e é sempre escrito — escrevê-la a partir de um formulário
+ * daria a entender que desligá-la faz alguma coisa.
+ *
+ * `profile_id`, papel e estado da conta também não: a linha é escolhida pela
+ * sessão, e nunca por um campo do formulário.
+ */
 function preferencesUpdate(input: NotificationPreferencesInput) {
   return {
-    in_app_enabled: input.inAppEnabled,
     email_enabled: input.emailEnabled,
     lesson_created: input.lessonCreated,
     lesson_updated: input.lessonUpdated,
@@ -137,6 +150,18 @@ function preferencesUpdate(input: NotificationPreferencesInput) {
     participant_changed: input.participantChanged,
     reminder_24h: input.reminder24h,
     reminder_2h: input.reminder2h,
+    quiet_hours_start: input.quietHoursStart,
+    quiet_hours_end: input.quietHoursEnd,
+  };
+}
+
+/** Os três avisos de pacote da Etapa 8B só existem para quem os recebe. */
+function studentPreferencesUpdate(input: StudentNotificationPreferencesInput) {
+  return {
+    ...preferencesUpdate(input),
+    package_expiring: input.packageExpiring,
+    package_expired: input.packageExpired,
+    package_low_balance: input.packageLowBalance,
   };
 }
 
@@ -145,16 +170,28 @@ async function updatePreferences(
   settingsPath: "/professor/definicoes" | "/aluno/perfil",
   formData: FormData,
 ): Promise<ProfileSettingsActionState> {
-  const parsed = notificationPreferencesSchema.safeParse(
-    readNotificationPreferencesFormData(formData),
-  );
+  // Cada papel tem o seu schema, e o do professor não conhece os campos de
+  // pacote. Um schema único faria o parser estrito ler a ausência desses campos
+  // como `false` e desligar preferências que o professor nunca viu.
+  const isStudent = settingsPath === "/aluno/perfil";
+
+  const parsed = isStudent
+    ? studentNotificationPreferencesSchema.safeParse(
+        readStudentNotificationPreferencesFormData(formData),
+      )
+    : notificationPreferencesSchema.safeParse(readNotificationPreferencesFormData(formData));
+
   if (!parsed.success) return validationError(parsed.error);
+
+  const update = isStudent
+    ? studentPreferencesUpdate(parsed.data as StudentNotificationPreferencesInput)
+    : preferencesUpdate(parsed.data);
 
   try {
     const supabase = await createSupabaseServerClient();
     const { data, error } = await supabase
       .from("notification_preferences")
-      .update(preferencesUpdate(parsed.data))
+      .update(update)
       .eq("profile_id", user.id)
       .select("profile_id")
       .single();

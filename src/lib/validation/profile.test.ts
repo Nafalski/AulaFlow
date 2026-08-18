@@ -5,7 +5,9 @@ import {
   notificationPreferencesSchema,
   readAccountProfileFormData,
   readNotificationPreferencesFormData,
+  readStudentNotificationPreferencesFormData,
   readTeacherPublicProfileFormData,
+  studentNotificationPreferencesSchema,
   teacherPublicProfileSchema,
 } from "./profile";
 
@@ -219,14 +221,12 @@ describe("teacherPublicProfileSchema", () => {
 describe("notificationPreferencesSchema", () => {
   it("converte checkboxes presentes e ausentes em booleanos", () => {
     const formData = new FormData();
-    formData.set("inAppEnabled", "on");
     formData.set("emailEnabled", "true");
     formData.set("lessonCreated", "1");
     formData.set("whatsappEnabled", "on");
 
     const raw = readNotificationPreferencesFormData(formData);
     expect(raw).toEqual({
-      inAppEnabled: true,
       emailEnabled: true,
       lessonCreated: true,
       lessonUpdated: false,
@@ -235,8 +235,88 @@ describe("notificationPreferencesSchema", () => {
       participantChanged: false,
       reminder24h: false,
       reminder2h: false,
+      quietHoursStart: "",
+      quietHoursEnd: "",
     });
     expect("whatsappEnabled" in raw).toBe(false);
     expect(notificationPreferencesSchema.safeParse(raw).success).toBe(true);
+  });
+
+  it("o aviso dentro da aplicação já não é um campo do formulário", () => {
+    // A Etapa 8A decidiu que a notificação in-app é o histórico do facto e é
+    // sempre escrita. Continuar a aceitar o campo deixaria o formulário gravar
+    // uma preferência que não governa nada.
+    const formData = new FormData();
+    formData.set("inAppEnabled", "on");
+
+    const raw = readNotificationPreferencesFormData(formData);
+    expect("inAppEnabled" in raw).toBe(false);
+    expect(
+      notificationPreferencesSchema.safeParse({ ...raw, inAppEnabled: true }).success,
+    ).toBe(false);
+  });
+
+  it("o professor não envia preferências de pacote, e o schema dele não as aceita", () => {
+    // Se as aceitasse, a ausência num formulário sem esses campos seria lida
+    // como `false` e desligaria em silêncio avisos que ninguém desligou.
+    const raw = readNotificationPreferencesFormData(new FormData());
+    expect(
+      notificationPreferencesSchema.safeParse({ ...raw, packageLowBalance: true }).success,
+    ).toBe(false);
+  });
+
+  it("o aluno envia os três avisos de pacote", () => {
+    const formData = new FormData();
+    formData.set("packageLowBalance", "on");
+
+    const raw = readStudentNotificationPreferencesFormData(formData);
+    expect(raw.packageLowBalance).toBe(true);
+    expect(raw.packageExpiring).toBe(false);
+    expect(raw.packageExpired).toBe(false);
+
+    const parsed = studentNotificationPreferencesSchema.safeParse(raw);
+    expect(parsed.success).toBe(true);
+  });
+});
+
+describe("horas de silêncio", () => {
+  function withQuietHours(start: string, end: string) {
+    const formData = new FormData();
+    formData.set("quietHoursStart", start);
+    formData.set("quietHoursEnd", end);
+    return notificationPreferencesSchema.safeParse(
+      readNotificationPreferencesFormData(formData),
+    );
+  }
+
+  it("os dois campos vazios significam não ter horas de silêncio", () => {
+    const parsed = withQuietHours("", "");
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.quietHoursStart).toBeNull();
+      expect(parsed.data.quietHoursEnd).toBeNull();
+    }
+  });
+
+  it("aceita um intervalo normal e um que atravessa a meia-noite", () => {
+    expect(withQuietHours("13:00", "15:00").success).toBe(true);
+    expect(withQuietHours("22:00", "08:00").success).toBe(true);
+  });
+
+  it("uma hora sozinha não descreve intervalo nenhum", () => {
+    expect(withQuietHours("22:00", "").success).toBe(false);
+    expect(withQuietHours("", "08:00").success).toBe(false);
+  });
+
+  it("início igual a fim é recusado em vez de adivinhado", () => {
+    // Tanto se leria como "zero horas de silêncio" como "vinte e quatro", e
+    // adivinhar errado significa ou nunca enviar, ou enviar sempre.
+    expect(withQuietHours("22:00", "22:00").success).toBe(false);
+  });
+
+  it("recusa horas que não existem", () => {
+    expect(withQuietHours("24:00", "08:00").success).toBe(false);
+    expect(withQuietHours("22:60", "08:00").success).toBe(false);
+    expect(withQuietHours("amanhã", "08:00").success).toBe(false);
   });
 });

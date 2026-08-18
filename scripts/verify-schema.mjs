@@ -13674,6 +13674,642 @@ check(
   "passada a meia-noite de Lisboa o pacote expira, mesmo antes da meia-noite UTC",
 );
 
+// ═════════════════════════════════════════════════════════════════════════════
+// ETAPA 8C — O OUTBOX DE EMAIL
+// ═════════════════════════════════════════════════════════════════════════════
+
+section("Etapa 8C — outbox de email");
+
+// O aluno do agendador já existe e tem conta ligada com email confirmado, que é
+// exatamente o que o trigger de materialização exige.
+async function deliveriesOf(notificationId) {
+  return rows(
+    `select id, channel, status, attempts, scheduled_for, recipient_email,
+            skip_reason, provider_message_id, locked_at, last_error
+       from public.notification_deliveries
+      where notification_id = $1`,
+    [notificationId],
+  );
+}
+
+/** Escreve um aviso pelo caminho oficial e devolve a entrega materializada. */
+async function notifyAndFetchDelivery(profileId, type, dedupe, createdAt = null) {
+  const inserted = await one(
+    `insert into public.notifications
+       (recipient_profile_id, type, title, body, dedupe_key, created_at)
+     values ($1, $2::public.notification_type, $3, $4, $5, coalesce($6::timestamptz, now()))
+     returning id`,
+    [profileId, type, `Aviso ${dedupe}`, `Corpo do aviso ${dedupe}`, dedupe, createdAt],
+  );
+  const list = await deliveriesOf(inserted.id);
+  return { notificationId: inserted.id, delivery: list[0] ?? null };
+}
+
+async function setPreference(profileId, patch) {
+  const assignments = Object.keys(patch)
+    .map((column, index) => `${column} = $${index + 2}`)
+    .join(", ");
+  await db.query(
+    `update public.notification_preferences set ${assignments} where profile_id = $1`,
+    [profileId, ...Object.values(patch)],
+  );
+}
+
+const schedProfile = await one(
+  `select profile_id from public.student_profiles where id = $1`,
+  [schedStudent.id],
+);
+const SCHED_PROFILE = schedProfile.profile_id;
+
+check(SCHED_PROFILE !== null, "o aluno do agendador tem conta ligada");
+
+// ── A entrega nasce com o facto, na mesma transação ──
+const created8c = await notifyAndFetchDelivery(SCHED_PROFILE, "lesson_created", "8c:criada:1");
+check(
+  created8c.delivery !== null && created8c.delivery.channel === "email",
+  "um aviso elegível materializa uma entrega de email",
+);
+check(
+  created8c.delivery?.status === "pending",
+  "com email ligado e o tipo ligado, a entrega fica pendente",
+);
+check(
+  created8c.delivery?.recipient_email === "agendado@exemplo.pt",
+  "a entrega guarda o email da conta, e não um email vindo de um formulário",
+);
+check(
+  created8c.delivery?.skip_reason === null && created8c.delivery?.attempts === 0,
+  "uma entrega pendente nasce sem motivo de supressão e sem tentativas",
+);
+
+// ── Uma só entrega por aviso e canal ──
+await db.query(
+  `insert into public.notifications
+     (recipient_profile_id, type, title, body, dedupe_key)
+   values ($1, 'lesson_created', 'Repetido', 'Corpo', '8c:criada:1')
+   on conflict (dedupe_key) do nothing`,
+  [SCHED_PROFILE],
+);
+check(
+  (await deliveriesOf(created8c.notificationId)).length === 1,
+  "repetir a operação não duplica a entrega",
+);
+
+// ── Email desligado: a entrega existe, mas suprimida e com motivo ──
+await setPreference(SCHED_PROFILE, { email_enabled: false });
+const offDelivery = await notifyAndFetchDelivery(SCHED_PROFILE, "lesson_cancelled", "8c:email-off");
+check(
+  offDelivery.delivery?.status === "skipped",
+  "com o email desligado a entrega nasce suprimida",
+);
+check(
+  offDelivery.delivery?.skip_reason === "email_disabled",
+  "o motivo é estruturado, e não escrito em last_error",
+);
+check(
+  offDelivery.delivery?.last_error === null && offDelivery.delivery?.recipient_email === null,
+  "uma entrega suprimida não guarda erro nem endereço",
+);
+await setPreference(SCHED_PROFILE, { email_enabled: true });
+
+// ── Tipo desligado ──
+await setPreference(SCHED_PROFILE, { reminder_2h: false });
+const typeOff = await notifyAndFetchDelivery(SCHED_PROFILE, "lesson_reminder_2h", "8c:tipo-off");
+check(
+  typeOff.delivery?.status === "skipped" && typeOff.delivery?.skip_reason === "event_disabled",
+  "um tipo desligado é suprimido com o seu próprio motivo",
+);
+await setPreference(SCHED_PROFILE, { reminder_2h: true });
+
+// ── Os avisos de pacote da 8B usam as preferências novas ──
+await setPreference(SCHED_PROFILE, { package_low_balance: false });
+const lowOff = await notifyAndFetchDelivery(
+  SCHED_PROFILE,
+  "package_low_balance",
+  "8c:pacote-off",
+);
+check(
+  lowOff.delivery?.status === "skipped" && lowOff.delivery?.skip_reason === "event_disabled",
+  "o aviso de poucas aulas respeita a preferência do aluno",
+);
+await setPreference(SCHED_PROFILE, { package_low_balance: true });
+
+const lowOn = await notifyAndFetchDelivery(SCHED_PROFILE, "package_low_balance", "8c:pacote-on");
+check(lowOn.delivery?.status === "pending", "ligada, a preferência de pacote deixa passar");
+
+const expiringOn = await notifyAndFetchDelivery(
+  SCHED_PROFILE,
+  "package_expiring",
+  "8c:expira-on",
+);
+const expiredOn = await notifyAndFetchDelivery(SCHED_PROFILE, "package_expired", "8c:expirou-on");
+check(
+  expiringOn.delivery?.status === "pending" && expiredOn.delivery?.status === "pending",
+  "pacote a expirar e pacote expirado têm cada um a sua preferência",
+);
+
+// ── Um tipo que ninguém produz não gera email ──
+const unproduced = await notifyAndFetchDelivery(
+  SCHED_PROFILE,
+  "account_blocked",
+  "8c:sem-producer",
+);
+check(
+  unproduced.delivery?.status === "skipped" &&
+    unproduced.delivery?.skip_reason === "event_not_deliverable",
+  "um tipo do enum sem producer nem preferência não é enviado por omissão",
+);
+
+// ── HORAS DE SILÊNCIO ──────────────────────────────────────────────────────
+//
+// O relógio da suite não entra nisto: os instantes são fixos, e por isso o
+// resultado é o mesmo às três da manhã ou ao meio-dia.
+check(
+  (
+    await one(
+      `select public.email_delivery_schedule($1, '2026-08-18T09:00:00Z'::timestamptz) as at`,
+      [SCHED_PROFILE],
+    )
+  ).at.toISOString() === "2026-08-18T09:00:00.000Z",
+  "sem horas de silêncio o email segue no instante do facto",
+);
+
+// 13:00–15:00 em Lisboa (verão: UTC+1).
+await setPreference(SCHED_PROFILE, { quiet_hours_start: "13:00", quiet_hours_end: "15:00" });
+const inWindow = await one(
+  `select public.email_delivery_schedule($1, '2026-08-18T13:00:00Z'::timestamptz) as at`,
+  [SCHED_PROFILE],
+);
+check(
+  inWindow.at.toISOString() === "2026-08-18T14:00:00.000Z",
+  "às 14:00 de Lisboa, dentro do silêncio, o email fica para as 15:00 locais",
+);
+const outOfWindow = await one(
+  `select public.email_delivery_schedule($1, '2026-08-18T15:00:00Z'::timestamptz) as at`,
+  [SCHED_PROFILE],
+);
+check(
+  outOfWindow.at.toISOString() === "2026-08-18T15:00:00.000Z",
+  "às 16:00 de Lisboa, já fora do silêncio, o email segue logo",
+);
+
+// 22:00–08:00, o intervalo que atravessa a meia-noite.
+await setPreference(SCHED_PROFILE, { quiet_hours_start: "22:00", quiet_hours_end: "08:00" });
+const overnightLate = await one(
+  `select public.email_delivery_schedule($1, '2026-08-18T22:00:00Z'::timestamptz) as at`,
+  [SCHED_PROFILE],
+);
+check(
+  overnightLate.at.toISOString() === "2026-08-19T07:00:00.000Z",
+  "às 23:00 de Lisboa o email fica para as 08:00 da manhã seguinte",
+);
+const overnightEarly = await one(
+  `select public.email_delivery_schedule($1, '2026-08-19T04:00:00Z'::timestamptz) as at`,
+  [SCHED_PROFILE],
+);
+check(
+  overnightEarly.at.toISOString() === "2026-08-19T07:00:00.000Z",
+  "às 05:00 de Lisboa ainda é o silêncio da noite anterior, e o fim é hoje",
+);
+const overnightMorning = await one(
+  `select public.email_delivery_schedule($1, '2026-08-19T09:00:00Z'::timestamptz) as at`,
+  [SCHED_PROFILE],
+);
+check(
+  overnightMorning.at.toISOString() === "2026-08-19T09:00:00.000Z",
+  "às 10:00 de Lisboa o silêncio já passou e o email segue logo",
+);
+
+// ── O FUSO É O DE QUEM RECEBE, E NÃO O DO SERVIDOR ──
+//
+// Nos Açores são menos duas horas do que em Lisboa. Com o mesmo instante e as
+// mesmas horas de silêncio, a decisão tem de ser diferente — e é isto que
+// falharia se o código assumisse Europe/Lisbon para toda a gente.
+await db.query(`update public.profiles set timezone = 'Atlantic/Azores' where id = $1`, [
+  SCHED_PROFILE,
+]);
+// No verão os Açores estão em UTC+0 e Lisboa em UTC+1. O mesmo instante —
+// 21:00Z — é 22:00 em Lisboa, já dentro do silêncio, e 21:00 nos Açores, ainda
+// fora dele. É exatamente aqui que assumir Europe/Lisbon para toda a gente
+// silenciaria uma pessoa uma hora antes do que ela pediu.
+const azores = await one(
+  `select public.email_delivery_schedule($1, '2026-08-18T21:00:00Z'::timestamptz) as at`,
+  [SCHED_PROFILE],
+);
+check(
+  azores.at.toISOString() === "2026-08-18T21:00:00.000Z",
+  "às 21:00 dos Açores ainda não começou o silêncio das 22:00 locais",
+);
+const azoresLate = await one(
+  `select public.email_delivery_schedule($1, '2026-08-18T23:00:00Z'::timestamptz) as at`,
+  [SCHED_PROFILE],
+);
+check(
+  azoresLate.at.toISOString() === "2026-08-19T08:00:00.000Z",
+  "às 23:00 dos Açores o email fica para as 08:00 locais, que são 08:00 UTC",
+);
+await db.query(`update public.profiles set timezone = 'Europe/Lisbon' where id = $1`, [
+  SCHED_PROFILE,
+]);
+
+// A entrega criada dentro do silêncio nasce agendada para depois.
+const quietDelivery = await notifyAndFetchDelivery(
+  SCHED_PROFILE,
+  "lesson_created",
+  "8c:silencio",
+  "2026-08-18T22:30:00Z",
+);
+check(
+  quietDelivery.delivery?.scheduled_for.toISOString() === "2026-08-19T07:00:00.000Z",
+  "um aviso criado dentro do silêncio nasce agendado para o fim dele",
+);
+await setPreference(SCHED_PROFILE, { quiet_hours_start: null, quiet_hours_end: null });
+
+// A constraint do banco recusa metade de um intervalo.
+await mustReject(
+  "uma hora de silêncio sozinha é recusada pelo banco",
+  () =>
+    db.query(
+      `update public.notification_preferences set quiet_hours_start = '22:00',
+         quiet_hours_end = null where profile_id = $1`,
+      [SCHED_PROFILE],
+    ),
+  "quiet_hours_valid",
+);
+await mustReject(
+  "início igual a fim é recusado em vez de adivinhado",
+  () =>
+    db.query(
+      `update public.notification_preferences set quiet_hours_start = '22:00',
+         quiet_hours_end = '22:00' where profile_id = $1`,
+      [SCHED_PROFILE],
+    ),
+  "quiet_hours_valid",
+);
+
+// ── RECLAMAR, ENVIAR, FECHAR ───────────────────────────────────────────────
+//
+// Andaime de teste: cada aviso escrito pelas fases anteriores materializou
+// também a sua entrega, e o worker escolhe as MAIS ANTIGAS primeiro. Sem afastar
+// esse acervo, um lote de dez nunca chegaria às entregas criadas aqui — e o que
+// se quer exercitar é o mecanismo, não a fila de desenvolvimento.
+await db.query(
+  `update public.notification_deliveries
+      set scheduled_for = now() + interval '100 years'
+    where status = 'pending'`,
+);
+
+const claimTarget = await notifyAndFetchDelivery(SCHED_PROFILE, "lesson_created", "8c:claim:1");
+
+const claimed = await rows(
+  `select * from public.claim_email_deliveries(10, 300, now())`,
+);
+check(
+  claimed.some((row) => row.delivery_id === claimTarget.delivery.id),
+  "o worker reclama a entrega pendente já vencida",
+);
+const claimedRow = claimed.find((row) => row.delivery_id === claimTarget.delivery.id);
+check(
+  claimedRow?.subject === `Aviso 8c:claim:1` && claimedRow?.body === `Corpo do aviso 8c:claim:1`,
+  "o conteúdo vem do aviso histórico, e não do estado atual da aula",
+);
+check(
+  (await deliveriesOf(claimTarget.notificationId))[0].locked_at !== null,
+  "reclamar deixa o arrendamento marcado",
+);
+
+// Reclamar não é tentar: `attempts` só sobe quando se fala com o fornecedor.
+check(
+  (await deliveriesOf(claimTarget.notificationId))[0].attempts === 0,
+  "reclamar sem enviar não conta como tentativa",
+);
+
+// Um segundo worker, na mesma janela, não vê a linha arrendada.
+const secondClaim = await rows(
+  `select * from public.claim_email_deliveries(10, 300, now())`,
+);
+check(
+  !secondClaim.some((row) => row.delivery_id === claimTarget.delivery.id),
+  "um segundo worker não reclama a mesma entrega enquanto o arrendamento é válido",
+);
+
+check(
+  (
+    await one(`select public.finalize_email_delivery($1, 'sent', 'msg_abc', null) as result`, [
+      claimTarget.delivery.id,
+    ])
+  ).result === "sent",
+  "fechar com sucesso devolve sent",
+);
+const sentRow = (await deliveriesOf(claimTarget.notificationId))[0];
+check(
+  sentRow.status === "sent" && sentRow.attempts === 1 && sentRow.provider_message_id === "msg_abc",
+  "a entrega enviada guarda a tentativa e o identificador do fornecedor",
+);
+check(
+  sentRow.locked_at === null && sentRow.last_error === null,
+  "o sucesso limpa o arrendamento e o erro anterior",
+);
+check(
+  (
+    await one(`select public.finalize_email_delivery($1, 'sent', 'msg_outro', null) as result`, [
+      claimTarget.delivery.id,
+    ])
+  ).result === "sent",
+  "fechar a mesma entrega outra vez não a reabre nem volta a contar",
+);
+check(
+  (await deliveriesOf(claimTarget.notificationId))[0].attempts === 1,
+  "e o número de tentativas continua o mesmo",
+);
+
+// ── RECUO PROGRESSIVO ──────────────────────────────────────────────────────
+const retryTarget = await notifyAndFetchDelivery(SCHED_PROFILE, "lesson_created", "8c:retry:1");
+const backoffs = [];
+for (let attempt = 1; attempt <= 5; attempt += 1) {
+  const outcome = await one(
+    `select public.finalize_email_delivery($1, 'retry', null, 'HTTP 500', '2026-08-18T10:00:00Z'::timestamptz) as result`,
+    [retryTarget.delivery.id],
+  );
+  const row = (await deliveriesOf(retryTarget.notificationId))[0];
+  backoffs.push({
+    result: outcome.result,
+    status: row.status,
+    attempts: row.attempts,
+    minutes:
+      (row.scheduled_for.getTime() - Date.parse("2026-08-18T10:00:00Z")) / 60000,
+  });
+}
+check(
+  backoffs.slice(0, 4).every((step) => step.result === "retry"),
+  "as primeiras falhas temporárias voltam a ficar pendentes",
+);
+check(
+  backoffs.map((step) => step.attempts).join(",") === "1,2,3,4,5",
+  "cada finalize conta exatamente uma tentativa de envio",
+);
+check(
+  backoffs.slice(0, 4).map((step) => step.minutes).join(",") === "1,5,15,60",
+  "o recuo cresce: 1 min, 5 min, 15 min, 1 h",
+);
+check(
+  backoffs[4].result === "failed" && backoffs[4].status === "failed",
+  "ao fim do limite de tentativas a entrega passa a falhada",
+);
+check(
+  (await deliveriesOf(retryTarget.notificationId))[0].locked_at === null,
+  "uma entrega falhada não fica com o arrendamento preso",
+);
+
+// Uma falha definitiva não gasta cinco tentativas a saber o que já se sabe.
+const permanent = await notifyAndFetchDelivery(SCHED_PROFILE, "lesson_created", "8c:permanente");
+check(
+  (
+    await one(
+      `select public.finalize_email_delivery($1, 'failed', null, 'invalid recipient') as result`,
+      [permanent.delivery.id],
+    )
+  ).result === "failed",
+  "um erro inequívoco do pedido falha à primeira",
+);
+check(
+  (await deliveriesOf(permanent.notificationId))[0].attempts === 1,
+  "e conta apenas a tentativa que realmente aconteceu",
+);
+
+// Uma entrega falhada não bloqueia as seguintes.
+const afterFailure = await notifyAndFetchDelivery(SCHED_PROFILE, "lesson_created", "8c:seguinte");
+const claimAfterFailure = await rows(
+  `select * from public.claim_email_deliveries(10, 300, now())`,
+);
+check(
+  claimAfterFailure.some((row) => row.delivery_id === afterFailure.delivery.id),
+  "uma entrega falhada não impede as seguintes de serem reclamadas",
+);
+await db.query(`select public.finalize_email_delivery($1, 'sent', 'msg_x', null)`, [
+  afterFailure.delivery.id,
+]);
+
+// ── ARRENDAMENTO EXPIRADO ──────────────────────────────────────────────────
+//
+// O worker morre depois de reclamar. Sem recuperação, a entrega ficaria presa
+// para sempre — e o estado não pode depender da memória de um processo.
+// O facto é datado, para que as três sondagens do arrendamento caiam todas
+// depois de `scheduled_for` — senão a entrega nem sequer seria elegível.
+const stale = await notifyAndFetchDelivery(
+  SCHED_PROFILE,
+  "lesson_created",
+  "8c:arrendamento",
+  "2026-08-18T09:00:00Z",
+);
+await rows(`select * from public.claim_email_deliveries(10, 300, '2026-08-18T10:00:00Z'::timestamptz)`);
+check(
+  (await deliveriesOf(stale.notificationId))[0].locked_at !== null,
+  "a entrega fica reclamada",
+);
+const beforeTimeout = await rows(
+  `select * from public.claim_email_deliveries(10, 300, '2026-08-18T10:02:00Z'::timestamptz)`,
+);
+check(
+  !beforeTimeout.some((row) => row.delivery_id === stale.delivery.id),
+  "antes de o arrendamento expirar, ninguém a reclama",
+);
+const afterTimeout = await rows(
+  `select * from public.claim_email_deliveries(10, 300, '2026-08-18T10:10:00Z'::timestamptz)`,
+);
+check(
+  afterTimeout.some((row) => row.delivery_id === stale.delivery.id),
+  "passado o arrendamento, outro worker recupera o trabalho",
+);
+await db.query(`select public.finalize_email_delivery($1, 'sent', 'msg_y', null)`, [
+  stale.delivery.id,
+]);
+
+// ── A PREFERÊNCIA MUDA DEPOIS DE A ENTREGA ESTAR EM FILA ───────────────────
+const queued = await notifyAndFetchDelivery(SCHED_PROFILE, "lesson_created", "8c:mudou");
+check(queued.delivery?.status === "pending", "a entrega entra em fila normalmente");
+
+await setPreference(SCHED_PROFILE, { email_enabled: false });
+const claimAfterOff = await rows(`select * from public.claim_email_deliveries(10, 300, now())`);
+check(
+  !claimAfterOff.some((row) => row.delivery_id === queued.delivery.id),
+  "quem desligou o email não recebe o que estava em fila",
+);
+check(
+  (await deliveriesOf(queued.notificationId))[0].status === "skipped",
+  "essa entrega passa a suprimida em vez de ficar pendente para sempre",
+);
+
+await setPreference(SCHED_PROFILE, { email_enabled: true });
+const claimAfterOn = await rows(`select * from public.claim_email_deliveries(10, 300, now())`);
+check(
+  !claimAfterOn.some((row) => row.delivery_id === queued.delivery.id),
+  "voltar a ligar o email não ressuscita a entrega já suprimida",
+);
+const freshAfterOn = await notifyAndFetchDelivery(SCHED_PROFILE, "lesson_created", "8c:novo");
+check(
+  freshAfterOn.delivery?.status === "pending",
+  "mas um facto novo entra normalmente no fluxo",
+);
+
+// ── SEM CONTA LIGADA NÃO HÁ AVISO, E POR ISSO NÃO HÁ EMAIL ─────────────────
+//
+// Comportamento deliberado da 8C, e não uma falha silenciosa: o email de uma
+// ficha por reclamar fica para outra etapa.
+const unlinked8c = await one(
+  `insert into public.student_profiles (organization_id, created_by_teacher_id, full_name, email)
+   values ($1, $2, 'Aluno sem conta 8C', 'sem.conta.8c@exemplo.pt')
+   returning id, profile_id`,
+  [org, teacher.id],
+);
+check(
+  unlinked8c.profile_id === null,
+  "a ficha nasce sem conta ligada",
+);
+const deliveriesBefore = await one(
+  `select count(*)::int as total from public.notification_deliveries`,
+);
+await db.query(
+  `select public.record_lesson_notification_if_new(
+     (select l from public.lessons l limit 1), $1, 'lesson_created', 'T', 'B', '8c:sem-conta')`,
+  [unlinked8c.id],
+);
+const deliveriesAfter = await one(
+  `select count(*)::int as total from public.notification_deliveries`,
+);
+check(
+  deliveriesBefore.total === deliveriesAfter.total,
+  "sem conta ligada não há aviso nem entrega, e o domínio continua a funcionar",
+);
+
+// ── O OUTBOX É PRIVADO ─────────────────────────────────────────────────────
+for (const [label, uid] of [
+  ["aluno", SCHED_UID],
+  ["professor", TEACHER_UID],
+  ["administrador", ADMIN_UID],
+]) {
+  // Sem GRANT nenhum, isto nem chega a devolver zero linhas: é recusado. E é
+  // essa a intenção — a Fase 1 deixou a tabela com RLS ativo e zero policies.
+  await mustReject(`o ${label} não lê nenhuma entrega do outbox`, () =>
+    asDatabaseRole("authenticated", uid, () =>
+      db.query(`select count(*)::int as total from public.notification_deliveries`),
+    ),
+  );
+}
+
+await mustReject("nenhum cliente escreve no outbox", () =>
+  asDatabaseRole("authenticated", SCHED_UID, () =>
+    db.query(
+      `insert into public.notification_deliveries (notification_id, channel)
+       values ($1, 'email')`,
+      [created8c.notificationId],
+    ),
+  ),
+);
+
+for (const fn of [
+  `public.claim_email_deliveries(1, 300, now())`,
+  `public.finalize_email_delivery('00000000-0000-4000-8000-000000000000'::uuid, 'sent', null, null)`,
+  `public.email_delivery_block_reason('00000000-0000-4000-8000-000000000000'::uuid, 'lesson_created')`,
+  `public.email_delivery_schedule('00000000-0000-4000-8000-000000000000'::uuid, now())`,
+  `public.dispatch_email_worker()`,
+]) {
+  await mustReject(
+    `nenhum cliente executa ${fn.split("(")[0].replace("public.", "")}`,
+    () => asDatabaseRole("authenticated", SCHED_UID, () => db.query(`select ${fn}`)),
+  );
+}
+
+// ── NENHUMA REDE DENTRO DE UMA MUTAÇÃO DE DOMÍNIO ──────────────────────────
+//
+// Prova estrutural: se alguma destas funções chamasse `net.http_post`, uma
+// indisponibilidade do fornecedor de email passaria a poder fazer falhar um
+// cancelamento de aula.
+const domainSources = await rows(
+  `select p.proname, p.prosrc
+     from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'public'
+      and p.proname in ('create_lesson', 'cancel_lesson', 'reschedule_lesson',
+                        'complete_lesson', 'run_scheduled_notifications',
+                        'materialize_email_delivery', 'record_lesson_notification_if_new',
+                        'record_package_notification')`,
+);
+check(
+  domainSources.length >= 8,
+  "as funções de domínio e os producers estão todas presentes",
+);
+check(
+  domainSources.every((fn) => !/net\.http|http_post|http_get|pg_net/i.test(fn.prosrc)),
+  "nenhuma operação de domínio nem producer faz HTTP: a única rede vive no worker",
+);
+
+// ── UMA FALHA DE EMAIL NÃO DESFAZ O DOMÍNIO ────────────────────────────────
+//
+// O coração da decisão D-07. O trigger que materializa a entrega corre na mesma
+// transação; se ele rebentasse, o facto desapareceria com ele. Aqui força-se a
+// pior situação plausível — preferências em falta — e confirma-se que o aviso
+// sobrevive na mesma.
+const noPrefsUid = "8c8c8c8c-0000-4000-8000-00000000c001";
+await db.query(
+  `insert into auth.users (id, email, email_confirmed_at, raw_user_meta_data)
+   values ($1, 'sem.prefs.8c@exemplo.pt', now(), '{"role":"student","full_name":"Sem Preferências"}'::jsonb)`,
+  [noPrefsUid],
+);
+await db.query(`delete from public.notification_preferences where profile_id = $1`, [noPrefsUid]);
+const noPrefs = await notifyAndFetchDelivery(noPrefsUid, "lesson_created", "8c:sem-prefs");
+check(
+  (await one(`select id from public.notifications where id = $1`, [noPrefs.notificationId]))
+    !== null,
+  "o facto é gravado mesmo quando a entrega não pode ser decidida",
+);
+check(
+  noPrefs.delivery?.status === "skipped" &&
+    noPrefs.delivery?.skip_reason === "preferences_missing",
+  "sem preferências registadas não se assume consentimento",
+);
+
+// ── ISOLAMENTO ENTRE DESTINATÁRIOS ─────────────────────────────────────────
+const otherDeliveries = await rows(
+  `select d.recipient_email
+     from public.notification_deliveries d
+     join public.notifications n on n.id = d.notification_id
+    where n.recipient_profile_id = $1 and d.recipient_email is not null`,
+  [SCHED_PROFILE],
+);
+check(
+  otherDeliveries.every((row) => row.recipient_email === "agendado@exemplo.pt"),
+  "cada entrega leva apenas o endereço do seu próprio destinatário",
+);
+
+// ── O AGENDAMENTO DO WORKER ────────────────────────────────────────────────
+check(
+  (
+    await one(
+      `select count(*)::int as total from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+        where n.nspname = 'public' and p.proname = 'dispatch_email_worker'`,
+    )
+  ).total === 1,
+  "a função de despacho existe mesmo onde pg_net não está disponível",
+);
+check(
+  (
+    await one(
+      `select p.proconfig::text as config from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+        where n.nspname = 'public' and p.proname = 'dispatch_email_worker'`,
+    )
+  ).config.includes("search_path=public, pg_temp"),
+  "e tem search_path fixo, como todas as SECURITY DEFINER do projeto",
+);
+check(
+  !(
+    await one(
+      `select p.prosrc from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+        where n.nspname = 'public' and p.proname = 'dispatch_email_worker'`,
+    )
+  ).prosrc.match(/re_[A-Za-z0-9]{8,}|Bearer [A-Za-z0-9]/),
+  "nenhum segredo literal ficou escrito na função de despacho",
+);
+
 // ── Resultado ────────────────────────────────────────────────────────────────
 
 console.log(

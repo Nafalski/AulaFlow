@@ -1,0 +1,22 @@
+# ============================================================================
+# AulaFlow — configuração da CLI do Supabase
+#
+# Este ficheiro existe SOMENTE por causa da Edge Function da Etapa 8C. Não
+# configura Auth, base de dados local, Storage nem Realtime: essas partes do
+# projeto continuam a ser geridas pelo painel, e mexer-lhes aqui arriscava
+# divergir do que está realmente configurado no remoto.
+# ============================================================================
+
+project_id = "aulaflow"
+
+[functions.notification-email-worker]
+# `verify_jwt = false` porque quem invoca é o `pg_cron` através de `pg_net`, e
+# não uma pessoa com sessão iniciada. Não há JWT de utilizador nenhum para
+# verificar.
+#
+# Isto NÃO deixa a função aberta: ela exige um token dedicado no cabeçalho
+# `x-aulaflow-worker-token`, comparado contra o segredo
+# `AULAFLOW_EMAIL_WORKER_TOKEN`, e recusa qualquer pedido quando esse segredo
+# não está configurado. Deixar `verify_jwt = true` obrigaria a guardar um JWT de
+# serviço no Vault e a renová-lo — mais segredo em circulação, não menos.
+verify_jwt = false

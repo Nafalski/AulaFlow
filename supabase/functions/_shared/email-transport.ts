@@ -1,0 +1,138 @@
+/**
+ * O transporte, e a leitura do que o fornecedor respondeu.
+ *
+ * Separado da composição e do SQL de propósito: classificar um 429 como "tentar
+ * outra vez" e um 422 como "não insistas" é uma regra de negócio, e regras de
+ * negócio testam-se sem rede. `classifyProviderResult()` é uma função pura; só
+ * `sendEmailViaResend()` fala com o mundo.
+ */
+
+export type ProviderOutcome = "sent" | "retry" | "failed";
+
+export type ProviderResult = {
+  outcome: ProviderOutcome;
+  messageId?: string;
+  error?: string;
+};
+
+/**
+ * A chave de idempotência da entrega, estável em todas as tentativas.
+ *
+ * É a SEGUNDA defesa, não a primeira — a primeira é `unique (notification_id,
+ * channel)` na base de dados. Esta cobre a janela em que o fornecedor aceitou a
+ * mensagem e o worker morreu antes de conseguir gravar `sent`: a repetição
+ * apresenta a mesma chave, e o fornecedor reconhece-a em vez de enviar outra vez.
+ *
+ * Gerar um UUID novo por tentativa destruiria exatamente essa proteção.
+ */
+export function providerIdempotencyKey(deliveryId: string): string {
+  return `aulaflow-email/${deliveryId}`;
+}
+
+/**
+ * O que fazer com o que o fornecedor respondeu.
+ *
+ * - 2xx: aceite.
+ * - 408/429 e 5xx: o problema é temporário — limite de ritmo, indisponibilidade,
+ *   timeout. Vale a pena repetir.
+ * - 4xx restantes: o pedido está errado e vai continuar errado. Endereço
+ *   inválido, remetente não verificado, chave sem permissões — repetir cinco
+ *   vezes não muda nenhuma dessas coisas, e só atrasa a fila.
+ */
+export function classifyProviderResult(status: number): ProviderOutcome {
+  if (status >= 200 && status < 300) return "sent";
+  if (status === 408 || status === 429) return "retry";
+  if (status >= 500) return "retry";
+  return "failed";
+}
+
+/**
+ * Uma falha de rede nunca é resposta: não houve status nenhum. Não se sabe
+ * sequer se o fornecedor recebeu o pedido — e é por isso que se repete com a
+ * mesma chave de idempotência, em vez de assumir que não chegou.
+ */
+export function networkFailureResult(message: string): ProviderResult {
+  return { outcome: "retry", error: sanitizeProviderError(message) };
+}
+
+/**
+ * O erro que fica gravado é curto e sem segredos.
+ *
+ * A resposta do fornecedor pode trazer eco do pedido; guardar tudo arriscaria
+ * escrever cabeçalhos de autorização na base de dados. Guarda-se o suficiente
+ * para diagnosticar, e mais nada.
+ */
+export function sanitizeProviderError(raw: string): string {
+  return raw
+    .replace(/re_[A-Za-z0-9_-]{8,}/g, "[redacted]")
+    .replace(/Bearer\s+\S+/gi, "[redacted]")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 300);
+}
+
+export type ResendRequest = {
+  apiKey: string;
+  from: string;
+  to: string;
+  subject: string;
+  text: string;
+  html: string;
+  idempotencyKey: string;
+};
+
+/** O `fetch` é injetado para que os testes possam exercer 200, 429, 500 e falha de rede. */
+export type FetchLike = (url: string, init: RequestInit) => Promise<Response>;
+
+/**
+ * Chamada HTTP direta, sem a biblioteca do fornecedor.
+ *
+ * É um POST com um JSON. Trazer um SDK inteiro para isto acrescentaria uma
+ * dependência ao bundle e uma superfície de atualização, sem tirar nenhuma
+ * decisão das nossas mãos.
+ */
+export async function sendEmailViaResend(
+  request: ResendRequest,
+  fetchImpl: FetchLike,
+): Promise<ProviderResult> {
+  let response: Response;
+
+  try {
+    response = await fetchImpl("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${request.apiKey}`,
+        "Content-Type": "application/json",
+        "Idempotency-Key": request.idempotencyKey,
+      },
+      body: JSON.stringify({
+        from: request.from,
+        to: [request.to],
+        subject: request.subject,
+        text: request.text,
+        html: request.html,
+      }),
+    });
+  } catch (error) {
+    return networkFailureResult(error instanceof Error ? error.message : "network failure");
+  }
+
+  const outcome = classifyProviderResult(response.status);
+  const raw = await response.text().catch(() => "");
+
+  if (outcome !== "sent") {
+    return { outcome, error: sanitizeProviderError(raw || `HTTP ${response.status}`) };
+  }
+
+  // Só o identificador da mensagem é guardado. A resposta inteira não acrescenta
+  // nada que se possa vir a precisar, e é mais uma coisa a proteger.
+  let messageId: string | undefined;
+  try {
+    const parsed = JSON.parse(raw) as { id?: unknown };
+    if (typeof parsed.id === "string") messageId = parsed.id;
+  } catch {
+    messageId = undefined;
+  }
+
+  return { outcome: "sent", messageId };
+}

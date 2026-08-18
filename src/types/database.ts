@@ -742,6 +742,10 @@ export type NotificationPreferences = {
   reminder_2h: boolean;
   quiet_hours_start: TimeOnly | null;
   quiet_hours_end: TimeOnly | null;
+  // Avisos de pacote da Etapa 8B, configuráveis a partir da 8C.
+  package_expiring: boolean;
+  package_expired: boolean;
+  package_low_balance: boolean;
   created_at: Timestamp;
   updated_at: Timestamp;
 }
@@ -755,6 +759,12 @@ export type NotificationDelivery = {
   last_error: string | null;
   scheduled_for: Timestamp;
   sent_at: Timestamp | null;
+  // Colunas do worker da Etapa 8C. A tabela não tem acesso de cliente nenhum e
+  // nenhuma view a expõe — `recipient_email` em particular nunca sai daqui.
+  recipient_email: string | null;
+  locked_at: Timestamp | null;
+  provider_message_id: string | null;
+  skip_reason: string | null;
   created_at: Timestamp;
   updated_at: Timestamp;
 }

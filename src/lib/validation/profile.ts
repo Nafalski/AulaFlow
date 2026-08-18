@@ -184,9 +184,30 @@ export const NOTIFICATION_PREFERENCE_KEYS = [
   "reminder2h",
 ] as const;
 
-/** Só inclui canais e eventos que já existem no MVP; WhatsApp fica excluído. */
-export const notificationPreferencesSchema = z.strictObject({
-  inAppEnabled: z.boolean({ error: "A preferência de avisos na aplicação é inválida." }),
+/**
+ * Hora civil no formato que um `<input type="time">` produz.
+ *
+ * O campo vazio é a ausência de silêncio, e não uma hora inválida — por isso
+ * chega como `null` em vez de falhar a validação.
+ */
+const quietHourField = z
+  .string({ error: "A hora de silêncio é inválida." })
+  .trim()
+  .transform((value) => (value === "" ? null : value))
+  .refine((value) => value === null || /^([01]\d|2[0-3]):[0-5]\d$/.test(value), {
+    error: "Use uma hora entre 00:00 e 23:59.",
+  });
+
+/**
+ * As preferências que os dois papéis partilham.
+ *
+ * `inAppEnabled` NÃO está aqui, e a ausência é deliberada. A Etapa 8A decidiu
+ * que a notificação dentro da aplicação é o histórico do facto e é sempre
+ * escrita; um interruptor que não desliga nada seria uma promessa falsa. A
+ * coluna continua na base de dados por compatibilidade, mas nenhum formulário
+ * lhe toca.
+ */
+const notificationPreferencesBase = {
   emailEnabled: z.boolean({ error: "A preferência de avisos por email é inválida." }),
   lessonCreated: z.boolean({ error: "A preferência de novas aulas é inválida." }),
   lessonUpdated: z.boolean({ error: "A preferência de alterações de aula é inválida." }),
@@ -195,9 +216,65 @@ export const notificationPreferencesSchema = z.strictObject({
   participantChanged: z.boolean({ error: "A preferência de participantes é inválida." }),
   reminder24h: z.boolean({ error: "A preferência do lembrete de 24 horas é inválida." }),
   reminder2h: z.boolean({ error: "A preferência do lembrete de 2 horas é inválida." }),
-});
+  quietHoursStart: quietHourField,
+  quietHoursEnd: quietHourField,
+};
+
+/**
+ * Uma hora sozinha não descreve intervalo nenhum, e início igual a fim é
+ * ambíguo de uma forma perigosa: tanto se lê como "nunca há silêncio" como
+ * "silêncio o dia inteiro". Recusar é a única leitura que não adivinha.
+ *
+ * A mesma regra está imposta por uma constraint no PostgreSQL — isto é a
+ * mensagem legível, não a garantia.
+ */
+function refineQuietHours(
+  value: { quietHoursStart: string | null; quietHoursEnd: string | null },
+  ctx: z.RefinementCtx,
+) {
+  const { quietHoursStart: start, quietHoursEnd: end } = value;
+
+  if ((start === null) !== (end === null)) {
+    ctx.addIssue({
+      code: "custom",
+      path: [start === null ? "quietHoursStart" : "quietHoursEnd"],
+      message: "Indique a hora de início e a de fim, ou deixe as duas vazias.",
+    });
+    return;
+  }
+
+  if (start !== null && end !== null && start === end) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["quietHoursEnd"],
+      message: "A hora de fim tem de ser diferente da de início.",
+    });
+  }
+}
+
+export const notificationPreferencesSchema = z
+  .strictObject(notificationPreferencesBase)
+  .superRefine(refineQuietHours);
+
+/**
+ * O aluno é quem recebe os avisos de pacote da Etapa 8B, e por isso é o único
+ * que os configura. Um formulário partilhado que enviasse estes campos para o
+ * professor faria o parser estrito gravá-los como `false` — desligando em
+ * silêncio preferências que ninguém pediu para desligar.
+ */
+export const studentNotificationPreferencesSchema = z
+  .strictObject({
+    ...notificationPreferencesBase,
+    packageExpiring: z.boolean({ error: "A preferência de pacote a terminar é inválida." }),
+    packageExpired: z.boolean({ error: "A preferência de pacote expirado é inválida." }),
+    packageLowBalance: z.boolean({ error: "A preferência de poucas aulas é inválida." }),
+  })
+  .superRefine(refineQuietHours);
 
 export type NotificationPreferencesInput = z.infer<typeof notificationPreferencesSchema>;
+export type StudentNotificationPreferencesInput = z.infer<
+  typeof studentNotificationPreferencesSchema
+>;
 
 function stringValue(formData: FormData, key: string): string | undefined {
   const value = formData.get(key);
@@ -240,7 +317,6 @@ export function readTeacherPublicProfileFormData(formData: FormData) {
 /** Converte o comportamento próprio dos checkboxes HTML em booleanos reais. */
 export function readNotificationPreferencesFormData(formData: FormData) {
   return {
-    inAppEnabled: checkedValue(formData, "inAppEnabled"),
     emailEnabled: checkedValue(formData, "emailEnabled"),
     lessonCreated: checkedValue(formData, "lessonCreated"),
     lessonUpdated: checkedValue(formData, "lessonUpdated"),
@@ -249,5 +325,17 @@ export function readNotificationPreferencesFormData(formData: FormData) {
     participantChanged: checkedValue(formData, "participantChanged"),
     reminder24h: checkedValue(formData, "reminder24h"),
     reminder2h: checkedValue(formData, "reminder2h"),
+    quietHoursStart: stringValue(formData, "quietHoursStart") ?? "",
+    quietHoursEnd: stringValue(formData, "quietHoursEnd") ?? "",
+  };
+}
+
+/** Os campos do aluno: os partilhados mais os três avisos de pacote. */
+export function readStudentNotificationPreferencesFormData(formData: FormData) {
+  return {
+    ...readNotificationPreferencesFormData(formData),
+    packageExpiring: checkedValue(formData, "packageExpiring"),
+    packageExpired: checkedValue(formData, "packageExpired"),
+    packageLowBalance: checkedValue(formData, "packageLowBalance"),
   };
 }

@@ -48,7 +48,7 @@ export default async function TeacherSettingsPage() {
       supabase
         .from("notification_preferences")
         .select(
-          "profile_id, in_app_enabled, email_enabled, lesson_created, lesson_updated, lesson_cancelled, lesson_rescheduled, participant_changed, reminder_24h, reminder_2h",
+          "profile_id, email_enabled, lesson_created, lesson_updated, lesson_cancelled, lesson_rescheduled, participant_changed, reminder_24h, reminder_2h, quiet_hours_start, quiet_hours_end",
         )
         .eq("profile_id", user.id)
         .maybeSingle(),
@@ -79,7 +79,6 @@ export default async function TeacherSettingsPage() {
     contactPreference: user.profile.preferred_contact_method,
   };
   const notificationValues = {
-    inAppEnabled: preferences.in_app_enabled,
     emailEnabled: preferences.email_enabled,
     lessonCreated: preferences.lesson_created,
     lessonUpdated: preferences.lesson_updated,
@@ -88,6 +87,8 @@ export default async function TeacherSettingsPage() {
     participantChanged: preferences.participant_changed,
     reminder24h: preferences.reminder_24h,
     reminder2h: preferences.reminder_2h,
+    quietHoursStart: preferences.quiet_hours_start?.slice(0, 5) ?? null,
+    quietHoursEnd: preferences.quiet_hours_end?.slice(0, 5) ?? null,
   };
 
   return (
@@ -182,7 +183,11 @@ export default async function TeacherSettingsPage() {
         </div>
 
         <div className="flex flex-col gap-6">
-          <NotificationPreferencesForm role="teacher" values={notificationValues} />
+          <NotificationPreferencesForm
+            role="teacher"
+            values={notificationValues}
+            timezone={user.profile.timezone}
+          />
           <SecuritySettingsCard email={user.email} />
         </div>
       </div>

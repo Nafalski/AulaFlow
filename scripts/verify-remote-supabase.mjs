@@ -1436,6 +1436,174 @@ checks as (
   union all
   select
     'estrutura',
+    'o outbox tem as colunas do worker (8C)',
+    (
+      select count(*) from information_schema.columns
+      where table_schema = 'public' and table_name = 'notification_deliveries'
+        and column_name in ('recipient_email', 'locked_at', 'provider_message_id', 'skip_reason')
+    ) = 4,
+    'ok'
+
+  union all
+  select
+    'estrutura',
+    'as preferências de pacote existem e nascem ligadas',
+    (
+      select count(*) from information_schema.columns
+      where table_schema = 'public' and table_name = 'notification_preferences'
+        and column_name in ('package_expiring', 'package_expired', 'package_low_balance')
+        and column_default = 'true'
+    ) = 3,
+    'ok'
+
+  union all
+  select
+    'estrutura',
+    'as horas de silêncio são validadas pelo banco',
+    exists (
+      select 1 from pg_constraint
+      where conrelid = 'public.notification_preferences'::regclass
+        and conname = 'notification_preferences_quiet_hours_valid'
+    ),
+    'ok'
+
+  union all
+  select
+    'estrutura',
+    'um trigger materializa a entrega quando o aviso nasce',
+    exists (
+      select 1 from pg_trigger t
+      join pg_class c on c.oid = t.tgrelid
+      where c.relname = 'notifications'
+        and t.tgname = 'materialize_email_delivery_on_notification'
+        and not t.tgisinternal
+    ),
+    'ok'
+
+  union all
+  select
+    'seguranca',
+    'o outbox continua fechado a todo o cliente',
+    not exists (
+      select 1
+      from information_schema.role_table_grants
+      where table_schema = 'public'
+        and table_name = 'notification_deliveries'
+        and grantee in ('authenticated', 'anon', 'PUBLIC')
+    ),
+    'ok'
+
+  union all
+  select
+    'seguranca',
+    'nenhum cliente reclama nem fecha entregas de email',
+    not exists (
+      select 1
+      from information_schema.role_routine_grants
+      where routine_schema = 'public'
+        and routine_name in (
+          'claim_email_deliveries', 'finalize_email_delivery',
+          'email_delivery_block_reason', 'email_delivery_schedule',
+          'materialize_email_delivery', 'dispatch_email_worker'
+        )
+        and grantee in ('authenticated', 'anon', 'PUBLIC')
+    ),
+    'ok'
+
+  union all
+  select
+    'seguranca',
+    'as funcoes do outbox tem search_path fixo',
+    (
+      select count(*) from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+      where n.nspname = 'public'
+        and p.proname in (
+          'claim_email_deliveries', 'finalize_email_delivery',
+          'email_delivery_block_reason', 'email_delivery_schedule',
+          'materialize_email_delivery', 'dispatch_email_worker'
+        )
+        and p.proconfig::text like '%search_path=public, pg_temp%'
+    ) = 6,
+    'ok'
+
+  union all
+  select
+    'seguranca',
+    'nenhum segredo literal ficou numa funcao do projeto',
+    not exists (
+      select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+      where n.nspname = 'public'
+        and p.prosrc ~ '(re_[A-Za-z0-9]{12,}|Bearer [A-Za-z0-9]{8,})'
+    ),
+    'ok'
+
+  union all
+  select
+    'contrato',
+    'a rede vive so no worker: nenhuma mutacao de dominio faz HTTP',
+    not exists (
+      select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+      where n.nspname = 'public'
+        and p.proname in (
+          'create_lesson', 'cancel_lesson', 'reschedule_lesson', 'complete_lesson',
+          'update_lesson', 'run_scheduled_notifications', 'materialize_email_delivery',
+          'record_lesson_notification_if_new', 'record_package_notification',
+          'confirm_lesson_participation', 'cancel_lesson_participation'
+        )
+        and p.prosrc ~* '(net\\.http|http_post|http_get)'
+    ),
+    'ok'
+
+  union all
+  select
+    'estrutura',
+    'pg_net esta instalado para o despacho do worker',
+    exists (select 1 from pg_extension where extname = 'pg_net'),
+    'ok'
+
+  union all
+  select
+    'estrutura',
+    'o Vault esta disponivel para guardar URL e token do worker',
+    to_regclass('vault.decrypted_secrets') is not null,
+    'ok'
+
+  union all
+  select
+    'estrutura',
+    'existem exatamente dois jobs agendados',
+    (select count(*) from cron.job) = 2,
+    'ok'
+
+  union all
+  select
+    'estrutura',
+    'o job do worker de email corre ao minuto',
+    exists (
+      select 1 from cron.job
+      where jobname = 'aulaflow-email-worker'
+        and active
+        and schedule = '* * * * *'
+        and command like '%dispatch_email_worker%'
+    ),
+    'ok'
+
+  union all
+  select
+    'estrutura',
+    'o job da 8B ficou intacto',
+    exists (
+      select 1 from cron.job
+      where jobname = 'aulaflow-scheduled-notifications'
+        and active
+        and schedule = '5 * * * *'
+        and command like '%run_scheduled_notifications%'
+    ),
+    'ok'
+
+  union all
+  select
+    'estrutura',
     'duas passagens do agendador nunca duplicaram um aviso',
     not exists (
       select 1

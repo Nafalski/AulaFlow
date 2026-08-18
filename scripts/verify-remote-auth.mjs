@@ -7367,6 +7367,178 @@ try {
     }),
   );
 
+  section("Outbox de email (8C)");
+
+  // ── O outbox e privado, e continua privado para toda a gente ──
+  //
+  // A tabela guarda endereços de email. RLS ativo com zero policies e sem GRANT
+  // nenhum e o desenho desde a Fase 1; a 8C so lhe acrescentou colunas.
+  for (const [label, client] of [
+    ["Aluno", studentClient],
+    ["Professor", teacherClient],
+    ["Admin", adminClient],
+    ["Conta bloqueada", blockedClient],
+    ["Anonimo", anonClient],
+  ]) {
+    // Sem GRANT nenhum isto nem devolve zero linhas: e recusado. E e essa a
+    // intencao — a tabela guarda enderecos de email.
+    await mustReject(`${label} nao le o outbox de email`, async () =>
+      client.from("notification_deliveries").select("id").limit(1),
+    );
+  }
+
+  await mustReject("Aluno nao escreve no outbox de email", async () =>
+    studentClient.from("notification_deliveries").insert({ channel: "email" }),
+  );
+  await mustReject("Professor nao escreve no outbox de email", async () =>
+    teacherClient.from("notification_deliveries").insert({ channel: "email" }),
+  );
+
+  // ── As RPCs do worker nao estao ao alcance de ninguem com sessao ──
+  for (const [label, client] of [
+    ["Aluno", studentClient],
+    ["Professor", teacherClient],
+    ["Admin", adminClient],
+    ["Anonimo", anonClient],
+  ]) {
+    await mustReject(`${label} nao reclama entregas de email`, async () =>
+      client.rpc("claim_email_deliveries", { p_batch_size: 5 }),
+    );
+    await mustReject(`${label} nao fecha entregas de email`, async () =>
+      client.rpc("finalize_email_delivery", {
+        p_delivery_id: deterministicUuid("8c-fake-delivery"),
+        p_outcome: "sent",
+      }),
+    );
+  }
+  await mustReject("Aluno nao consulta a decisao de entrega de outro", async () =>
+    studentClient.rpc("email_delivery_block_reason", {
+      p_profile_id: studentUser.id,
+      p_type: "lesson_created",
+    }),
+  );
+  await mustReject("Aluno nao despacha o worker de email", async () =>
+    studentClient.rpc("dispatch_email_worker"),
+  );
+  await mustReject("Anonimo nao despacha o worker de email", async () =>
+    anonClient.rpc("dispatch_email_worker"),
+  );
+
+  // ── As preferencias sao do proprio, e so do proprio ──
+  const prefsColumns =
+    "profile_id, email_enabled, lesson_created, reminder_24h, reminder_2h, " +
+    "quiet_hours_start, quiet_hours_end, package_expiring, package_expired, package_low_balance";
+
+  const studentPrefs = await getSingle(
+    "preferencias do aluno",
+    studentClient.from("notification_preferences").select(prefsColumns).eq("profile_id", studentUser.id),
+  );
+  check(
+    studentPrefs.package_low_balance === true || studentPrefs.package_low_balance === false,
+    "As preferencias de pacote existem na linha do aluno",
+  );
+
+  const savedPrefs = await studentClient
+    .from("notification_preferences")
+    .update({
+      package_low_balance: false,
+      quiet_hours_start: "22:00",
+      quiet_hours_end: "08:00",
+    })
+    .eq("profile_id", studentUser.id)
+    .select("package_low_balance, quiet_hours_start, quiet_hours_end")
+    .single();
+  check(
+    !savedPrefs.error && savedPrefs.data?.package_low_balance === false,
+    `O aluno altera as suas proprias preferencias${
+      savedPrefs.error ? `: ${summarizeError(savedPrefs.error)}` : ""
+    }`,
+  );
+
+  // A constraint do banco nao aceita meio intervalo, venha o pedido de onde vier.
+  await mustReject("Meia hora de silencio e recusada pelo banco", async () =>
+    studentClient
+      .from("notification_preferences")
+      .update({ quiet_hours_start: "22:00", quiet_hours_end: null })
+      .eq("profile_id", studentUser.id)
+      .select("profile_id")
+      .single(),
+  );
+  await mustReject("Inicio igual a fim e recusado pelo banco", async () =>
+    studentClient
+      .from("notification_preferences")
+      .update({ quiet_hours_start: "22:00", quiet_hours_end: "22:00" })
+      .eq("profile_id", studentUser.id)
+      .select("profile_id")
+      .single(),
+  );
+
+  const restored = await studentClient
+    .from("notification_preferences")
+    .update({ package_low_balance: true, quiet_hours_start: null, quiet_hours_end: null })
+    .eq("profile_id", studentUser.id)
+    .select("profile_id")
+    .single();
+  check(!restored.error, "As preferencias do aluno voltam ao estado inicial");
+
+  // Alterar a linha de outra pessoa nao afeta linha nenhuma: a policy filtra
+  // pelo proprio, e um update que nao encontra linha nao e uma excecao.
+  const crossUser = await studentClient
+    .from("notification_preferences")
+    .update({ email_enabled: false })
+    .eq("profile_id", teacherUser.id)
+    .select("profile_id");
+  check(
+    !crossUser.error && (crossUser.data ?? []).length === 0,
+    "Um aluno nao altera as preferencias de outra conta",
+  );
+  const teacherStillOn = await getSingle(
+    "preferencias do professor",
+    teacherClient
+      .from("notification_preferences")
+      .select("profile_id, email_enabled")
+      .eq("profile_id", teacherUser.id),
+  );
+  check(
+    teacherStillOn.email_enabled === true,
+    "E as preferencias do professor ficaram como estavam",
+  );
+
+  // ── Uma operacao de dominio continua a funcionar, e deixa o email em fila ──
+  //
+  // Nao ha aqui nenhuma chamada ao fornecedor: o trigger escreve uma linha na
+  // mesma transacao e acaba. E por isso que uma indisponibilidade do Resend nao
+  // consegue fazer falhar a criacao de uma aula.
+  const outboxSlot = phase8aSlot(5);
+  const { data: outboxLessonId, error: outboxLessonError } = await createLesson(teacherClient, {
+    p_starts_at: lisbonInstant(phase8aDate, outboxSlot.startsAt),
+    p_ends_at: lisbonInstant(phase8aDate, outboxSlot.endsAt),
+    p_title: `Aula E2E 8C outbox ${phase6RunSuffix}`,
+    p_location_id: null,
+    p_location_resource_id: null,
+    p_student_id: studentsA.id,
+    p_idempotency_key: deterministicUuid(`lesson-8c-outbox:${phase6RunSuffix}`),
+  });
+  check(
+    !outboxLessonError && Boolean(outboxLessonId),
+    `A aula e criada com o fornecedor de email fora da transacao${
+      outboxLessonError ? `: ${summarizeError(outboxLessonError)}` : ""
+    }`,
+  );
+
+  const outboxInbox = await studentClient
+    .from("user_notification_records")
+    .select("id, type")
+    .eq("lesson_id", outboxLessonId);
+  check(
+    (outboxInbox.data ?? []).some((row) => row.type === "lesson_created"),
+    "O aviso in-app existe, como sempre existiu",
+  );
+  check(
+    !("recipient_email" in ((outboxInbox.data ?? [])[0] ?? {})),
+    "A projecao da caixa nunca traz o endereco de email",
+  );
+
   section("Conta bloqueada e anonimo");
   await signIn(blockedClient, credentials.blocked.email, credentials.blocked.password, "Conta bloqueada");
   await mustReturnNoRows("Conta bloqueada nao le views de pacotes", () =>

@@ -449,7 +449,7 @@ A estrutura fica pronta para notificações push (Fase 8).
 | **5** | Calendário e criação de aulas, com reserva de créditos | **Concluído** — disponibilidade, calendário, clubes, locais, recursos, criação/edição de aulas, conflitos atómicos, reserva atómica de créditos, recorrência semanal segura e revisão integrada |
 | **6** | Cancelamento, reagendamento, presenças, histórico | **Concluída** — 6A/6B: presença, falta/no-show, conclusão normal/mista e cancelamentos com `reserved -> available` ou `reserved -> used` seguros. 6C.1/1A/1B: contrato transacional de reagendamento, chave de idempotência obrigatória e concorrência real provada. 6C.2: interface operacional, com editar conteúdo e reagendar colocação separados no PostgreSQL |
 | **7** | Área do aluno: aulas, saldo, confirmação da participação | **Concluída** — 7A: contrato de confirmação individual, com `requires_confirmation` ligado, escrita direta fechada e RSVP separado de presença. 7B: o professor pede ao criar, o aluno responde pela própria participação, provado em browser e mobile |
-| **8** | Notificações, lembretes e expiração agendada | **8A e 8B concluídas** — a fundação da Fase 1 foi ligada (producers por trigger, caixa in-app, lida/por ler e contador) e o agendador `pg_cron` corre de hora a hora com lembretes de 24 h e 2 h, saldo baixo por episódio, pacote a expirar e expiração automática em datas civis de Lisboa. Falta a 8C (entrega por email a partir do outbox) |
+| **8** | Notificações, lembretes e expiração agendada | **8A e 8B concluídas; 8C implementada e por fechar** — a fundação da Fase 1 foi ligada (producers por trigger, caixa in-app, lida/por ler e contador) e o agendador `pg_cron` corre de hora a hora com lembretes de 24 h e 2 h, saldo baixo por episódio, pacote a expirar e expiração automática em datas civis de Lisboa. A 8C entrega o outbox transacional, o worker em Edge Function, as preferências por tipo e as horas de silêncio, validados contra fornecedor simulado — falta a verificação com credencial real. Falta ainda a 8D (revisão integrada da Fase 8) |
 | **9** | Supabase real, concorrência, acessibilidade, deployment | **Parcialmente concluído** — Supabase/Auth reais validados até à 8B (540 verificações, verdes em duas execuções consecutivas); 954 verificações de esquema em PGlite; agendador `pg_cron` instalado e provado no remoto, incluindo duas execuções em paralelo sem duplicar; browser automatizado com sessão GoTrue real, verde em dev e em build de produção; deployment pendente |
 
 A ordem segue as prioridades pedidas: primeiro a área do professor ao computador, depois as regras seguras de créditos, depois o aluno no telemóvel.
@@ -1349,6 +1349,40 @@ Corrigir a validade **rearma** o aviso: a chave de "a expirar" inclui `expires_o
 #### `p_now` é para testes deterministas, nunca para o cliente
 
 `run_scheduled_notifications()` não tem `EXECUTE` para `authenticated`, `anon` nem `PUBLIC`. Nenhuma Server Action o chama e nenhum formulário envia um instante. Um parâmetro de relógio ao alcance do browser deixaria qualquer pessoa adiantar o tempo do domínio e expirar o pacote de outra. A suite Auth recusa-o explicitamente a aluno, professor, admin e anónimo — incluindo com um `p_now` forjado.
+
+### Implementado na Etapa 8C — email transacional pelo outbox
+
+A decisão D-07 estava escrita desde a Fase 1 e explicava-se a si própria: *com envio direto, uma falha da API de email faria falhar a operação inteira*. `notification_deliveries` era esse outbox, criado e nunca usado. A 8C ligou-o.
+
+**Um trigger sobre `notifications`, e só um.** `materialize_email_delivery()` corre `after insert`, na mesma transação do facto. Os nove tipos que a 8A e a 8B produzem passam todos por ele, sem que nenhuma função de aula ou de pacote precise de saber que o email existe — editar nove sítios para acrescentar o mesmo INSERT seriam nove oportunidades de os deixar diferentes.
+
+**Nenhuma rede no PostgreSQL.** O trigger escreve uma linha e acaba. Isso é verificado estruturalmente, e não apenas afirmado: `db:verify` e a suite remota falham se `create_lesson`, `cancel_lesson`, `reschedule_lesson`, `complete_lesson`, `run_scheduled_notifications` ou qualquer producer passarem a conter `net.http_post`.
+
+**`skipped` em vez de ausência.** Uma entrega deliberadamente suprimida fica registada com o motivo (`email_disabled`, `event_disabled`, `event_not_deliverable`, `recipient_email_unavailable`, `preferences_missing`). Sem ela, "não recebi o email" e "o sistema nem tentou" seriam indistinguíveis. `last_error` fica reservado a falhas reais.
+
+**A preferência é avaliada duas vezes** — na materialização e no `claim`. Quem desliga o email entre as duas não recebe o que estava em fila. O inverso não acontece: voltar a ligar não ressuscita uma entrega já `skipped`, porque essa terminou.
+
+**Horas de silêncio no fuso de quem recebe.** A aplicação serve Lisboa, Madeira e Açores; assumir `Europe/Lisbon` para todos silenciaria um açoriano uma hora antes do que pediu. Suporta intervalo normal e o que atravessa a meia-noite. Uma hora sozinha, ou início igual a fim, são recusados por constraint — `start = end` tanto se lê como "zero horas" como "vinte e quatro", e adivinhar errado significa ou nunca enviar, ou enviar sempre.
+
+**O interruptor in-app saiu da interface.** A 8A decidiu que o aviso dentro da aplicação é o histórico do facto e é sempre escrito. Um interruptor que não desliga nada é uma promessa falsa; a coluna fica por compatibilidade e nenhum formulário lhe toca. A caixa continua a mostrar tudo.
+
+**Reclamar é atómico**: `for update ... skip locked` mais arrendamento em `locked_at`. Dois workers nunca apanham a mesma entrega, e um arrendamento expirado permite recuperar o trabalho de um worker que morreu — sem depender da memória de nenhum processo.
+
+**`attempts` conta tentativas reais de envio**, e sobe no `finalize`. Recuo de 1 min, 5 min, 15 min, 1 h, 4 h; ao fim de cinco, `failed`. Uma entrega falhada nunca bloqueia as seguintes.
+
+**`sent` significa "o fornecedor aceitou"**, e não "chegou à caixa de entrada". A chave de idempotência (`aulaflow-email/<delivery_id>`) é estável em todas as tentativas e é a segunda defesa, depois da constraint única. Não se promete exactly-once: um HTTP externo tem sempre uma janela em que não se sabe se a aceitação se perdeu no regresso.
+
+**Dois jobs `pg_cron`, porque são dois trabalhos**: o da 8B produz factos de hora a hora; o da 8C consome o outbox ao minuto. Juntá-los amarraria a produção de factos à latência do fornecedor. O segredo do worker vive no Vault e é lido em cada execução — nunca numa migração.
+
+#### O que ficou por verificar
+
+O projeto de desenvolvimento **não tem `RESEND_API_KEY`, remetente verificado nem os segredos da Edge Function configurados**, e criar uma conta no fornecedor em nome do utilizador não é decisão de quem implementa. Toda a lógica está validada contra um transporte simulado — sucesso, 429, 500, falha de rede, 422 definitivo, limite de tentativas, arrendamento expirado e concorrência —, mas **não houve envio real**.
+
+Por isso a **8C não está formalmente fechada**. Falta: configurar os segredos, publicar a Edge Function no projeto de desenvolvimento, e um envio de teste para um endereço de teste do fornecedor, confirmando `provider_message_id` e que a repetição não duplica.
+
+#### Defeito pré-existente encontrado pela cobertura nova
+
+O botão do formulário de preferências fica preso em "A guardar…" numa submissão em cada cinco, na build de produção, embora a gravação aconteça. **Reproduz-se no commit 8019269, sem uma linha da 8C**, por isso não é regressão desta etapa — ficou visível porque a 8C é a primeira a submeter aquele formulário várias vezes seguidas. O guião de browser verifica a persistência recarregando a página, e não afirma que o pending termina, precisamente para não afirmar uma coisa falsa.
 
 #### O que a 8B deliberadamente não faz
 

@@ -42,7 +42,7 @@ async function loadNotificationPreferences(
   const { data, error } = await supabase
     .from("notification_preferences")
     .select(
-      "in_app_enabled, email_enabled, lesson_created, lesson_updated, lesson_cancelled, lesson_rescheduled, participant_changed, reminder_24h, reminder_2h",
+      "email_enabled, lesson_created, lesson_updated, lesson_cancelled, lesson_rescheduled, participant_changed, reminder_24h, reminder_2h, quiet_hours_start, quiet_hours_end, package_expiring, package_expired, package_low_balance",
     )
     .eq("profile_id", profileId)
     .maybeSingle();
@@ -95,7 +95,6 @@ function notificationPreferences(
   row: Awaited<ReturnType<typeof loadNotificationPreferences>>,
 ): StudentNotificationPreferences {
   return {
-    inAppEnabled: row.in_app_enabled,
     emailEnabled: row.email_enabled,
     lessonCreated: row.lesson_created,
     lessonUpdated: row.lesson_updated,
@@ -104,6 +103,13 @@ function notificationPreferences(
     participantChanged: row.participant_changed,
     reminder24h: row.reminder_24h,
     reminder2h: row.reminder_2h,
+    // A coluna é `time`, e o `<input type="time">` quer "HH:MM". O PostgreSQL
+    // devolve "HH:MM:SS"; os segundos são sempre zero e o campo rejeita-os.
+    quietHoursStart: row.quiet_hours_start?.slice(0, 5) ?? null,
+    quietHoursEnd: row.quiet_hours_end?.slice(0, 5) ?? null,
+    packageExpiring: row.package_expiring,
+    packageExpired: row.package_expired,
+    packageLowBalance: row.package_low_balance,
   };
 }
 
@@ -197,7 +203,10 @@ export default async function StudentProfilePage() {
         />
       </section>
 
-      <StudentNotificationForm preferences={notificationPreferences(preferences)} />
+      <StudentNotificationForm
+          preferences={notificationPreferences(preferences)}
+          timezone={user.profile.timezone}
+        />
       <StudentSecurityPanel email={user.email} />
     </div>
   );
