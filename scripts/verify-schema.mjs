@@ -8114,7 +8114,9 @@ const expiredLessonPack = await assignPackageAs(TEACHER_UID, {
   credits: 3,
   sportId: sport,
   starts: "2026-08-01",
-  expires: "2026-08-24",
+  // A atribuição precisa nascer válida independentemente do dia em que a
+  // suite corre. A linha seguinte move-a para a validade expirada do cenário.
+  expires: "2099-08-24",
 });
 await db.query(`update public.student_packages set expires_on='2026-08-23' where id=$1`, [
   expiredLessonPack.id,

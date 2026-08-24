@@ -1404,7 +1404,7 @@ Por isso a **8C não está formalmente fechada**. Falta: configurar os segredos,
 
 #### Defeito pré-existente encontrado pela cobertura nova
 
-O botão do formulário de preferências fica preso em "A guardar…" numa submissão em cada cinco, na build de produção, embora a gravação aconteça. **Reproduz-se no commit 8019269, sem uma linha da 8C**, por isso não é regressão desta etapa — ficou visível porque a 8C é a primeira a submeter aquele formulário várias vezes seguidas. O guião de browser verifica a persistência recarregando a página, e não afirma que o pending termina, precisamente para não afirmar uma coisa falsa.
+O bloqueio intermitente do formulário em "A guardar…" foi fechado no contrato de runtime. A escrita no Supabase concluía, mas `revalidatePath()` anexava o novo RSC payload à mesma resposta da Server Action; quando esse Flight stream era abortado, `useActionState` nunca recebia o fim apesar de o valor já estar persistido. A Action de preferências passou a devolver apenas o estado serializável confirmado, e o formulário preserva os valores durante o reset automático do React 19. O browser exige agora que o pending termine sem reload, confronta cada um de dez submits consecutivos com uma leitura sob JWT real e cobre sucesso, validação, erro controlado, clique rápido, aluno, professor e 390 px.
 
 #### O que a 8B deliberadamente não faz
 

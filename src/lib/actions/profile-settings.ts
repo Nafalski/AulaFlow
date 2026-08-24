@@ -167,13 +167,13 @@ function studentPreferencesUpdate(input: StudentNotificationPreferencesInput) {
 
 async function updatePreferences(
   user: SessionUser,
-  settingsPath: "/professor/definicoes" | "/aluno/perfil",
+  role: EditableRole,
   formData: FormData,
 ): Promise<ProfileSettingsActionState> {
   // Cada papel tem o seu schema, e o do professor não conhece os campos de
   // pacote. Um schema único faria o parser estrito ler a ausência desses campos
   // como `false` e desligar preferências que o professor nunca viu.
-  const isStudent = settingsPath === "/aluno/perfil";
+  const isStudent = role === "student";
 
   const parsed = isStudent
     ? studentNotificationPreferencesSchema.safeParse(
@@ -200,7 +200,12 @@ async function updatePreferences(
       return persistenceError("Falha ao atualizar as preferências de avisos.", error);
     }
 
-    revalidatePath(settingsPath);
+    // Esta Action devolve apenas o resultado confirmado da mutação. Ligar
+    // `revalidatePath()` ao mesmo Flight stream tornava o fim de `pending`
+    // dependente do RSC refresh; se esse stream fosse abortado, a escrita já
+    // estava persistida mas `useActionState` ficava preso em "A guardar…".
+    // As duas páginas são force-dynamic e uma leitura posterior traz sempre
+    // os valores atuais. O formulário mantém imediatamente os valores enviados.
     return { status: "success", message: "Preferências de avisos guardadas." };
   } catch (error) {
     return persistenceError("Erro inesperado ao atualizar as preferências de avisos.", error);
@@ -271,7 +276,7 @@ export async function updateTeacherNotificationPreferencesAction(
   const authorization = await authorize(["teacher"]);
   if (authorization.state) return authorization.state;
 
-  return updatePreferences(authorization.user, "/professor/definicoes", formData);
+  return updatePreferences(authorization.user, "teacher", formData);
 }
 
 export async function updateStudentAccountAction(
@@ -291,7 +296,7 @@ export async function updateStudentNotificationPreferencesAction(
   const authorization = await authorize(["student"]);
   if (authorization.state) return authorization.state;
 
-  return updatePreferences(authorization.user, "/aluno/perfil", formData);
+  return updatePreferences(authorization.user, "student", formData);
 }
 
 export async function requestPasswordChangeLinkAction(

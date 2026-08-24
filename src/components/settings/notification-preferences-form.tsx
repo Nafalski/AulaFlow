@@ -10,7 +10,10 @@ import {
   updateStudentNotificationPreferencesAction,
   updateTeacherNotificationPreferencesAction,
 } from "@/lib/actions/profile-settings";
-import { FORM_ACTION_IDLE_STATE } from "@/lib/actions/action-state";
+import {
+  FORM_ACTION_IDLE_STATE,
+  preserveFormValuesOnReset,
+} from "@/lib/actions/action-state";
 
 export type NotificationPreferenceValues = {
   emailEnabled: boolean;
@@ -81,7 +84,11 @@ export function NotificationPreferencesForm({
         description="Escolha o que quer receber por email. Os avisos importantes ficam sempre na sua caixa do AulaFlow."
       />
       <CardBody>
-        <form action={formAction} className="flex flex-col gap-5">
+        <form
+          action={formAction}
+          onReset={preserveFormValuesOnReset}
+          className="flex flex-col gap-5"
+        >
           {state.status !== "idle" && state.message && (
             <Alert tone={state.status === "success" ? "success" : "danger"}>
               {state.message}

@@ -2174,6 +2174,106 @@ async function scheduledNotificationsScenario(browser, apiClient) {
 }
 
 /**
+ * Submete as preferências e exige o ciclo completo da Form Action.
+ *
+ * Não navega nem recarrega: se o `pending` não terminar por causa da resposta
+ * da própria Action, esta função falha. Foi precisamente isso que o guião
+ * antigo escondia ao abrir novamente a rota depois de cada clique.
+ */
+async function submitNotificationPreferences(
+  page,
+  label,
+  { expectedStatus = "success", expectedMessage, rapidSecondClick = false } = {},
+) {
+  const button = page.getByRole("button", { name: /Guardar preferências/ }).first();
+  await button.waitFor({ state: "visible", timeout: 20_000 });
+  const handle = await button.elementHandle();
+  if (!handle) throw new Error(`${label}: botão de guardar indisponível.`);
+
+  let actionPosts = 0;
+  const countActionPost = (request) => {
+    if (
+      request.method() === "POST" &&
+      ["/aluno/perfil", "/professor/definicoes"].includes(new URL(request.url()).pathname)
+    ) {
+      actionPosts += 1;
+    }
+  };
+  page.on("request", countActionPost);
+
+  try {
+    const pendingStarted = page
+      .waitForFunction(
+        (element) =>
+          element instanceof HTMLButtonElement &&
+          element.isConnected &&
+          element.disabled &&
+          element.textContent?.includes("A guardar"),
+        handle,
+        { timeout: 3_000 },
+      )
+      .then(() => true)
+      .catch(() => false);
+
+    await button.click();
+    check(await pendingStarted, `${label}: o pending aparece e desativa o botão`);
+
+    if (rapidSecondClick) {
+      // `ElementHandle.click()` esperaria o botão voltar a ficar habilitado e
+      // acabaria por medir um segundo submit sequencial. `HTMLElement.click()`
+      // corre agora, enquanto `disabled` ainda é true, como um segundo gesto
+      // imediato do utilizador; o browser não despacha a ativação nesse estado.
+      const secondClickWasBlocked = await handle.evaluate((element) => {
+        if (!(element instanceof HTMLButtonElement) || !element.disabled) return false;
+        element.click();
+        return true;
+      });
+      check(
+        secondClickWasBlocked,
+        `${label}: um segundo clique rápido é bloqueado durante o pending`,
+      );
+    }
+
+    const settled = await page
+      .waitForFunction(
+        (element) =>
+          element instanceof HTMLButtonElement &&
+          element.isConnected &&
+          !element.disabled &&
+          element.textContent?.includes("Guardar preferências"),
+        handle,
+        { timeout: 15_000 },
+      )
+      .then(() => true)
+      .catch(() => false);
+    check(settled, `${label}: o pending termina sem reload`);
+    if (!settled) throw new Error(`${label}: o botão ficou preso em pending.`);
+
+    const feedback = page
+      .getByRole(expectedStatus === "success" ? "status" : "alert")
+      .filter({
+        hasText:
+          expectedMessage ??
+          (expectedStatus === "success"
+            ? "Preferências de avisos guardadas."
+            : "Corrija os campos assinalados"),
+      })
+      .first();
+    const feedbackVisible = await feedback
+      .waitFor({ state: "visible", timeout: 5_000 })
+      .then(() => true)
+      .catch(() => false);
+    check(feedbackVisible, `${label}: a resposta fica acessível na interface`);
+
+    if (rapidSecondClick) {
+      check(actionPosts === 1, `${label}: houve uma única Server Action`, `${actionPosts} POSTs`);
+    }
+  } finally {
+    page.off("request", countActionPost);
+  }
+}
+
+/**
  * As preferências de avisos, com sessão real do aluno (Etapa 8C).
  *
  * O que se verifica aqui não é só que o formulário guarda: é que desligar o
@@ -2233,75 +2333,97 @@ async function preferencesScenario(browser, apiClient) {
     "O fuso horário da conta é mostrado junto às horas de silêncio",
   );
 
-  // ── Guardar horas de silêncio, e recarregar ──
-  /**
-   * Submete, e devolve o controlo sem afirmar nada sobre o `pending`.
-   *
-   * A razão é um defeito real e PRÉ-EXISTENTE: o botão deste formulário fica
-   * preso em "A guardar…" numas submissões em cada cinco, na build de produção.
-   * Reproduz-se no commit 8019269, sem uma linha da Etapa 8C aplicada — não é
-   * regressão desta etapa, mas ficou visível porque a 8C é a primeira a submeter
-   * este formulário várias vezes seguidas.
-   *
-   * A gravação em si acontece na mesma: a escrita é feita antes do
-   * `revalidatePath()`. O que este guião afirma é o que a 8C promete — que o
-   * valor fica guardado —, e afirma-o lendo a página outra vez. Fingir que o
-   * pending termina seria afirmar uma coisa falsa.
-   */
-  async function submitPreferences() {
-    const button = page.getByRole("button", { name: /Guardar preferências/ }).first();
-    await button.waitFor({ state: "visible", timeout: 20_000 });
-    const handle = await button.elementHandle();
-    await button.click();
-    await page
-      .waitForFunction(
-        (element) =>
-          !(element instanceof HTMLButtonElement) || !element.isConnected || !element.disabled,
-        handle,
-        { timeout: 8_000 },
-      )
-      .catch(() => {});
-  }
-
-  /** Volta à página do zero: mais determinista do que recarregar com um pedido em voo. */
-  async function reopenPreferences() {
-    await page.goto(`${BASE_URL}/aluno/perfil`, { waitUntil: "domcontentloaded" });
-    await page.getByRole("heading", { name: "Avisos e lembretes" }).first().waitFor({
-      timeout: 30_000,
+  const preferenceClient = createClient(
+    env.NEXT_PUBLIC_SUPABASE_URL,
+    env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
+    { auth: { persistSession: false, autoRefreshToken: false } },
+  );
+  const { data: preferenceSession, error: preferenceSignInError } =
+    await preferenceClient.auth.signInWithPassword({
+      email: ACCOUNTS.student.email,
+      password: ACCOUNTS.student.password,
     });
+  if (preferenceSignInError || !preferenceSession.user) {
+    throw new Error("Não foi possível abrir a sessão Auth de leitura das preferências.");
+  }
+  const preferenceProfileId = preferenceSession.user.id;
+
+  async function persistedStudentPreferences(columns) {
+    const { data, error } = await preferenceClient
+      .from("notification_preferences")
+      .select(columns)
+      .eq("profile_id", preferenceProfileId)
+      .single();
+    if (error || !data) throw new Error(`Ler preferências persistidas: ${error?.message}`);
+    return data;
   }
 
-  async function savePreferences(label) {
-    await submitPreferences();
-    await reopenPreferences();
-    check(true, `${label}: a submissão chega ao servidor`);
+  // Dez submissões consecutivas na mesma sessão, sem reload entre elas. O
+  // valor é confrontado em cada volta com uma leitura sob o JWT real do aluno.
+  let expectedEmail = await emailToggle.isChecked();
+  for (let cycle = 1; cycle <= 10; cycle += 1) {
+    expectedEmail = !expectedEmail;
+    if (expectedEmail) await emailToggle.check();
+    else await emailToggle.uncheck();
+
+    await submitNotificationPreferences(page, `Ciclo consecutivo ${cycle}`);
+    check(
+      (await emailToggle.isChecked()) === expectedEmail,
+      `Ciclo consecutivo ${cycle}: o valor visível corresponde ao enviado`,
+    );
+    const persisted = await persistedStudentPreferences("email_enabled");
+    check(
+      persisted.email_enabled === expectedEmail,
+      `Ciclo consecutivo ${cycle}: o valor persistido corresponde ao enviado`,
+    );
   }
+
+  // O único reload da série confirma persistência; nunca é usado para
+  // libertar o pending ou tornar o formulário novamente utilizável.
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.getByRole("heading", { name: "Avisos e lembretes" }).first().waitFor({
+    timeout: 20_000,
+  });
+  check(
+    (await page.locator('input[name="emailEnabled"]').isChecked()) === expectedEmail,
+    "O reload final confirma o valor da décima gravação",
+  );
 
   await quietStart.fill("22:00");
   await quietEnd.fill("08:00");
-  await savePreferences("Guardar horas de silêncio");
+  await submitNotificationPreferences(page, "Guardar horas de silêncio");
   check(
     (await page.locator('input[name="quietHoursStart"]').inputValue()) === "22:00" &&
       (await page.locator('input[name="quietHoursEnd"]').inputValue()) === "08:00",
-    "As horas de silêncio persistem depois de recarregar",
+    "As horas de silêncio continuam visíveis sem recarregar",
+  );
+  const persistedQuietHours = await persistedStudentPreferences(
+    "quiet_hours_start, quiet_hours_end",
+  );
+  check(
+    persistedQuietHours.quiet_hours_start?.slice(0, 5) === "22:00" &&
+      persistedQuietHours.quiet_hours_end?.slice(0, 5) === "08:00",
+    "As horas de silêncio ficaram persistidas sob a sessão do aluno",
   );
 
   // Metade de um intervalo é recusada com uma mensagem, e não com um erro cru.
   await page.locator('input[name="quietHoursEnd"]').fill("");
-  await submitPreferences();
+  await submitNotificationPreferences(page, "Erro de validação", {
+    expectedStatus: "error",
+    expectedMessage: "Corrija os campos assinalados",
+  });
   check(
     await waitForPanel(page, "Indique a hora de início e a de fim"),
     "Uma hora de silêncio sozinha é recusada em português",
   );
-  await reopenPreferences();
 
   await page.locator('input[name="quietHoursStart"]').fill("");
   await page.locator('input[name="quietHoursEnd"]').fill("");
-  await savePreferences("Limpar horas de silêncio");
+  await submitNotificationPreferences(page, "Corrigir e limpar horas de silêncio");
 
   // ── DESLIGAR O EMAIL ──
   await page.locator('input[name="emailEnabled"]').uncheck();
-  await savePreferences("Desligar o email");
+  await submitNotificationPreferences(page, "Desligar o email");
   check(
     !(await page.locator('input[name="emailEnabled"]').isChecked()),
     "Desligar o email persiste",
@@ -2363,7 +2485,7 @@ async function preferencesScenario(browser, apiClient) {
     timeout: 20_000,
   });
   await page.locator('input[name="emailEnabled"]').check();
-  await savePreferences("Voltar a ligar o email");
+  await submitNotificationPreferences(page, "Voltar a ligar o email");
 
   const slotOn = billable ? await findFreeSlot(apiClient) : null;
   let onLessonId = null;
@@ -2442,6 +2564,78 @@ async function preferencesScenario(browser, apiClient) {
   );
   check(smallTargets === 0, "Alvos de toque adequados", `${smallTargets} pequenos`);
 
+  // O mesmo ciclo no viewport móvel: sucesso, erro e recuperação sem reload.
+  const mobileLowBalance = page.locator('input[name="packageLowBalance"]');
+  const expectedLowBalance = !(await mobileLowBalance.isChecked());
+  if (expectedLowBalance) await mobileLowBalance.check();
+  else await mobileLowBalance.uncheck();
+  await submitNotificationPreferences(page, "Guardar no telemóvel");
+  const mobilePersisted = await persistedStudentPreferences("package_low_balance");
+  check(
+    mobilePersisted.package_low_balance === expectedLowBalance,
+    "A preferência móvel fica persistida",
+  );
+
+  await page.locator('input[name="quietHoursStart"]').fill("22:00");
+  await page.locator('input[name="quietHoursEnd"]').fill("");
+  await submitNotificationPreferences(page, "Erro de validação no telemóvel", {
+    expectedStatus: "error",
+    expectedMessage: "Corrija os campos assinalados",
+  });
+  await page.locator('input[name="quietHoursStart"]').fill("");
+  await submitNotificationPreferences(page, "Recuperar do erro no telemóvel");
+
+  // Erro controlado de servidor: um administrador bloqueia temporariamente a
+  // fixture pela RPC oficial. O browser continua com a sessão GoTrue real, mas
+  // a Action recusa a conta inativa e tem de devolver o controlo ao formulário.
+  // A conta é sempre reativada no `finally`, mesmo que a asserção falhe.
+  const adminPreferenceClient = createClient(
+    env.NEXT_PUBLIC_SUPABASE_URL,
+    env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
+    { auth: { persistSession: false, autoRefreshToken: false } },
+  );
+  const { error: adminPreferenceSignInError } =
+    await adminPreferenceClient.auth.signInWithPassword({
+      email: env.E2E_ADMIN_EMAIL,
+      password: env.E2E_ADMIN_PASSWORD,
+    });
+  if (adminPreferenceSignInError) {
+    throw new Error("Não foi possível abrir a sessão administrativa da fixture.");
+  }
+  const beforeExpiredSession = await persistedStudentPreferences("email_enabled");
+  const blockResult = await adminPreferenceClient.rpc("admin_set_account_status", {
+    p_profile_id: preferenceProfileId,
+    p_status: "blocked",
+    p_reason: "Fixture E2E do erro controlado das preferências",
+  });
+  if (blockResult.error) throw new Error(`Bloquear fixture: ${blockResult.error.message}`);
+
+  try {
+    const inactiveAccountEmail = page.locator('input[name="emailEnabled"]');
+    if (beforeExpiredSession.email_enabled) await inactiveAccountEmail.uncheck();
+    else await inactiveAccountEmail.check();
+    await submitNotificationPreferences(page, "Erro controlado de conta inativa", {
+      expectedStatus: "error",
+      expectedMessage: "A sua conta não está ativa",
+    });
+  } finally {
+    const reactivateResult = await adminPreferenceClient.rpc("admin_set_account_status", {
+      p_profile_id: preferenceProfileId,
+      p_status: "active",
+      p_reason: null,
+    });
+    if (reactivateResult.error) {
+      throw new Error(`Reativar fixture: ${reactivateResult.error.message}`);
+    }
+  }
+  const afterExpiredSession = await persistedStudentPreferences("email_enabled");
+  check(
+    afterExpiredSession.email_enabled === beforeExpiredSession.email_enabled,
+    "O erro de conta inativa não altera as preferências",
+  );
+
+  await adminPreferenceClient.auth.signOut();
+  await preferenceClient.auth.signOut();
   await context.close();
 }
 
@@ -2449,30 +2643,6 @@ async function preferencesScenario(browser, apiClient) {
  * O professor partilha o mesmo formulário — e não pode ter ganho controlos que
  * não governam nada para ele.
  */
-/**
- * O mesmo padrão do formulário do aluno, pela mesma razão: o defeito do botão
- * preso em "A guardar…" é pré-existente e partilhado por este formulário.
- */
-async function saveTeacherPreferences(page, label) {
-  const button = page.getByRole("button", { name: /Guardar preferências/ }).first();
-  await button.waitFor({ state: "visible", timeout: 20_000 });
-  const handle = await button.elementHandle();
-  await button.click();
-  await page
-    .waitForFunction(
-      (element) =>
-        !(element instanceof HTMLButtonElement) || !element.isConnected || !element.disabled,
-      handle,
-      { timeout: 8_000 },
-    )
-    .catch(() => {});
-  await page.goto(`${BASE_URL}/professor/definicoes`, { waitUntil: "domcontentloaded" });
-  await page.getByRole("heading", { name: "Avisos e lembretes" }).first().waitFor({
-    timeout: 30_000,
-  });
-  check(true, `${label}: a submissão chega ao servidor`);
-}
-
 async function teacherPreferencesScenario(browser) {
   section("Professor — as definições não regrediram");
 
@@ -2504,12 +2674,42 @@ async function teacherPreferencesScenario(browser) {
     "As horas de silêncio também são dele",
   );
 
+  const teacherPreferenceClient = createClient(
+    env.NEXT_PUBLIC_SUPABASE_URL,
+    env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
+    { auth: { persistSession: false, autoRefreshToken: false } },
+  );
+  const { data: teacherPreferenceSession, error: teacherPreferenceSignInError } =
+    await teacherPreferenceClient.auth.signInWithPassword({
+      email: ACCOUNTS.teacher.email,
+      password: ACCOUNTS.teacher.password,
+    });
+  if (teacherPreferenceSignInError || !teacherPreferenceSession.user) {
+    throw new Error("Não foi possível abrir a sessão Auth das preferências do professor.");
+  }
+  const teacherPreferenceProfileId = teacherPreferenceSession.user.id;
+
   await page.locator('input[name="quietHoursStart"]').fill("23:00");
   await page.locator('input[name="quietHoursEnd"]').fill("07:00");
-  await saveTeacherPreferences(page, "Professor guarda o silêncio");
+  await submitNotificationPreferences(page, "Professor guarda o silêncio");
   check(
-    (await page.locator('input[name="quietHoursStart"]').inputValue()) === "23:00",
-    "E persistem para o professor",
+    (await page.locator('input[name="quietHoursStart"]').inputValue()) === "23:00" &&
+      (await page.locator('input[name="quietHoursEnd"]').inputValue()) === "07:00",
+    "E continuam visíveis para o professor sem reload",
+  );
+
+  const teacherQuietHours = await teacherPreferenceClient
+    .from("notification_preferences")
+    .select("quiet_hours_start, quiet_hours_end")
+    .eq("profile_id", teacherPreferenceProfileId)
+    .single();
+  if (teacherQuietHours.error) {
+    throw new Error(`Ler preferências do professor: ${teacherQuietHours.error.message}`);
+  }
+  check(
+    teacherQuietHours.data.quiet_hours_start?.slice(0, 5) === "23:00" &&
+      teacherQuietHours.data.quiet_hours_end?.slice(0, 5) === "07:00",
+    "As horas de silêncio persistem sob o JWT do professor",
   );
 
   // Guardar não pode ter desligado em silêncio preferências que ele nunca viu.
@@ -2527,8 +2727,32 @@ async function teacherPreferencesScenario(browser) {
 
   await page.locator('input[name="quietHoursStart"]').fill("");
   await page.locator('input[name="quietHoursEnd"]').fill("");
-  await saveTeacherPreferences(page, "Professor limpa o silêncio");
+  await submitNotificationPreferences(page, "Professor limpa o silêncio");
 
+  // Um segundo clique enquanto a primeira Action está pendente não pode
+  // enfileirar outra gravação nem deixar o botão bloqueado.
+  const teacherEmail = page.locator('input[name="emailEnabled"]');
+  const teacherEmailTarget = !(await teacherEmail.isChecked());
+  if (teacherEmailTarget) await teacherEmail.check();
+  else await teacherEmail.uncheck();
+  await submitNotificationPreferences(page, "Professor faz clique rápido repetido", {
+    rapidSecondClick: true,
+  });
+  const teacherEmailPersisted = await teacherPreferenceClient
+    .from("notification_preferences")
+    .select("email_enabled")
+    .eq("profile_id", teacherPreferenceProfileId)
+    .single();
+  if (teacherEmailPersisted.error) {
+    throw new Error(`Ler email do professor: ${teacherEmailPersisted.error.message}`);
+  }
+  check(
+    teacherEmailPersisted.data.email_enabled === teacherEmailTarget &&
+      (await teacherEmail.isChecked()) === teacherEmailTarget,
+    "O clique rápido deixa UI e persistência no mesmo estado",
+  );
+
+  await teacherPreferenceClient.auth.signOut();
   await context.close();
 }
 
