@@ -79,12 +79,54 @@ const expectedTables = [
   "lesson_change_history",
 ];
 
+const projectionOnlyTables = [
+  "attendance",
+  "lesson_participants",
+  "student_packages",
+  "package_credit_transactions",
+  "notifications",
+  "organization_members",
+  "organization_invitations",
+  "student_invitations",
+  "student_package_audit_events",
+];
+
+const projectionContracts = [
+  "student_package_records",
+  "student_package_transaction_records",
+  "teacher_package_records",
+  "teacher_package_history_records",
+  "teacher_package_audit_records",
+  "teacher_lesson_credit_transaction_records",
+  "student_lesson_records",
+  "lesson_participant_directory",
+  "teacher_lesson_participant_credit_records",
+  "user_notification_records",
+  "workspace_membership_records",
+  "workspace_member_directory",
+  "workspace_invitation_records",
+  "workspace_received_invitation_records",
+  "teacher_student_management_records",
+];
+
+const teacherLessonCreditColumns = [
+  "id",
+  "student_package_id",
+  "student_id",
+  "lesson_id",
+  "lesson_participant_id",
+  "type",
+  "quantity",
+  "created_at",
+];
+
 const expectedViews = [
   "teacher_package_records",
   "student_package_records",
   "student_package_transaction_records",
   "teacher_package_audit_records",
   "teacher_package_history_records",
+  "teacher_lesson_credit_transaction_records",
   "teacher_availability_rule_records",
   "teacher_availability_exception_records",
   "teacher_schedule_block_records",
@@ -419,6 +461,15 @@ authenticated_rpc(name) as (values
 internal_functions(name) as (values
     ${values(internalFunctions)}
 ),
+projection_only_tables(name) as (values
+    ${values(projectionOnlyTables)}
+),
+projection_contracts(name) as (values
+    ${values(projectionContracts)}
+),
+teacher_lesson_credit_columns(name) as (values
+    ${values(teacherLessonCreditColumns)}
+),
 checks as (
   select
     'migracoes' as category,
@@ -479,6 +530,95 @@ checks as (
       select string_agg(name, ', ' order by name)
       from expected_views
       where to_regclass('public.' || name) is null
+    ), 'ok')
+
+  union all
+  select
+    'privacidade',
+    'tabelas com projections proprias nao tem SELECT bruto de cliente',
+    not exists (
+      select 1
+      from information_schema.column_privileges grant_entry
+      join projection_only_tables expected on expected.name = grant_entry.table_name
+      where grant_entry.table_schema = 'public'
+        and grant_entry.grantee in ('PUBLIC', 'anon', 'authenticated')
+        and grant_entry.privilege_type = 'SELECT'
+    ),
+    coalesce((
+      select string_agg(distinct grant_entry.table_name || ':' || grant_entry.grantee, ', ')
+      from information_schema.column_privileges grant_entry
+      join projection_only_tables expected on expected.name = grant_entry.table_name
+      where grant_entry.table_schema = 'public'
+        and grant_entry.grantee in ('PUBLIC', 'anon', 'authenticated')
+        and grant_entry.privilege_type = 'SELECT'
+    ), 'ok')
+
+  union all
+  select
+    'privacidade',
+    'projections mantem SELECT autenticado e recusam anon',
+    not exists (
+      select 1
+      from projection_contracts expected
+      where not has_table_privilege('authenticated', 'public.' || expected.name, 'SELECT')
+         or has_table_privilege('anon', 'public.' || expected.name, 'SELECT')
+    ),
+    coalesce((
+      select string_agg(expected.name, ', ' order by expected.name)
+      from projection_contracts expected
+      where not has_table_privilege('authenticated', 'public.' || expected.name, 'SELECT')
+         or has_table_privilege('anon', 'public.' || expected.name, 'SELECT')
+    ), 'ok')
+
+  union all
+  select
+    'privacidade',
+    'projection de movimentos por aula expoe apenas a correlacao minima',
+    not exists (
+      (select name from teacher_lesson_credit_columns)
+      except
+      (select column_name from information_schema.columns
+        where table_schema = 'public'
+          and table_name = 'teacher_lesson_credit_transaction_records')
+    ) and not exists (
+      (select column_name from information_schema.columns
+        where table_schema = 'public'
+          and table_name = 'teacher_lesson_credit_transaction_records')
+      except
+      (select name from teacher_lesson_credit_columns)
+    ),
+    coalesce((
+      select string_agg(column_name, ', ' order by ordinal_position)
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'teacher_lesson_credit_transaction_records'
+    ), 'view ausente')
+
+  union all
+  select
+    'privacidade',
+    'hardening da Fase 2 continua a ocultar notas privadas',
+    not exists (
+      select 1
+      from information_schema.column_privileges
+      where table_schema = 'public'
+        and grantee = 'authenticated'
+        and privilege_type = 'SELECT'
+        and (table_name, column_name) in (
+          ('lessons', 'private_notes'),
+          ('student_profiles', 'notes')
+        )
+    ),
+    coalesce((
+      select string_agg(table_name || '.' || column_name, ', ' order by table_name, column_name)
+      from information_schema.column_privileges
+      where table_schema = 'public'
+        and grantee = 'authenticated'
+        and privilege_type = 'SELECT'
+        and (table_name, column_name) in (
+          ('lessons', 'private_notes'),
+          ('student_profiles', 'notes')
+        )
     ), 'ok')
 
   union all

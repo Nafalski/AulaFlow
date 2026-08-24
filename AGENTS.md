@@ -182,7 +182,8 @@ update public.profiles set role = 'admin' where email = 'voce@exemplo.pt';
 │   ├── ..._phase8b2_depleted_low_balance.sql Fase 8B.2: esgotado ainda é saldo baixo
 │   ├── ..._phase8c_email_outbox.sql Fase 8C: outbox, preferências e horas de silêncio
 │   ├── ..._phase8c_email_worker_schedule.sql Fase 8C: o job que acorda o worker
-│   └── ..._phase8c1_quiet_hours_at_claim.sql Fase 8C.1: o silêncio vale no envio
+│   ├── ..._phase8c1_quiet_hours_at_claim.sql Fase 8C.1: o silêncio vale no envio
+│   └── ..._projection_read_boundaries.sql AF-H01: projeções como fronteira de leitura
 │
 └── src/
     ├── proxy.ts             Renova a sessão e protege rotas (era middleware.ts)
@@ -303,6 +304,7 @@ Alvo: WCAG 2.1 AA. Os componentes de `components/ui/` já resolvem o essencial �
 11. **Membership de clube não é autorização operacional.** Dá acesso a nome e papel dos colegas e, com consentimento explícito, a disponibilidade genérica. Não acrescentar `SELECT` a tabelas existentes por causa de um clube: o calendário partilhado tem projeção própria e restrita.
 12. **Partilhar a agenda é sempre uma decisão do próprio.** `calendar_sharing_enabled` nasce `false` e só muda por `set_workspace_calendar_sharing()`, que não aceita alvo. Não criar caminho para owner, manager ou admin forçarem a partilha de outra pessoa.
 13. **Uma view nova não é privada por acidente.** No Supabase, views e funções herdam privilégios de `PUBLIC`/`anon` por omissão. Cada uma tem de ter `revoke all ... from public, anon` e um `grant` explícito — como em `..._workspace_grants.sql`. Não confiar na cláusula `WHERE` para fazer o trabalho de uma permissão.
+14. **RLS filtra linhas; grants e projeções filtram colunas.** Tabelas com contrato de leitura por view não dão `SELECT` bruto a `authenticated`: `attendance`, `lesson_participants`, `student_packages`, `package_credit_transactions`, `notifications`, `organization_members`, `organization_invitations`, `student_invitations` e `student_package_audit_events` são lidas apenas pelas projeções próprias. Não reabrir a tabela para resolver uma consulta da interface.
 
 ### Perfis e definições (Fase 2)
 

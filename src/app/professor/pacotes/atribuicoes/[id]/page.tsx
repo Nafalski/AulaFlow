@@ -39,7 +39,7 @@ export const dynamic = "force-dynamic";
 const PACKAGE_COLUMNS =
   "id, student_id, student_name, student_email, template_name, name, sport_name, initial_credits, credits_total, credits_available, credits_reserved, credits_used, purchased_at, starts_on, expires_on, status, paid_amount_cents, currency, notes, origin, created_by_name, created_at, updated_at";
 const TRANSACTION_COLUMNS =
-  "id, type, quantity, corrects_transaction_id, created_at";
+  "id, type:event_type, quantity, corrects_transaction_id, created_at";
 const HISTORY_COLUMNS =
   "id, source, event_type, quantity, available_after, reserved_after, used_after, reason, performed_by_name, previous_values, new_values, corrects_transaction_id, created_at";
 
@@ -56,6 +56,16 @@ const TRANSACTION_LABELS: Record<CreditTransactionType, string> = {
   administrative_correction: "Correção administrativa",
   exception_authorized: "Exceção autorizada",
 };
+
+function isCorrectableCreditTransaction(
+  value: CreditTransactionType | PackageAuditEventType,
+): value is CreditTransactionType {
+  return (
+    value === "package_created" ||
+    value === "credit_added_manually" ||
+    value === "credit_removed_manually"
+  );
+}
 
 const AUDIT_EVENT_LABELS: Record<PackageAuditEventType, string> = {
   package_suspended: "Pacote suspenso",
@@ -119,9 +129,10 @@ export default async function AssignedPackagePage({
   }
 
   const { data: transactions, error: transactionError } = await supabase
-    .from("package_credit_transactions")
+    .from("teacher_package_history_records")
     .select(TRANSACTION_COLUMNS)
     .eq("student_package_id", pack.id)
+    .eq("source", "credit")
     .order("created_at", { ascending: false })
     .limit(80);
 
@@ -137,10 +148,12 @@ export default async function AssignedPackagePage({
   );
   const correctableTransactions = (transactions ?? [])
     .filter(
-      (transaction) =>
-        ["package_created", "credit_added_manually", "credit_removed_manually"].includes(
-          transaction.type,
-        ) && !correctedTransactionIds.has(transaction.id),
+      (
+        transaction,
+      ): transaction is typeof transaction & { type: CreditTransactionType; quantity: number } =>
+        isCorrectableCreditTransaction(transaction.type) &&
+        transaction.quantity !== null &&
+        !correctedTransactionIds.has(transaction.id),
     )
     .map((transaction) => ({
       id: transaction.id,

@@ -1386,6 +1386,12 @@ Corrigido na mesma passagem, do lado do transporte: o **409** do fornecedor deix
 
 E a lógica do worker saiu do entrypoint para `handler.ts`, com dependências injetadas: autenticação, fornecedor por configurar, o ciclo e a privacidade da resposta ficaram cobertos por testes que correm sem rede e sem segredos. Uma falha a **fechar** deixou de poder ser confundida com o fornecedor ter falhado. O entrypoint Deno, que estava fora do `tsc` e do ESLint, passou a ser verificado por ambos através de `supabase/functions/deno-env.d.ts`.
 
+#### Correção transversal AF-H01 — projeções são a fronteira de leitura
+
+O RLS continua a decidir **quais linhas** pertencem à sessão, mas deixou de ser confundido com proteção de colunas. Quando uma tabela já tem views próprias por audiência, `authenticated` não recebe mais `SELECT` bruto: presença, participantes, pacotes, livro-razão, notificações, memberships, convites e auditoria de pacotes são consultados apenas pelas projeções previstas. A interface do professor foi ajustada para os contratos existentes; uma única view mínima nova correlaciona movimentos de crédito com aulas sem expor saldos, motivo, autoria, correções ou chaves de idempotência.
+
+O catálogo local e remoto fixa essa fronteira, e os testes Auth/PostgREST tentam explicitamente contorná-la com JWT real de aluno, professor, administrador, conta bloqueada e anónimo. O hardening anterior de `lessons.private_notes` e `student_profiles.notes` foi preservado, não refeito.
+
 #### O que ficou por verificar
 
 O projeto de desenvolvimento **não tem `RESEND_API_KEY`, remetente verificado nem os segredos da Edge Function configurados**, e criar uma conta no fornecedor em nome do utilizador não é decisão de quem implementa. Toda a lógica está validada contra um transporte simulado — sucesso, 429, 500, falha de rede, 422 definitivo, limite de tentativas, arrendamento expirado e concorrência —, mas **não houve envio real**.

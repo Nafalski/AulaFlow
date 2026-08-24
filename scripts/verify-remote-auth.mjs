@@ -25,6 +25,18 @@ import {
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
+const PROJECTION_ONLY_TABLES = [
+  "attendance",
+  "lesson_participants",
+  "student_packages",
+  "package_credit_transactions",
+  "notifications",
+  "organization_members",
+  "organization_invitations",
+  "student_invitations",
+  "student_package_audit_events",
+];
+
 let assertions = 0;
 let failures = 0;
 const created = {};
@@ -449,6 +461,12 @@ try {
     .order("created_at", { ascending: true });
   if (history.error) throw new Error(`Historico combinado: ${summarizeError(history.error)}`);
   check(history.data.length >= 5, "Historico combinado contem eventos esperados");
+  await mustReject("Professor nao contorna a projection da auditoria de pacotes", async () =>
+    teacherClient
+      .from("student_package_audit_events")
+      .select("idempotency_key, performed_by")
+      .eq("student_package_id", packageId),
+  );
 
   section("Aluno A");
   const studentUser = await signIn(
@@ -459,6 +477,18 @@ try {
   );
   const studentProfile = await getProfile(studentClient, studentUser.id, "Aluno A");
   check(studentProfile.role === "student", "Aluno A tem papel student");
+
+  const studentSelf = await getSingle(
+    "ficha segura do Aluno A",
+    studentClient
+      .from("student_self_profile")
+      .select("id, organization_id, full_name, email")
+      .eq("profile_id", studentUser.id),
+  );
+  check(studentSelf.id === studentsA.id, "Aluno A le a propria ficha pela projection segura");
+  await mustReject("Aluno A nao le notes na tabela bruta da ficha", async () =>
+    studentClient.from("student_profiles").select("notes").eq("id", studentsA.id),
+  );
 
   const studentPackages = await studentClient
     .from("student_package_records")
@@ -491,6 +521,14 @@ try {
     "View do aluno nao inclui campos administrativos",
     `View do aluno vazou campos: ${privatePackageFields.join(", ")}`,
   );
+  await mustReject("Aluno A nao contorna a projection do pacote", async () =>
+    studentClient
+      .from("student_packages")
+      .select(
+        "organization_id, student_id, teacher_id, template_id, paid_amount_cents, notes, created_by, assignment_idempotency_key",
+      )
+      .eq("id", packageId),
+  );
 
   const studentMovements = await studentClient
     .from("student_package_transaction_records")
@@ -514,6 +552,14 @@ try {
     privateMovementFields.length === 0,
     "Movimentos do aluno nao incluem autoria, motivo nem saldos internos",
     `Movimentos vazaram campos: ${privateMovementFields.join(", ")}`,
+  );
+  await mustReject("Aluno A nao contorna a projection do livro-razao", async () =>
+    studentClient
+      .from("package_credit_transactions")
+      .select(
+        "available_before, reserved_before, used_before, available_after, reserved_after, used_after, reason, performed_by, corrects_transaction_id, idempotency_key",
+      )
+      .eq("student_package_id", packageId),
   );
   await mustReject("Aluno A nao executa RPC administrativa", async () =>
     studentClient.rpc("admin_adjust_package_credits", {
@@ -579,6 +625,15 @@ try {
   );
   await mustReturnNoRows("Admin nao le ledger privado do professor", () =>
     adminClient.from("teacher_package_history_records").select("id").eq("student_package_id", packageId),
+  );
+  await mustReject("Admin nao usa tabela bruta para virar super-professor de pacotes", async () =>
+    adminClient.from("student_packages").select("notes, paid_amount_cents").eq("id", packageId),
+  );
+  await mustReject("Admin nao usa tabela bruta para ler o ledger do professor", async () =>
+    adminClient
+      .from("package_credit_transactions")
+      .select("reason, performed_by, available_after")
+      .eq("student_package_id", packageId),
   );
   await mustReject("Admin nao ajusta credito como professor funcional", async () =>
     adminClient.rpc("admin_adjust_package_credits", {
@@ -1016,6 +1071,12 @@ try {
     (pendingInvitations.data ?? []).some((row) => row.id === invitationId),
     "Professor A consulta o convite pendente que emitiu",
   );
+  await mustReject("Professor A nao contorna a projection de convites do clube", async () =>
+    teacherClient
+      .from("organization_invitations")
+      .select("idempotency_key, invited_by, responded_by, revoked_by")
+      .eq("id", invitationId),
+  );
 
   await signIn(
     teacherBClient,
@@ -1092,6 +1153,12 @@ try {
       "notes",
     ]).length === 0,
     "Diretorio de membros nao expoe contactos nem dados operacionais",
+  );
+  await mustReject("Membro nao contorna o diretorio seguro do clube", async () =>
+    teacherBClient
+      .from("organization_members")
+      .select("invited_by, removed_at, calendar_sharing_enabled")
+      .eq("organization_id", clubId),
   );
 
   await mustReturnNoRows("Membro do clube nao le alunos do colega", () =>
@@ -3170,7 +3237,7 @@ try {
     "aula de turma do aluno",
     studentClient
       .from("student_lesson_records")
-      .select("id, is_group_lesson, billing_status, credits_reserved, package_name")
+      .select("id, participation_id, is_group_lesson, billing_status, credits_reserved, package_name")
       .eq("id", groupLessonId),
   );
   check(
@@ -3179,6 +3246,29 @@ try {
       studentGroupLesson.credits_reserved === 1 &&
       studentGroupLesson.package_name !== null,
     "Aluno ve apenas o proprio estado de credito na aula de turma",
+  );
+  await mustReject("Aluno nao contorna a projection da propria participacao", async () =>
+    studentClient
+      .from("lesson_participants")
+      .select(
+        "student_package_id, credits_reserved, credits_consumed, billing_status, is_exception, exception_reason, exception_authorized_by, added_by",
+      )
+      .eq("id", studentGroupLesson.participation_id),
+  );
+  await mustReject("private_notes de lessons continua protegida desde a Fase 2", async () =>
+    studentClient.from("lessons").select("private_notes").eq("id", groupLessonId),
+  );
+  await mustReturnNoRows("Professor B nao le movimentos das aulas do Professor A", () =>
+    teacherBClient
+      .from("teacher_lesson_credit_transaction_records")
+      .select("id")
+      .eq("lesson_id", groupLessonId),
+  );
+  await mustReturnNoRows("Admin nao vira professor pela projection de movimentos da aula", () =>
+    adminClient
+      .from("teacher_lesson_credit_transaction_records")
+      .select("id")
+      .eq("lesson_id", groupLessonId),
   );
 
   const rollbackGroup = await ensureGroup(teacherClient, teacherRecord, `Turma E2E sem credito ${runId}`);
@@ -4055,7 +4145,7 @@ try {
   );
   const completeParticipantAfter = await readParticipant(completeLessonId, studentsA.id);
   const completeLedger = await teacherClient
-    .from("package_credit_transactions")
+    .from("teacher_lesson_credit_transaction_records")
     .select("id, type")
     .eq("lesson_id", completeLessonId)
     .eq("type", "credit_consumed");
@@ -4187,7 +4277,7 @@ try {
     .select("billing_status, credits_reserved, credits_consumed")
     .eq("lesson_id", completeGroupLessonId);
   const completeGroupLedger = await teacherClient
-    .from("package_credit_transactions")
+    .from("teacher_lesson_credit_transaction_records")
     .select("id, type")
     .eq("lesson_id", completeGroupLessonId)
     .eq("type", "credit_consumed");
@@ -4259,7 +4349,7 @@ try {
   const completionRaceSuccesses = completionRace.filter((outcome) => outcome.ok && outcome.data === true);
   const completionRaceNoops = completionRace.filter((outcome) => outcome.ok && outcome.data === false);
   const raceLedger = await teacherClient
-    .from("package_credit_transactions")
+    .from("teacher_lesson_credit_transaction_records")
     .select("id")
     .eq("lesson_id", raceLessonId)
     .eq("type", "credit_consumed");
@@ -4286,8 +4376,8 @@ try {
     ),
   ]);
   const presenceRaceRows = await teacherClient
-    .from("attendance")
-    .select("id, status")
+    .from("teacher_lesson_participant_credit_records")
+    .select("lesson_participant_id, attendance_status")
     .eq("lesson_id", presenceRaceLessonId)
     .eq("student_id", studentsA.id);
   check(
@@ -4295,7 +4385,7 @@ try {
       presenceRace.filter((outcome) => outcome.ok && outcome.data === true).length === 1 &&
       presenceRace.filter((outcome) => outcome.ok && outcome.data === false).length === 1 &&
       (presenceRaceRows.data ?? []).length === 1 &&
-      presenceRaceRows.data?.[0]?.status === "present",
+      presenceRaceRows.data?.[0]?.attendance_status === "present",
     "Presenca concorrente cria uma unica linha e a segunda chamada e no-op",
   );
 
@@ -4331,7 +4421,7 @@ try {
   );
   const editRaceParticipantAfter = await readParticipant(editRaceLessonId, studentsA.id);
   const editRaceLedger = await teacherClient
-    .from("package_credit_transactions")
+    .from("teacher_lesson_credit_transaction_records")
     .select("id")
     .eq("lesson_id", editRaceLessonId)
     .eq("type", "credit_consumed");
@@ -4371,6 +4461,13 @@ try {
       "recurrence_group_id",
     ]).length === 0,
     "Projecao 6A do aluno nao expoe ator, pacote interno nem colegas",
+  );
+  await mustReject("Aluno nao contorna a projection da propria presenca", async () =>
+    studentClient
+      .from("attendance")
+      .select("student_id, lesson_id, marked_by, notes")
+      .eq("lesson_id", completeLessonId)
+      .eq("student_id", studentsA.id),
   );
 
   await mustReturnNoRows("Aluno B nao ve a presenca da aula do Aluno A", () =>
@@ -4508,7 +4605,7 @@ try {
       .eq("id", cancelPackageBefore.id),
   );
   const cancelReleaseLedger = await teacherClient
-    .from("package_credit_transactions")
+    .from("teacher_lesson_credit_transaction_records")
     .select("id, type")
     .eq("lesson_id", cancelLessonId)
     .eq("type", "reservation_released");
@@ -5065,7 +5162,7 @@ try {
     rpcOutcome(() => cancelLessonRpc(raceClientB, doubleCancelLessonId)),
   ]);
   const doubleCancelLedger = await teacherClient
-    .from("package_credit_transactions")
+    .from("teacher_lesson_credit_transaction_records")
     .select("id")
     .eq("lesson_id", doubleCancelLessonId)
     .eq("type", "reservation_released");
@@ -5102,12 +5199,12 @@ try {
   );
   const cancelCompleteParticipantAfter = await readParticipant(cancelCompleteRaceId, studentsA.id);
   const cancelCompleteReleaseLedger = await teacherClient
-    .from("package_credit_transactions")
+    .from("teacher_lesson_credit_transaction_records")
     .select("id")
     .eq("lesson_id", cancelCompleteRaceId)
     .eq("type", "reservation_released");
   const cancelCompleteConsumeLedger = await teacherClient
-    .from("package_credit_transactions")
+    .from("teacher_lesson_credit_transaction_records")
     .select("id")
     .eq("lesson_id", cancelCompleteRaceId)
     .eq("type", "credit_consumed");
@@ -5161,7 +5258,7 @@ try {
     groupStudent.id,
   );
   const cancelParticipantRaceLedger = await teacherClient
-    .from("package_credit_transactions")
+    .from("teacher_lesson_credit_transaction_records")
     .select("id")
     .eq("lesson_id", cancelParticipantLessonRaceId)
     .eq("lesson_participant_id", cancelParticipantRaceTarget.lesson_participant_id)
@@ -5860,7 +5957,7 @@ try {
       .eq("lesson_id", originId);
     if (history.error) throw new Error(`${label}: historico: ${summarizeError(history.error)}`);
     const ledger = await teacherClient
-      .from("package_credit_transactions")
+      .from("teacher_lesson_credit_transaction_records")
       .select("id, type")
       .eq("lesson_id", originId);
     if (ledger.error) throw new Error(`${label}: livro-razao: ${summarizeError(ledger.error)}`);
@@ -6529,7 +6626,7 @@ try {
       .eq("name", confirmParticipantBefore.package_name),
   );
   const confirmLedgerBefore = await teacherClient
-    .from("package_credit_transactions")
+    .from("teacher_lesson_credit_transaction_records")
     .select("id")
     .eq("lesson_id", confirmableLessonId);
   if (confirmLedgerBefore.error) {
@@ -6586,7 +6683,7 @@ try {
     "Confirmar nao move nenhum dos tres baldes de creditos",
   );
   const confirmLedgerAfter = await teacherClient
-    .from("package_credit_transactions")
+    .from("teacher_lesson_credit_transaction_records")
     .select("id")
     .eq("lesson_id", confirmableLessonId);
   check(
@@ -6827,7 +6924,7 @@ try {
       .eq("name", groupRaceColleagueBefore.package_name),
   );
   const groupRaceLedgerBefore = await teacherClient
-    .from("package_credit_transactions")
+    .from("teacher_lesson_credit_transaction_records")
     .select("id, type")
     .eq("lesson_id", groupRaceLessonId);
   if (groupRaceLedgerBefore.error) {
@@ -6939,7 +7036,7 @@ try {
   );
 
   const groupRaceLedgerAfter = await teacherClient
-    .from("package_credit_transactions")
+    .from("teacher_lesson_credit_transaction_records")
     .select("id, type")
     .eq("lesson_id", groupRaceLessonId);
   if (groupRaceLedgerAfter.error) {
@@ -7117,6 +7214,12 @@ try {
   );
   await mustReject("Anonimo nao le a caixa de avisos", async () =>
     anonClient.from("user_notification_records").select("id").limit(1),
+  );
+  await mustReject("Aluno nao contorna a projection da propria notificacao", async () =>
+    studentClient
+      .from("notifications")
+      .select("recipient_profile_id, organization_id, payload, dedupe_key")
+      .eq("id", createdNotification?.id ?? "00000000-0000-0000-0000-000000000000"),
   );
 
   // ── Escrita direta fechada ──
@@ -7663,6 +7766,11 @@ try {
   await mustReject("Anonimo nao le contextos de workspace", async () =>
     anonClient.from("workspace_membership_records").select("organization_id").limit(1),
   );
+  for (const table of PROJECTION_ONLY_TABLES) {
+    await mustReject(`Anonimo nao le tabela bruta ${table}`, async () =>
+      anonClient.from(table).select("*").limit(1),
+    );
+  }
   await mustReject("Anonimo nao cria clube", async () =>
     anonClient.rpc("create_club_workspace", {
       p_name: `Clube anonimo ${runId}`,

@@ -56,7 +56,7 @@ export default async function PackageTemplateDetailPage({
   const [sportsResult, assignedCountResult] = await Promise.all([
     supabase.from("sports").select("id, name, icon, is_active").order("name"),
     supabase
-      .from("student_packages")
+      .from("teacher_package_records")
       .select("id", { count: "exact", head: true })
       .eq("template_id", template.id),
   ]);

@@ -185,6 +185,112 @@ check(
   `escrita direta concedida: ${packageWrites.map((p) => `${p.table_name}.${p.privilege_type}`).join(", ")}`,
 );
 
+const PROJECTION_ONLY_TABLES = [
+  "attendance",
+  "lesson_participants",
+  "student_packages",
+  "package_credit_transactions",
+  "notifications",
+  "organization_members",
+  "organization_invitations",
+  "student_invitations",
+  "student_package_audit_events",
+];
+
+const projectionBypasses = await rows(
+  `select table_name, grantee, privilege_type
+     from information_schema.column_privileges
+    where table_schema = 'public'
+      and table_name = any($1)
+      and grantee in ('PUBLIC', 'anon', 'authenticated')
+      and privilege_type = 'SELECT'
+    order by table_name, grantee, column_name`,
+  [PROJECTION_ONLY_TABLES],
+);
+check(
+  projectionBypasses.length === 0,
+  "tabelas com projections próprias não têm SELECT bruto de cliente",
+  `SELECT bruto ainda exposto: ${projectionBypasses
+    .map((grant) => `${grant.table_name}.${grant.grantee}`)
+    .filter((value, index, all) => all.indexOf(value) === index)
+    .join(", ")}`,
+);
+
+const PROJECTION_CONTRACTS = [
+  "student_package_records",
+  "student_package_transaction_records",
+  "teacher_package_records",
+  "teacher_package_history_records",
+  "teacher_package_audit_records",
+  "teacher_lesson_credit_transaction_records",
+  "student_lesson_records",
+  "lesson_participant_directory",
+  "teacher_lesson_participant_credit_records",
+  "user_notification_records",
+  "workspace_membership_records",
+  "workspace_member_directory",
+  "workspace_invitation_records",
+  "workspace_received_invitation_records",
+  "teacher_student_management_records",
+];
+
+const TEACHER_LESSON_CREDIT_COLUMNS = [
+  "id",
+  "student_package_id",
+  "student_id",
+  "lesson_id",
+  "lesson_participant_id",
+  "type",
+  "quantity",
+  "created_at",
+];
+
+const missingProjectionContracts = await rows(
+  `select expected.name
+     from unnest($1::text[]) expected(name)
+    where not has_table_privilege('authenticated', 'public.' || expected.name, 'SELECT')
+       or has_table_privilege('anon', 'public.' || expected.name, 'SELECT')`,
+  [PROJECTION_CONTRACTS],
+);
+check(
+  missingProjectionContracts.length === 0,
+  "projections mantêm SELECT apenas para authenticated",
+  `contratos de projection incorretos: ${missingProjectionContracts.map((row) => row.name).join(", ")}`,
+);
+
+const teacherLessonCreditColumns = await rows(
+  `select column_name
+     from information_schema.columns
+    where table_schema = 'public'
+      and table_name = 'teacher_lesson_credit_transaction_records'
+    order by ordinal_position`,
+);
+check(
+  teacherLessonCreditColumns.map((row) => row.column_name).join(",") ===
+    TEACHER_LESSON_CREDIT_COLUMNS.join(","),
+  "projection de movimentos por aula expõe apenas a correlação mínima",
+  `colunas encontradas: ${teacherLessonCreditColumns.map((row) => row.column_name).join(", ")}`,
+);
+
+const phase2PrivateColumnGrants = await rows(
+  `select table_name, column_name
+     from information_schema.column_privileges
+    where table_schema = 'public'
+      and grantee = 'authenticated'
+      and privilege_type = 'SELECT'
+      and (table_name, column_name) in (
+        ('lessons', 'private_notes'),
+        ('student_profiles', 'notes')
+      )`,
+);
+check(
+  phase2PrivateColumnGrants.length === 0,
+  "hardening da Fase 2 continua a ocultar notas privadas nas tabelas base",
+  `notas privadas expostas: ${phase2PrivateColumnGrants
+    .map((grant) => `${grant.table_name}.${grant.column_name}`)
+    .join(", ")}`,
+);
+
 const PACKAGE_VIEWS = [
   "teacher_package_records",
   "student_package_records",
@@ -1167,25 +1273,27 @@ const claimedAna = await asDatabaseRole("authenticated", ANA_UID, () =>
 check(claimedAna.id === ana.id, "aluna com email confirmado reclamou a ficha certa");
 
 const anaVisiblePackages = await asDatabaseRole("authenticated", ANA_UID, () =>
-  rows(`select id, student_id from public.student_packages order by id`),
+  rows(`select id from public.student_package_records order by id`),
 );
 check(
   anaVisiblePackages.length >= 2 &&
-    anaVisiblePackages.every((row) => row.student_id === ana.id) &&
     !anaVisiblePackages.some((row) => row.id === otherPackage.id),
-  "RLS deixa a aluna ver os próprios pacotes e oculta os restantes",
+  "projection deixa a aluna ver os próprios pacotes e oculta os restantes",
 );
 
 const anaVisibleTransactions = await asDatabaseRole("authenticated", ANA_UID, () =>
-  rows(`select distinct student_id from public.package_credit_transactions`),
+  rows(`select distinct student_package_id from public.student_package_transaction_records`),
 );
 check(
-  anaVisibleTransactions.length === 1 && anaVisibleTransactions[0].student_id === ana.id,
-  "RLS deixa a aluna ver apenas as próprias movimentações",
+  anaVisibleTransactions.length > 0 &&
+    anaVisibleTransactions.every((row) =>
+      anaVisiblePackages.some((pack) => pack.id === row.student_package_id),
+    ),
+  "projection deixa a aluna ver apenas as próprias movimentações",
 );
 
 const teacherVisibleOrganizations = await asDatabaseRole("authenticated", TEACHER_UID, () =>
-  rows(`select distinct organization_id from public.student_packages`),
+  rows(`select distinct organization_id from public.teacher_package_records`),
 );
 check(
   teacherVisibleOrganizations.length === 1 && teacherVisibleOrganizations[0].organization_id === org,
@@ -1453,7 +1561,7 @@ check(
 const blockedAnaProtectedRows = await asDatabaseRole("authenticated", ANA_UID, async () => {
   const self = await rows(`select id from public.student_self_profile`);
   const organizations = await rows(`select id from public.organizations`);
-  const packages = await rows(`select id from public.student_packages`);
+  const packages = await rows(`select id from public.student_package_records`);
   const preferences = await rows(`select profile_id from public.notification_preferences`);
   const updated = await rows(
     `update public.profiles set full_name='Nome bloqueado' where id=$1 returning id`,
@@ -2899,13 +3007,15 @@ await asDatabaseRole("authenticated", ADMIN_UID, () =>
   ]),
 );
 
-const directStudentPackageRows = await asDatabaseRole("authenticated", ANA_UID, () =>
-  rows(`select id, paid_amount_cents, origin, notes, created_by from public.student_packages`),
+await mustReject("aluno não contorna a projection pela tabela bruta de pacotes", () =>
+  asDatabaseRole("authenticated", ANA_UID, () =>
+    db.query(`select paid_amount_cents, origin, notes, created_by from public.student_packages`),
+  ),
 );
-check(
-  directStudentPackageRows.some((row) => row.id === anaPack.id) &&
-    directStudentPackageRows.every((row) => row.id !== customAssignment.id),
-  "RLS da tabela base continua a isolar linhas do aluno",
+await mustReject("aluno não contorna a projection pela tabela bruta do livro-razão", () =>
+  asDatabaseRole("authenticated", ANA_UID, () =>
+    db.query(`select available_before, reason, performed_by from public.package_credit_transactions`),
+  ),
 );
 
 section("Ajustes administrativos de pacotes (Etapa 1D)");
@@ -3275,6 +3385,15 @@ check(
     packageHistoryRows.some((row) => row.source === "admin" && row.event_type === "package_validity_changed"),
   "histórico do professor une livro-razão e eventos administrativos",
 );
+await mustReject("professor não contorna a projection da auditoria de pacotes", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(
+      `select idempotency_key, performed_by
+         from public.student_package_audit_events where student_package_id=$1`,
+      [adminPackage.id],
+    ),
+  ),
+);
 
 const studentPackageAdminHistory = await asDatabaseRole("authenticated", ANA_UID, () =>
   rows(`select id from public.teacher_package_history_records`),
@@ -3330,6 +3449,25 @@ check(
     preparedInvitationAudit.metadata.delivery === "not_sent" &&
     preparedInvitationAuditCount.n === 1,
   "conta de aluno sem organização pode ser preparada de forma idempotente e auditável",
+);
+const preparedInvitationProjection = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select invitation_id, invitation_status
+       from public.teacher_student_management_records where id=$1`,
+    [managedStudent.id],
+  ),
+);
+check(
+  preparedInvitationProjection.invitation_id === preparedInvitation.id &&
+    preparedInvitationProjection.invitation_status === "prepared",
+  "professor consulta o convite do aluno pela projection de gestão",
+);
+await mustReject("professor não contorna a projection pela tabela bruta de convites de aluno", () =>
+  asDatabaseRole("authenticated", TEACHER_UID, () =>
+    db.query(`select prepared_by_teacher_id, target_email from public.student_invitations where id=$1`, [
+      preparedInvitation.id,
+    ]),
+  ),
 );
 
 const emailChangeStudent = await asDatabaseRole("authenticated", TEACHER_UID, () =>
@@ -3629,12 +3767,8 @@ await mustReject("professor não altera o email de uma ficha já ligada", () =>
   ),
 );
 
-const invitationsHiddenFromStudent = await asDatabaseRole("authenticated", ANA_UID, () =>
-  rows(`select id from public.student_invitations`),
-);
-check(
-  invitationsHiddenFromStudent.length === 0,
-  "aluno não consulta o estado administrativo dos convites",
+await mustReject("aluno não consulta a tabela administrativa de convites", () =>
+  asDatabaseRole("authenticated", ANA_UID, () => db.query(`select id from public.student_invitations`)),
 );
 
 const managedGroup = await asDatabaseRole("authenticated", TEACHER_UID, () =>
@@ -5191,6 +5325,13 @@ check(
   receivedByB.length === 1 && receivedByB[0].id === inviteB.id,
   "o convidado vê o convite dirigido ao seu email confirmado",
 );
+await mustReject("convidado não contorna a projection pela tabela bruta de convites", () =>
+  asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+    db.query(`select idempotency_key, invited_by from public.organization_invitations where id=$1`, [
+      inviteB.id,
+    ]),
+  ),
+);
 
 const membershipB = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
   one(`select public.accept_workspace_invitation($1) as id`, [inviteB.id]),
@@ -5255,6 +5396,13 @@ check(
   ]).length === 0,
   "o diretório de membros não expõe email, telefone nem motivos de bloqueio",
 );
+await mustReject("membro não contorna o diretório pela tabela bruta de memberships", () =>
+  asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
+    db.query(`select invited_by, removed_at from public.organization_members where id=$1`, [
+      membershipB.id,
+    ]),
+  ),
+);
 
 const clubMateStudents = await asDatabaseRole("authenticated", OTHER_TEACHER_UID, () =>
   rows(`select id from public.teacher_student_management_records where organization_id=$1`, [org]),
@@ -5285,10 +5433,9 @@ check(
   "professor membro não vê a lista de convites administrativos do clube",
 );
 
-const studentSeesMemberships = await asDatabaseRole("authenticated", ANA_UID, () =>
-  rows(`select id from public.organization_members`),
+await mustReject("aluno não consulta a tabela bruta de memberships", () =>
+  asDatabaseRole("authenticated", ANA_UID, () => db.query(`select id from public.organization_members`)),
 );
-check(studentSeesMemberships.length === 0, "aluno não consulta memberships de professores");
 
 // ── Papéis ──────────────────────────────────────────────────────────────────
 
@@ -7967,8 +8114,11 @@ const expiredLessonPack = await assignPackageAs(TEACHER_UID, {
   credits: 3,
   sportId: sport,
   starts: "2026-08-01",
-  expires: "2026-08-23",
+  expires: "2026-08-24",
 });
+await db.query(`update public.student_packages set expires_on='2026-08-23' where id=$1`, [
+  expiredLessonPack.id,
+]);
 const expiredLedgerBefore = await one(
   `select count(*)::int as total from public.package_credit_transactions where student_package_id=$1`,
   [expiredLessonPack.id],
@@ -8938,8 +9088,8 @@ await mustReject(
 
 const missingAttendanceLesson = await createOperationalLesson({
   title: "Conclusão sem presença 6A",
-  startOffset: "-3 hours",
-  endOffset: "-2 hours",
+  startOffset: "-1 day",
+  endOffset: "-1 day 1 hour",
 });
 const missingAttendanceParticipant = await reserveParticipant(
   missingAttendanceLesson.id,
@@ -8967,8 +9117,8 @@ check(
 
 const legacyLesson = await createOperationalLesson({
   title: "Legacy sem reserva 6A",
-  startOffset: "-13 hours",
-  endOffset: "-12 hours",
+  startOffset: "-2 days",
+  endOffset: "-2 days 1 hour",
 });
 const legacyParticipant = await one(
   `insert into public.lesson_participants (lesson_id, student_id, added_by)
@@ -9008,8 +9158,8 @@ check(
 
 const completionLesson = await createOperationalLesson({
   title: "Conclusão individual 6A",
-  startOffset: "-5 hours",
-  endOffset: "-4 hours",
+  startOffset: "-3 days",
+  endOffset: "-3 days 1 hour",
 });
 const completionParticipant = await reserveParticipant(
   completionLesson.id,
@@ -9152,8 +9302,8 @@ await asDatabaseRole("authenticated", ADMIN_UID, () =>
 
 const incompleteGroupLesson = await createOperationalLesson({
   title: "Turma presença incompleta 6A",
-  startOffset: "-7 hours",
-  endOffset: "-6 hours",
+  startOffset: "-4 days",
+  endOffset: "-4 days 1 hour",
   groupId: managedGroup.id,
 });
 const incompleteAnaParticipant = await reserveParticipant(
@@ -9192,8 +9342,8 @@ check(
 
 const completeGroupLesson = await createOperationalLesson({
   title: "Turma completa 6A",
-  startOffset: "-9 hours",
-  endOffset: "-8 hours",
+  startOffset: "-5 days",
+  endOffset: "-5 days 1 hour",
   groupId: managedGroup.id,
 });
 const completeGroupAnaParticipant = await reserveParticipant(
@@ -9247,8 +9397,8 @@ const recurringCompletionParticipant = await one(
 );
 await db.query(
   `update public.lessons
-      set starts_at = now() + '-11 hours'::interval,
-          ends_at = now() + '-10 hours'::interval
+      set starts_at = date_trunc('day', now()) + interval '-6 days 3 hours',
+          ends_at = date_trunc('day', now()) + interval '-6 days 4 hours'
     where id=$1`,
   [recurringCompletionLessonId],
 );
@@ -9328,10 +9478,19 @@ check(
   ]).length === 0,
   "projeção do aluno não expõe ator, pacote, professor interno nem colegas",
 );
+await mustReject("aluno não contorna a projection pela tabela bruta de participantes", () =>
+  asDatabaseRole("authenticated", ANA_UID, () =>
+    db.query(
+      `select student_package_id, billing_status, exception_reason, exception_authorized_by
+         from public.lesson_participants where id=$1`,
+      [completionParticipant.id],
+    ),
+  ),
+);
 
 const anaAttendanceRows = await asDatabaseRole("authenticated", ANA_UID, () =>
   rows(
-    `select student_id, status::text from public.attendance where lesson_id=$1 order by student_id`,
+    `select attendance_status::text from public.student_lesson_records where id=$1`,
     [completeGroupLesson.id],
   ),
 );
@@ -9347,20 +9506,27 @@ const claimedBruno = await asDatabaseRole("authenticated", BRUNO_UID, () =>
 check(claimedBruno.id === bruno.id, "aluno Bruno autenticado reclamou a própria ficha");
 const brunoAttendanceRows = await asDatabaseRole("authenticated", BRUNO_UID, () =>
   rows(
-    `select student_id, status::text from public.attendance where lesson_id=$1 order by student_id`,
+    `select attendance_status::text from public.student_lesson_records where id=$1`,
     [completeGroupLesson.id],
   ),
 );
 const adminAttendanceRows = await asDatabaseRole("authenticated", ADMIN_UID, () =>
-  rows(`select id from public.attendance where lesson_id=$1`, [completeGroupLesson.id]),
+  rows(`select id from public.student_lesson_records where id=$1`, [completeGroupLesson.id]),
 );
 check(
   anaAttendanceRows.length === 1 &&
-    anaAttendanceRows[0].student_id === ana.id &&
+    anaAttendanceRows[0].attendance_status === "present" &&
     brunoAttendanceRows.length === 1 &&
-    brunoAttendanceRows[0].student_id === bruno.id &&
+    brunoAttendanceRows[0].attendance_status === "present" &&
     adminAttendanceRows.length === 0,
-  "RLS da tabela attendance isola aluno por aluno e não abre leitura operacional ao admin",
+  "projections de presença isolam aluno por aluno e não abrem leitura operacional ao admin",
+);
+await mustReject("aluno não contorna a projection pela tabela bruta de presença", () =>
+  asDatabaseRole("authenticated", ANA_UID, () =>
+    db.query(`select student_id, marked_by, notes from public.attendance where lesson_id=$1`, [
+      completeGroupLesson.id,
+    ]),
+  ),
 );
 
 await mustReject("cliente não insere presença diretamente", () =>
@@ -12452,6 +12618,15 @@ check(
     ["recipient_profile_id", "organization_id", "payload", "dedupe_key"].includes(row.column_name),
   ),
   "a projeção da caixa não expõe destinatário, organização, payload nem chave interna",
+);
+await mustReject("aluno não contorna a projection pela tabela bruta de notificações", () =>
+  asDatabaseRole("authenticated", ANA_UID, () =>
+    db.query(
+      `select recipient_profile_id, organization_id, payload, dedupe_key
+         from public.notifications where id=$1`,
+      [anaInboxAsAna[0].id],
+    ),
+  ),
 );
 
 // ── Escrita direta fechada ─────────────────────────────────────────────────

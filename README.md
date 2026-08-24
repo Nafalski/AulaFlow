@@ -61,7 +61,7 @@ Instruções completas — incluindo a configuração do Supabase — em [`AGENT
 - Convites recebidos em `/professor/convites`, com aceitar e recusar; moderação de clubes em `/admin/clubes`, com suspender/reativar auditado que não apaga dados
 - Calendário partilhado do clube em `/professor/clubes/[id]/calendario`, com Dia/Semana/Mês e filtro por professor: cada professor decide, clube a clube, se partilha a disponibilidade, e quem não partilha aparece como «Disponibilidade não partilhada»
 - A projeção partilhada tem quatro estados: disponível, indisponível, fora do horário (espaço vazio, incluindo dias inteiros sem rotina) e disponibilidade não partilhada; um bloqueio pessoal de um colega aparece como faixa indisponível, sem nunca revelar motivo, categoria nem identificadores internos
-- Views seguras para a área do aluno, sem valor registado, origem administrativa, observações, autoria ou identificadores internos sensíveis
+- Views seguras para aluno, professor e clube, sem bypass pelas tabelas brutas quando a projeção é o contrato de leitura; valores registados, saldos internos, observações, autoria e identificadores sensíveis ficam fora da audiência indevida
 - RPCs seguras de disponibilidade: professor vê detalhes dos próprios bloqueios; aluno não recebe motivo, categoria, fonte interna, organização nem `teacher_id`
 - Diretório administrativo com pesquisa, filtros, detalhe e bloqueio/reativação auditados
 - Proteção de rotas por tipo de conta e revogação de acesso para contas bloqueadas

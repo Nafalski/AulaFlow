@@ -825,6 +825,17 @@ export type TeacherLessonParticipantCreditRecord = {
   package_sport_name: string | null;
 }
 
+export type TeacherLessonCreditTransactionRecord = {
+  id: UUID | null;
+  student_package_id: UUID | null;
+  student_id: UUID | null;
+  lesson_id: UUID | null;
+  lesson_participant_id: UUID | null;
+  type: CreditTransactionType | null;
+  quantity: number | null;
+  created_at: Timestamp | null;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 /** Projeção pública do professor, sem dados privados da conta. */
 export type TeacherPublicProfile = {
@@ -1703,6 +1714,10 @@ export type Database = {
       };
       teacher_lesson_participant_credit_records: {
         Row: TeacherLessonParticipantCreditRecord;
+        Relationships: [];
+      };
+      teacher_lesson_credit_transaction_records: {
+        Row: TeacherLessonCreditTransactionRecord;
         Relationships: [];
       };
       teacher_public_profiles: {
