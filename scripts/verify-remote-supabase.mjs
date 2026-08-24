@@ -2233,6 +2233,38 @@ checks as (
 
   union all
   select
+    'integridade',
+    'retry de reagendamento serializa a intencao antes da consulta',
+    exists (
+      select 1
+      from pg_proc proc
+      join pg_namespace ns on ns.oid = proc.pronamespace
+      where ns.nspname = 'public'
+        and proc.proname = 'reschedule_lesson'
+        and strpos(proc.prosrc, 'pg_advisory_xact_lock') > 0
+        and strpos(proc.prosrc, '17051004') > 0
+        and strpos(proc.prosrc, 'pg_advisory_xact_lock')
+            < strpos(proc.prosrc, 'reschedule_idempotency_key = p_idempotency_key')
+    ),
+    'ok'
+
+  union all
+  select
+    'integridade',
+    'reagendamento copia confirmed_at no ramo sem reserva',
+    exists (
+      select 1
+      from pg_proc proc
+      join pg_namespace ns on ns.oid = proc.pronamespace
+      where ns.nspname = 'public'
+        and proc.proname = 'reschedule_lesson'
+        and proc.prosrc like '%confirmed_at, declined_at, decline_reason%'
+        and proc.prosrc like '%v_participant.confirmed_at%'
+    ),
+    'ok'
+
+  union all
+  select
     'seguranca',
     'anon nao executa o reagendamento',
     not exists (

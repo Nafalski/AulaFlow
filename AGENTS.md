@@ -183,7 +183,9 @@ update public.profiles set role = 'admin' where email = 'voce@exemplo.pt';
 │   ├── ..._phase8c_email_outbox.sql Fase 8C: outbox, preferências e horas de silêncio
 │   ├── ..._phase8c_email_worker_schedule.sql Fase 8C: o job que acorda o worker
 │   ├── ..._phase8c1_quiet_hours_at_claim.sql Fase 8C.1: o silêncio vale no envio
-│   └── ..._projection_read_boundaries.sql AF-H01: projeções como fronteira de leitura
+│   ├── ..._projection_read_boundaries.sql AF-H01: projeções como fronteira de leitura
+│   ├── ..._email_delivery_lease_ownership.sql AF-H02: ownership do lease de email
+│   └── ..._reschedule_retry_consistency.sql retries concorrentes e RSVP completo
 │
 └── src/
     ├── proxy.ts             Renova a sessão e protege rotas (era middleware.ts)
@@ -497,6 +499,8 @@ autor + reagendamento + aula original + destino pedido
 
 Ao reencontrar a chave, a função confirma que a substituta é mesmo **desta** original e para **este** destino; se não for, recusa por conflito de intenção. Sem chave, recusa: reagendar apanha duplo clique e retry de rede, e a diferença entre um retry e uma segunda intenção é uma aula a mais na agenda. Os índices únicos em `rescheduled_to_id` e `rescheduled_from_id` impedem a cadeia de bifurcar, e `lessons_reschedule_key_needs_origin` impede uma aula sem origem de carregar chave de reagendamento.
 
+**Retry concorrente é sucesso idempotente.** `reschedule_lesson()` toma um advisory lock transacional por ator + `reschedule_idempotency_key` antes de procurar a intenção. Duas chamadas simultâneas equivalentes terminam com sucesso e devolvem a mesma substituta; depois do lock, a segunda vê o commit da primeira e volta a validar original, horário, local e recurso. A mesma chave com qualquer parte diferente continua a ser conflito. Chaves diferentes para a mesma original continuam serializadas pelo `for update` da aula, e só uma transformação vence.
+
 **A substituta herda o estado da original.** Uma aula `confirmed` produz uma substituta `confirmed`. Não existe no produto nenhum fluxo de reconfirmação pelo aluno — a Fase 7 é que o traz —, por isso baixar para `scheduled` inventaria um passo que ninguém pode dar.
 
 **A concorrência real está coberta pela via do reagendamento (6C.1B).** Com JWTs reais e chamadas em paralelo: reagendar × reagendar (mesma original), mesma chave em simultâneo, reagendar × cancelar, reagendar × editar, reagendar × concluir, disputa de recurso e conflito de professor com intervalo mínimo. Todas verificam o **estado final** e não apenas quantas chamadas devolveram sucesso; a profundidade varia com o que cada corrida põe em risco. Todas confirmam o estado da original e o número de substitutas; as que mexem em cobrança confirmam também participação, os três baldes de créditos, livro-razão e histórico.
@@ -555,7 +559,7 @@ Quando a aula já tem presenças registadas, o caminho não é oferecido e a raz
 
 **`declined` e `removed` não voltam atrás.** Uma participação cancelada não é reativada por confirmação. Self-cancel do aluno continua fora do produto: dizer que não vai envolve destino do crédito, política e janela, e isso é outra etapa.
 
-**Reagendar preserva a resposta (correção da 7A).** `transfer_participation_reservation()` criava a participação da substituta sempre como `invited`. Esse valor vinha da Fase 1.5, escrito quando nada conseguia pôr uma participação em `confirmed` — não era uma política de reconfirmação. Deixá-lo significaria que reagendar apagava em silêncio o "vou lá estar", enquanto o outro ramo da mesma operação preservava um `declined`. A assimetria era acidental; passou a copiar `status` e `confirmed_at`.
+**Reagendar preserva a resposta (correção da 7A).** `transfer_participation_reservation()` criava a participação da substituta sempre como `invited`. Esse valor vinha da Fase 1.5, escrito quando nada conseguia pôr uma participação em `confirmed` — não era uma política de reconfirmação. Deixá-lo significaria que reagendar apagava em silêncio o "vou lá estar", enquanto o outro ramo da mesma operação preservava um `declined`. A assimetria era acidental; os dois ramos copiam agora `status` e o `confirmed_at` original, inclusive numa participação legítima sem reserva, como uma aula gratuita `exempt`. Nunca substituir o carimbo por `now()`.
 
 **Recorrência:** cada ocorrência herda o pedido de confirmação e é respondida isoladamente. Não existe confirmar a série inteira nem "esta e futuras".
 

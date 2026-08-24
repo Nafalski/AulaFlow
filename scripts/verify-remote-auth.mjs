@@ -1,8 +1,10 @@
 /**
  * Verifica Auth/PostgREST/RPCs com sessoes reais.
  *
- * Este script usa URL publica + anon key + email/senha E2E. Ele nao usa
- * service role para simular professor, aluno, admin ou anonimo.
+ * Este script usa URL publica + anon key + email/senha E2E para todos os
+ * atores. A service role serve apenas para preparar uma aula gratuita valida e
+ * inspecionar invariantes internos que nenhuma projection publica deve expor;
+ * nunca simula professor, aluno, admin ou anonimo.
  *
  *   npm run db:verify:auth -- --confirm-development
  */
@@ -174,6 +176,7 @@ try {
 
   const url = requireEnv("NEXT_PUBLIC_SUPABASE_URL");
   const anonKey = requireEnv("NEXT_PUBLIC_SUPABASE_ANON_KEY", { secret: true });
+  const serviceRoleKey = requireEnv("SUPABASE_SERVICE_ROLE_KEY", { secret: true });
   const runId = optionalEnv("E2E_RUN_ID", "default").replace(/[^a-zA-Z0-9_-]/g, "_");
   const fixtureBaseDate = optionalEnv("E2E_BASE_DATE", "2026-08-04");
 
@@ -214,6 +217,7 @@ try {
   const adminClient = client(url, anonKey);
   const blockedClient = client(url, anonKey);
   const anonClient = client(url, anonKey);
+  const fixtureClient = client(url, serviceRoleKey);
 
   section("Professor A");
   const teacherUser = await signIn(
@@ -5745,13 +5749,13 @@ try {
   // que se ve se os locks e a transacao aguentam — o PGlite tem uma so ligacao
   // e nunca poderia provar isto.
 
-  const packageBalances = async (label) =>
+  const packageBalances = async (label, packageId = reschedulePackageBefore.id) =>
     getSingle(
       label,
       teacherClient
         .from("teacher_package_records")
         .select("id, credits_available, credits_reserved, credits_used")
-        .eq("id", reschedulePackageBefore.id),
+        .eq("id", packageId),
     );
 
   const sameTotal = (before, after) =>
@@ -5816,39 +5820,155 @@ try {
     title: "Aula E2E 6C corrida chave",
     date: phase6cOriginDate,
   });
+  const raceBParticipantBefore = await readParticipant(raceOriginB, studentsA.id);
+  const raceBPackage = await getSingle(
+    "pacote antes da corrida B",
+    teacherClient
+      .from("teacher_package_records")
+      .select("id, credits_available, credits_reserved, credits_used")
+      .eq("name", raceBParticipantBefore.package_name),
+  );
+  const beforeRaceB = await packageBalances("saldos antes da corrida B", raceBPackage.id);
+  const raceBLedgerBefore = await teacherClient
+    .from("teacher_lesson_credit_transaction_records")
+    .select("id, lesson_id, lesson_participant_id, type, quantity")
+    .eq("lesson_id", raceOriginB);
+  if (raceBLedgerBefore.error) {
+    throw new Error(`Livro-razao antes da corrida B: ${summarizeError(raceBLedgerBefore.error)}`);
+  }
   const sameKey = deterministicUuid(`lesson-6c-race-same-key:${phase6RunSuffix}`);
   const raceB = await Promise.all([
     rpcOutcome(() =>
-      rescheduleRpc(teacherClient, raceOriginB, {
+      rescheduleRpc(raceClientA, raceOriginB, {
         p_starts_at: lisbonInstant(phase6cTargetDate, "18:00"),
         p_ends_at: lisbonInstant(phase6cTargetDate, "19:00"),
         p_idempotency_key: sameKey,
       }),
     ),
     rpcOutcome(() =>
-      rescheduleRpc(teacherClient, raceOriginB, {
+      rescheduleRpc(raceClientB, raceOriginB, {
         p_starts_at: lisbonInstant(phase6cTargetDate, "18:00"),
         p_ends_at: lisbonInstant(phase6cTargetDate, "19:00"),
         p_idempotency_key: sameKey,
       }),
     ),
   ]);
-  const raceBReplacements = await teacherClient
-    .from("teacher_lesson_schedule_records")
-    .select("id, starts_at")
-    .in("status", ["scheduled", "confirmed"])
-    .eq("starts_at", lisbonInstant(phase6cTargetDate, "18:00"));
-  if (raceBReplacements.error) {
-    throw new Error(`Substitutas da corrida B: ${summarizeError(raceBReplacements.error)}`);
-  }
   const raceBIds = new Set(raceB.filter((entry) => entry.ok).map((entry) => entry.data));
   check(
-    raceB.some((entry) => entry.ok) &&
-      raceBIds.size === 1 &&
-      (raceBReplacements.data ?? []).length === 1,
-    `Duas chamadas concorrentes com a mesma chave produzem uma unica substituta (${
-      (raceBReplacements.data ?? []).length
-    }; ${raceB.map((entry) => (entry.ok ? "ok" : summarizeError(entry.error))).join(" | ")})`,
+    raceB.every((entry) => entry.ok) && raceBIds.size === 1,
+    "Duas chamadas concorrentes equivalentes terminam fulfilled + fulfilled e devolvem o mesmo ID",
+    `Corrida B inesperada: ${raceB
+      .map((entry) => (entry.ok ? entry.data : summarizeError(entry.error)))
+      .join(" | ")}`,
+  );
+  const raceBReplacementId = raceB[0]?.ok ? raceB[0].data : null;
+  if (!raceBReplacementId || !raceB.every((entry) => entry.ok)) {
+    throw new Error("A corrida B nao devolveu duas respostas idempotentes validas.");
+  }
+  ok(`Requests A e B devolveram ${raceB[0].data} e ${raceB[1].data}`);
+
+  // Service role apenas para observar a cadeia interna. Estes campos continuam
+  // deliberadamente fora das projections de professor e aluno (AF-H01).
+  const raceBOriginalResult = await fixtureClient
+    .from("lessons")
+    .select("id, status, rescheduled_to_id")
+    .eq("id", raceOriginB)
+    .single();
+  const raceBReplacementResult = await fixtureClient
+    .from("lessons")
+    .select("id, status, rescheduled_from_id, reschedule_idempotency_key")
+    .eq("rescheduled_from_id", raceOriginB);
+  if (raceBOriginalResult.error || raceBReplacementResult.error) {
+    throw new Error(
+      `Cadeia interna da corrida B: ${summarizeError(
+        raceBOriginalResult.error ?? raceBReplacementResult.error,
+      )}`,
+    );
+  }
+  const raceBReplacementRows = raceBReplacementResult.data ?? [];
+  check(
+    raceBOriginalResult.data.status === "rescheduled" &&
+      raceBOriginalResult.data.rescheduled_to_id === raceBReplacementId &&
+      raceBReplacementRows.length === 1 &&
+      raceBReplacementRows[0].id === raceBReplacementId &&
+      raceBReplacementRows[0].rescheduled_from_id === raceOriginB &&
+      raceBReplacementRows[0].reschedule_idempotency_key === sameKey,
+    "A corrida cria uma unica substituta e a cadeia aponta nos dois sentidos",
+  );
+
+  const raceBParticipants = await teacherClient
+    .from("teacher_lesson_participant_credit_records")
+    .select(
+      "lesson_participant_id, student_id, status, confirmed_at, billing_status, credits_reserved, credits_consumed, is_exception",
+    )
+    .eq("lesson_id", raceBReplacementId);
+  if (raceBParticipants.error) {
+    throw new Error(`Participantes da corrida B: ${summarizeError(raceBParticipants.error)}`);
+  }
+  check(
+    (raceBParticipants.data ?? []).length === 1 &&
+      raceBParticipants.data?.[0]?.student_id === studentsA.id &&
+      raceBParticipants.data?.[0]?.status === raceBParticipantBefore.status &&
+      raceBParticipants.data?.[0]?.billing_status === "reserved" &&
+      raceBParticipants.data?.[0]?.credits_reserved === raceBParticipantBefore.credits_reserved &&
+      raceBParticipants.data?.[0]?.credits_consumed === 0 &&
+      raceBParticipants.data?.[0]?.is_exception === false,
+    "O retry concorrente nao duplica participante, RSVP, reserva nem excecao",
+  );
+  const raceBOriginalParticipantAfter = await readParticipant(raceOriginB, studentsA.id);
+  check(
+    raceBOriginalParticipantAfter.billing_status === "released" &&
+      raceBOriginalParticipantAfter.credits_reserved === 0,
+    "A participacao original e libertada uma unica vez para a transferencia",
+  );
+
+  const afterRaceB = await packageBalances("saldos depois da corrida B", raceBPackage.id);
+  check(
+    afterRaceB.credits_available === beforeRaceB.credits_available &&
+      afterRaceB.credits_reserved === beforeRaceB.credits_reserved &&
+      afterRaceB.credits_used === beforeRaceB.credits_used,
+    "A corrida idempotente preserva os tres baldes de creditos",
+  );
+  const raceBLedgerAfter = await teacherClient
+    .from("teacher_lesson_credit_transaction_records")
+    .select("id, lesson_id, lesson_participant_id, type, quantity")
+    .in("lesson_id", [raceOriginB, raceBReplacementId]);
+  if (raceBLedgerAfter.error) {
+    throw new Error(`Livro-razao depois da corrida B: ${summarizeError(raceBLedgerAfter.error)}`);
+  }
+  check(
+    (raceBLedgerAfter.data ?? []).length === (raceBLedgerBefore.data ?? []).length &&
+      (raceBLedgerAfter.data ?? []).every((row) =>
+        (raceBLedgerBefore.data ?? []).some((before) => before.id === row.id),
+      ),
+    "A corrida nao cria movimentos financeiros no livro-razao",
+  );
+
+  const raceBNotifications = await studentClient
+    .from("user_notification_records")
+    .select("id, type, lesson_id")
+    .eq("lesson_id", raceBReplacementId)
+    .eq("type", "lesson_rescheduled");
+  if (raceBNotifications.error) {
+    throw new Error(`Notificacoes da corrida B: ${summarizeError(raceBNotifications.error)}`);
+  }
+  check(
+    (raceBNotifications.data ?? []).length === 1,
+    "O retry concorrente produz uma unica notificacao operacional de reagendamento",
+  );
+
+  const differentRaceIntent = await mustReject(
+    "Mesma chave concorrente com destino diferente continua conflito",
+    async () =>
+      rescheduleRpc(raceClientA, raceOriginB, {
+        p_starts_at: lisbonInstant(phase6cTargetDate, "19:00"),
+        p_ends_at: lisbonInstant(phase6cTargetDate, "20:00"),
+        p_idempotency_key: sameKey,
+      }),
+  );
+  check(
+    summarizeError(differentRaceIntent).toLowerCase().includes("outro horário"),
+    "A serializacao nao enfraquece a validacao da intencao completa",
   );
 
   // C) Reagendar x cancelar a mesma aula. Sao dois desfechos terminais
@@ -7085,7 +7205,20 @@ try {
   // Reagendar preserva a resposta do aluno: quem ja tinha dito que ia continua
   // a dizer que vai, e quem ainda nao respondeu continua por responder.
   const preserveLessonId = await createConfirmableLesson("Aula E2E 7A preserva", 16, true);
-  await studentClient.rpc("confirm_lesson_participation", { p_lesson_id: preserveLessonId });
+  const preserveConfirmation = await studentClient.rpc("confirm_lesson_participation", {
+    p_lesson_id: preserveLessonId,
+  });
+  if (preserveConfirmation.error || preserveConfirmation.data !== true) {
+    throw new Error(`Confirmar antes de reagendar: ${summarizeError(preserveConfirmation.error)}`);
+  }
+  const reservedConfirmedBefore = await getSingle(
+    "RSVP reservado antes de reagendar",
+    teacherClient
+      .from("lesson_participant_directory")
+      .select("lesson_id, student_id, status, confirmed_at")
+      .eq("lesson_id", preserveLessonId)
+      .eq("student_id", studentsA.id),
+  );
   const preserveSlot = phase7aSlot(17);
   const { data: preserveReplacementId, error: preserveError } = await teacherClient.rpc(
     "reschedule_lesson",
@@ -7114,6 +7247,136 @@ try {
       preservedProjection.participation_status === "confirmed" &&
       preservedProjection.attendance_status === null,
     "Reagendar preserva o pedido de confirmacao e a resposta ja dada",
+  );
+  const reservedConfirmedAfter = await getSingle(
+    "RSVP reservado depois de reagendar",
+    teacherClient
+      .from("lesson_participant_directory")
+      .select("lesson_id, student_id, status, confirmed_at")
+      .eq("lesson_id", preserveReplacementId)
+      .eq("student_id", studentsA.id),
+  );
+  const reservedConfirmedCredit = await readParticipant(preserveReplacementId, studentsA.id);
+  check(
+    reservedConfirmedBefore.status === "confirmed" &&
+      reservedConfirmedBefore.confirmed_at !== null &&
+      reservedConfirmedAfter.status === "confirmed" &&
+      reservedConfirmedAfter.confirmed_at === reservedConfirmedBefore.confirmed_at &&
+      reservedConfirmedCredit.billing_status === "reserved" &&
+      reservedConfirmedCredit.credits_reserved > 0,
+    "RSVP confirmado reservado preserva exatamente o confirmed_at original e a reserva",
+  );
+
+  // Fixture controlada de um caso real do domínio: uma aula gratuita tem
+  // credit_cost=0, e a RPC oficial cria uma participação `exempt`. A service
+  // role prepara apenas a aula, porque a RPC pública de criação não expõe o
+  // custo; RSVP e reagendamento continuam a usar sessões reais de aluno e
+  // professor.
+  const exemptConfirmedDate = dateOnlyFromNow(await pickUnusedAvailabilityOffset(330, 350));
+  await prepareException(
+    teacherClient,
+    "Disponibilidade 7A para RSVP isento",
+    exemptConfirmedDate,
+    `lesson-7a-exempt-${phase6RunSuffix}`,
+    "06:00",
+    "22:00",
+  );
+  const exemptConfirmedLessonId = deterministicUuid(
+    `lesson-7a-exempt-confirmed:${phase6RunSuffix}`,
+  );
+  const exemptFixture = await fixtureClient.from("lessons").insert({
+    id: exemptConfirmedLessonId,
+    organization_id: teacherRecord.organization_id,
+    teacher_id: teacherRecord.id,
+    sport_id: sportRow.id,
+    title: `Aula E2E 7A gratuita confirmada ${phase6RunSuffix}`,
+    starts_at: lisbonInstant(exemptConfirmedDate, "10:00"),
+    ends_at: lisbonInstant(exemptConfirmedDate, "11:00"),
+    max_participants: 1,
+    requires_confirmation: true,
+    credit_cost: 0,
+    status: "scheduled",
+    created_by: teacherUser.id,
+  });
+  if (exemptFixture.error) {
+    throw new Error(`Preparar aula gratuita 7A: ${summarizeError(exemptFixture.error)}`);
+  }
+  const exemptReservation = await teacherClient.rpc("reserve_participation_credits", {
+    p_lesson_id: exemptConfirmedLessonId,
+    p_student_id: studentsA.id,
+    p_credits: 0,
+  });
+  if (exemptReservation.error || !exemptReservation.data) {
+    throw new Error(`Preparar participacao isenta 7A: ${summarizeError(exemptReservation.error)}`);
+  }
+  const exemptConfirmation = await studentClient.rpc("confirm_lesson_participation", {
+    p_lesson_id: exemptConfirmedLessonId,
+  });
+  if (exemptConfirmation.error || exemptConfirmation.data !== true) {
+    throw new Error(`Confirmar participacao isenta 7A: ${summarizeError(exemptConfirmation.error)}`);
+  }
+  const exemptConfirmedBefore = await getSingle(
+    "RSVP isento antes de reagendar",
+    teacherClient
+      .from("teacher_lesson_participant_credit_records")
+      .select(
+        "lesson_id, student_id, status, confirmed_at, billing_status, credits_reserved, credits_consumed, is_exception",
+      )
+      .eq("lesson_id", exemptConfirmedLessonId)
+      .eq("student_id", studentsA.id),
+  );
+  const exemptLedgerBefore = await teacherClient
+    .from("teacher_lesson_credit_transaction_records")
+    .select("id")
+    .eq("lesson_id", exemptConfirmedLessonId);
+  if (exemptLedgerBefore.error) {
+    throw new Error(`Ledger da participacao isenta: ${summarizeError(exemptLedgerBefore.error)}`);
+  }
+  const exemptReplacement = await teacherClient.rpc("reschedule_lesson", {
+    p_lesson_id: exemptConfirmedLessonId,
+    p_starts_at: lisbonInstant(exemptConfirmedDate, "14:00"),
+    p_ends_at: lisbonInstant(exemptConfirmedDate, "15:00"),
+    p_reason: "Mudanca de horario da aula gratuita",
+    p_location_id: null,
+    p_location_resource_id: null,
+    p_idempotency_key: deterministicUuid(`lesson-7a-exempt-reschedule:${phase6RunSuffix}`),
+  });
+  if (exemptReplacement.error || !exemptReplacement.data) {
+    throw new Error(`Reagendar participacao isenta 7A: ${summarizeError(exemptReplacement.error)}`);
+  }
+  const exemptConfirmedAfter = await getSingle(
+    "RSVP isento depois de reagendar",
+    teacherClient
+      .from("teacher_lesson_participant_credit_records")
+      .select(
+        "lesson_id, student_id, status, confirmed_at, billing_status, credits_reserved, credits_consumed, is_exception",
+      )
+      .eq("lesson_id", exemptReplacement.data)
+      .eq("student_id", studentsA.id),
+  );
+  const exemptLedgerAfter = await teacherClient
+    .from("teacher_lesson_credit_transaction_records")
+    .select("id")
+    .in("lesson_id", [exemptConfirmedLessonId, exemptReplacement.data]);
+  if (exemptLedgerAfter.error) {
+    throw new Error(`Ledger depois do RSVP isento: ${summarizeError(exemptLedgerAfter.error)}`);
+  }
+  check(
+    exemptConfirmedBefore.status === "confirmed" &&
+      exemptConfirmedBefore.confirmed_at !== null &&
+      exemptConfirmedBefore.billing_status === "exempt" &&
+      exemptConfirmedAfter.status === "confirmed" &&
+      exemptConfirmedAfter.confirmed_at === exemptConfirmedBefore.confirmed_at &&
+      exemptConfirmedAfter.billing_status === "exempt" &&
+      exemptConfirmedAfter.credits_reserved === 0 &&
+      exemptConfirmedAfter.credits_consumed === 0 &&
+      exemptConfirmedAfter.is_exception === false,
+    "RSVP confirmado nao reservado preserva exatamente o confirmed_at no ramo exempt",
+  );
+  check(
+    (exemptLedgerBefore.data ?? []).length === 0 &&
+      (exemptLedgerAfter.data ?? []).length === 0,
+    "A participacao gratuita continua sem reserva, consumo ou movimento financeiro",
   );
 
   // ── Privacidade: a projecao continua sem colegas nem internos ──

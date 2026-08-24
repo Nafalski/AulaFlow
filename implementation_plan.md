@@ -1109,6 +1109,8 @@ autor + operação de reagendamento + aula original + destino pedido
 
 Ao reencontrar a chave, a função confirma que a substituta encontrada é mesmo **desta** original e para **este** destino (horário, local e recurso). Se não for, recusa por conflito de intenção em vez de devolver um resultado que não corresponde ao pedido. Sem chave, recusa.
 
+Uma correção incremental posterior fechou a janela entre essa consulta e o `for update` da original: a intenção é agora serializada por advisory lock transacional de ator + chave **antes** da consulta. Dois pedidos simultâneos equivalentes veem uma única transformação e ambos devolvem o mesmo ID; depois de esperar, o segundo revalida a intenção completa. Reutilizar a chave para outra original, horário, local ou recurso continua a ser conflito.
+
 A integridade da cadeia também deixou de depender de boa vontade: índices únicos em `rescheduled_to_id` e `rescheduled_from_id` impedem que uma original ganhe duas substitutas ou que uma substituta ganhe duas antecessoras, e `lessons_reschedule_key_needs_origin` impede uma aula sem origem de carregar uma chave de reagendamento.
 
 **A substituta herda o estado da original.** Uma aula `confirmed` produz uma substituta `confirmed`. Baixar para `scheduled` obrigaria a uma reconfirmação que o produto não tem — a confirmação pelo aluno é da Fase 7 — e deixaria a aula à espera de um passo que ninguém consegue dar.
@@ -1192,7 +1194,7 @@ Acrescentar um parâmetro a `create_lesson()` com `create or replace` deixaria a
 
 #### Reagendar preserva a resposta
 
-`transfer_participation_reservation()` criava a participação da substituta como `invited`. Esse literal vinha da Fase 1.5, de quando nada no produto conseguia pôr uma participação em `confirmed` — era o default de uma linha nova, não uma política. Mantê-lo faria reagendar apagar em silêncio o "vou lá estar", enquanto o outro ramo da mesma função preservava um `declined`. A assimetria era acidental e foi corrigida.
+`transfer_participation_reservation()` criava a participação da substituta como `invited`. Esse literal vinha da Fase 1.5, de quando nada no produto conseguia pôr uma participação em `confirmed` — era o default de uma linha nova, não uma política. Mantê-lo faria reagendar apagar em silêncio o "vou lá estar", enquanto o outro ramo da mesma função preservava um `declined`. A assimetria era acidental e foi corrigida. O ramo sem reserva passou também a copiar o `confirmed_at` original: uma participação `confirmed` e `exempt`, por exemplo, já não chega à substituta com um estado confirmado e carimbo nulo.
 
 Reconfirmação obrigatória depois de reagendar continua a ser uma decisão de produto por tomar — e não se toma por omissão.
 

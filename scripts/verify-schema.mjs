@@ -11844,6 +11844,24 @@ const reschedSearchPath = await rows(
 );
 check(reschedSearchPath.length === 0, "as funções de reagendamento fixam search_path");
 
+const rescheduleDefinition = await one(
+  `select pg_get_functiondef(
+     'public.reschedule_lesson(uuid,timestamptz,timestamptz,text,uuid,uuid,uuid)'::regprocedure
+   ) as definition`,
+);
+check(
+  rescheduleDefinition.definition.includes("pg_advisory_xact_lock") &&
+    rescheduleDefinition.definition.includes("17051004") &&
+    rescheduleDefinition.definition.indexOf("pg_advisory_xact_lock") <
+      rescheduleDefinition.definition.indexOf("reschedule_idempotency_key = p_idempotency_key"),
+  "o reagendamento serializa ator + chave antes de decidir a idempotência",
+);
+check(
+  /confirmed_at,\s*declined_at/.test(rescheduleDefinition.definition) &&
+    rescheduleDefinition.definition.includes("v_participant.confirmed_at"),
+  "o ramo não reservado transporta o confirmed_at histórico",
+);
+
 // ── Invariante final: a cadeia é navegável e única ──────────────────────────
 
 const chainDuplicates = await rows(
@@ -12132,6 +12150,11 @@ const reschedConfirmLesson = await createLessonAs(TEACHER_UID, {
   requiresConfirmation: true,
 });
 await confirmAs(ANA_UID, reschedConfirmLesson.id);
+const originalConfirmedParticipation = await one(
+  `select status::text, confirmed_at, billing_status::text, credits_reserved
+     from public.lesson_participants where lesson_id=$1 and student_id=$2`,
+  [reschedConfirmLesson.id, ana.id],
+);
 const reschedConfirmReplacement = await rescheduleAs(TEACHER_UID, {
   lessonId: reschedConfirmLesson.id,
   start: "2027-04-12 14:00+00",
@@ -12149,8 +12172,68 @@ const replacementParticipation = await one(
 );
 check(
   replacementLessonRow.requires_confirmation === true &&
-    replacementParticipation.status === "confirmed",
-  "reagendar preserva o pedido de confirmação e a resposta já dada",
+    originalConfirmedParticipation.status === "confirmed" &&
+    originalConfirmedParticipation.billing_status === "reserved" &&
+    replacementParticipation.status === "confirmed" &&
+    replacementParticipation.confirmed_at.getTime() ===
+      originalConfirmedParticipation.confirmed_at.getTime(),
+  "reagendar preserva o confirmed_at original de uma participação reservada",
+);
+
+// O segundo ramo de `reschedule_lesson()` copia participações sem reserva. Uma
+// aula gratuita e confirmável é um estado real do domínio: `credit_cost=0`
+// produz cobrança `exempt`, e a confirmação continua a ser RSVP do aluno.
+const exemptConfirmedLesson = await one(
+  `insert into public.lessons
+     (organization_id, teacher_id, sport_id, title, starts_at, ends_at,
+      requires_confirmation, credit_cost, created_by)
+   values ($1,$2,$3,'Aula gratuita confirmada a reagendar',
+           '2027-04-26 10:00+00','2027-04-26 11:00+00',true,0,$4)
+   returning id`,
+  [org, teacher.id, sport, TEACHER_UID],
+);
+await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select public.reserve_participation_credits(
+       p_lesson_id => $1, p_student_id => $2, p_credits => 0
+     ) as id`,
+    [exemptConfirmedLesson.id, ana.id],
+  ),
+);
+await confirmAs(ANA_UID, exemptConfirmedLesson.id);
+const exemptConfirmedBefore = await one(
+  `select status::text, confirmed_at, billing_status::text, credits_reserved,
+          credits_consumed
+     from public.lesson_participants where lesson_id=$1 and student_id=$2`,
+  [exemptConfirmedLesson.id, ana.id],
+);
+const exemptLedgerBefore = await ledgerRows();
+const exemptConfirmedReplacement = await rescheduleAs(TEACHER_UID, {
+  lessonId: exemptConfirmedLesson.id,
+  start: "2027-04-26 14:00+00",
+  end: "2027-04-26 15:00+00",
+  reason: "Mudança de horário da aula gratuita",
+});
+const exemptConfirmedAfter = await one(
+  `select status::text, confirmed_at, billing_status::text, credits_reserved,
+          credits_consumed
+     from public.lesson_participants where lesson_id=$1 and student_id=$2`,
+  [exemptConfirmedReplacement.id, ana.id],
+);
+check(
+  exemptConfirmedBefore.status === "confirmed" &&
+    exemptConfirmedBefore.billing_status === "exempt" &&
+    exemptConfirmedBefore.confirmed_at !== null &&
+    exemptConfirmedAfter.status === "confirmed" &&
+    exemptConfirmedAfter.billing_status === "exempt" &&
+    exemptConfirmedAfter.confirmed_at.getTime() === exemptConfirmedBefore.confirmed_at.getTime(),
+  "reagendar preserva o confirmed_at original no ramo não reservado (exempt)",
+);
+check(
+  exemptConfirmedAfter.credits_reserved === 0 &&
+    exemptConfirmedAfter.credits_consumed === 0 &&
+    (await ledgerRows()) === exemptLedgerBefore,
+  "reagendar uma participação isenta não cria reserva, consumo nem ledger",
 );
 
 // Uma participação ainda por responder continua por responder.
