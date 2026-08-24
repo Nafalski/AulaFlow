@@ -1,9 +1,9 @@
 /**
  * Verificacao estrutural do Supabase remoto de desenvolvimento.
  *
- * Este script nao cria utilizadores, nao escreve dados de teste e nao imprime
- * credenciais. Ele valida o catalogo remoto depois do `db push`: migracoes,
- * tabelas, views, RLS, grants, RPCs, indices e privacidade das views do aluno.
+ * Este script nao cria utilizadores persistentes nem imprime credenciais. Alem
+ * do catalogo, o AF-H02 exerce ownership numa transacao que termina em ROLLBACK:
+ * nenhum dado de teste fica no projeto remoto.
  *
  * Para evitar execucao acidental contra outro ambiente:
  *
@@ -431,6 +431,167 @@ const internalFunctions = [
   "lock_lesson_creation_intention",
   "create_lesson_occurrence",
 ];
+
+const ownershipSql = `
+begin;
+
+do $$
+declare
+  v_profile_id     uuid;
+  v_notification_id uuid := gen_random_uuid();
+  v_delivery_id    uuid;
+  v_token_a        uuid;
+  v_token_b        uuid;
+  v_result         text;
+  v_delivery       public.notification_deliveries%rowtype;
+begin
+  select p.id
+    into v_profile_id
+    from public.profiles p
+    join auth.users u on u.id = p.id
+    join public.notification_preferences np on np.profile_id = p.id
+   where p.status = 'active'
+     and u.email_confirmed_at is not null
+     and nullif(btrim(p.email), '') is not null
+   order by p.created_at
+   limit 1;
+
+  if v_profile_id is null then
+    raise exception 'AF-H02 remoto requer uma conta de desenvolvimento ativa e confirmada.';
+  end if;
+
+  update public.notification_preferences
+     set email_enabled = true,
+         lesson_created = true,
+         quiet_hours_start = null,
+         quiet_hours_end = null
+   where profile_id = v_profile_id;
+
+  insert into public.notifications (
+    id, recipient_profile_id, type, title, body, created_at
+  ) values (
+    v_notification_id, v_profile_id, 'lesson_created',
+    'AF-H02 ownership remoto', 'Teste transacional com rollback.',
+    '2000-01-01T00:00:00Z'
+  );
+
+  select d.id
+    into v_delivery_id
+    from public.notification_deliveries d
+   where d.notification_id = v_notification_id;
+
+  if v_delivery_id is null then
+    raise exception 'AF-H02: o trigger nao materializou a delivery de teste.';
+  end if;
+
+  select c.lease_token
+    into v_token_a
+    from public.claim_email_deliveries(
+      1, 30, '2099-01-01T00:00:00Z'::timestamptz
+    ) c
+   where c.delivery_id = v_delivery_id;
+
+  if v_token_a is null then
+    raise exception 'AF-H02: worker A nao recebeu lease token.';
+  end if;
+
+  if exists (
+    select 1
+      from public.claim_email_deliveries(
+        1, 30, '2099-01-01T00:00:29Z'::timestamptz
+      ) c
+     where c.delivery_id = v_delivery_id
+  ) then
+    raise exception 'AF-H02: a delivery foi reclamada antes do lease expirar.';
+  end if;
+
+  select c.lease_token
+    into v_token_b
+    from public.claim_email_deliveries(
+      1, 30, '2099-01-01T00:00:31Z'::timestamptz
+    ) c
+   where c.delivery_id = v_delivery_id;
+
+  if v_token_b is null or v_token_b = v_token_a then
+    raise exception 'AF-H02: reclaim nao gerou token B novo.';
+  end if;
+
+  v_result := public.finalize_email_delivery(
+    v_delivery_id, v_token_a, 'sent', 'msg_stale_a', null,
+    '2099-01-01T00:00:32Z'::timestamptz
+  );
+  if v_result <> 'stale_claim' then
+    raise exception 'AF-H02: stale sent devolveu %.', v_result;
+  end if;
+
+  v_result := public.finalize_email_delivery(
+    v_delivery_id, v_token_a, 'retry', null, 'HTTP 500 stale',
+    '2099-01-01T00:00:32Z'::timestamptz
+  );
+  if v_result <> 'stale_claim' then
+    raise exception 'AF-H02: stale retry devolveu %.', v_result;
+  end if;
+
+  v_result := public.finalize_email_delivery(
+    v_delivery_id, v_token_a, 'failed', null, 'invalid stale',
+    '2099-01-01T00:00:32Z'::timestamptz
+  );
+  if v_result <> 'stale_claim' then
+    raise exception 'AF-H02: stale failed devolveu %.', v_result;
+  end if;
+
+  select * into v_delivery
+    from public.notification_deliveries
+   where id = v_delivery_id;
+
+  if v_delivery.status <> 'pending'
+     or v_delivery.attempts <> 0
+     or v_delivery.locked_at <> '2099-01-01T00:00:31Z'::timestamptz
+     or v_delivery.lease_token <> v_token_b
+     or v_delivery.provider_message_id is not null
+     or v_delivery.last_error is not null then
+    raise exception 'AF-H02: stale worker alterou a delivery pertencente a B.';
+  end if;
+
+  v_result := public.finalize_email_delivery(
+    v_delivery_id, v_token_b, 'sent', 'msg_owner_b', null,
+    '2099-01-01T00:00:33Z'::timestamptz
+  );
+  if v_result <> 'sent' then
+    raise exception 'AF-H02: finalize valido de B devolveu %.', v_result;
+  end if;
+
+  select * into v_delivery
+    from public.notification_deliveries
+   where id = v_delivery_id;
+
+  if v_delivery.status <> 'sent'
+     or v_delivery.attempts <> 1
+     or v_delivery.provider_message_id <> 'msg_owner_b'
+     or v_delivery.locked_at is not null
+     or v_delivery.lease_token is not null then
+    raise exception 'AF-H02: finalize valido de B deixou estado incorreto.';
+  end if;
+
+  v_result := public.finalize_email_delivery(
+    v_delivery_id, v_token_b, 'sent', 'msg_double', null,
+    '2099-01-01T00:00:34Z'::timestamptz
+  );
+
+  select * into v_delivery
+    from public.notification_deliveries
+   where id = v_delivery_id;
+
+  if v_result <> 'sent'
+     or v_delivery.attempts <> 1
+     or v_delivery.provider_message_id <> 'msg_owner_b' then
+    raise exception 'AF-H02: double finalize alterou a entrega terminal.';
+  end if;
+end
+$$;
+
+rollback;
+`;
 
 const sql = `
 with
@@ -1576,12 +1737,59 @@ checks as (
   union all
   select
     'estrutura',
-    'o outbox tem as colunas do worker (8C)',
+    'o outbox tem as colunas do worker e ownership do lease',
     (
       select count(*) from information_schema.columns
       where table_schema = 'public' and table_name = 'notification_deliveries'
-        and column_name in ('recipient_email', 'locked_at', 'provider_message_id', 'skip_reason')
-    ) = 4,
+        and column_name in (
+          'recipient_email', 'locked_at', 'lease_token', 'provider_message_id', 'skip_reason'
+        )
+    ) = 5,
+    'ok'
+
+  union all
+  select
+    'estrutura',
+    'lease_token e locked_at sao coerentes por constraint',
+    exists (
+      select 1 from pg_constraint
+      where conrelid = 'public.notification_deliveries'::regclass
+        and conname = 'notification_deliveries_lease_coherent'
+    ),
+    'ok'
+
+  union all
+  select
+    'estrutura',
+    'claim final devolve lease_token e removeu a assinatura antiga',
+    to_regprocedure(
+      'public.claim_email_deliveries(integer,integer,timestamp with time zone,integer)'
+    ) is not null
+    and to_regprocedure(
+      'public.claim_email_deliveries(integer,integer,timestamp with time zone)'
+    ) is null
+    and exists (
+      select 1
+        from pg_proc p
+        join pg_namespace n on n.oid = p.pronamespace
+        cross join lateral unnest(p.proargnames, p.proargmodes) output(arg_name, arg_mode)
+       where n.nspname = 'public'
+         and p.proname = 'claim_email_deliveries'
+         and output.arg_name = 'lease_token'
+         and output.arg_mode = 't'
+    ),
+    'ok'
+
+  union all
+  select
+    'estrutura',
+    'finalize final exige lease_token e removeu a assinatura sem ownership',
+    to_regprocedure(
+      'public.finalize_email_delivery(uuid,uuid,text,text,text,timestamp with time zone)'
+    ) is not null
+    and to_regprocedure(
+      'public.finalize_email_delivery(uuid,text,text,text,timestamp with time zone)'
+    ) is null,
     'ok'
 
   union all
@@ -1647,6 +1855,22 @@ checks as (
           'materialize_email_delivery', 'dispatch_email_worker'
         )
         and grantee in ('authenticated', 'anon', 'PUBLIC')
+    ),
+    'ok'
+
+  union all
+  select
+    'seguranca',
+    'o worker service-side executa claim e finalize finais',
+    has_function_privilege(
+      'service_role',
+      'public.claim_email_deliveries(integer,integer,timestamp with time zone,integer)',
+      'EXECUTE'
+    )
+    and has_function_privilege(
+      'service_role',
+      'public.finalize_email_delivery(uuid,uuid,text,text,text,timestamp with time zone)',
+      'EXECUTE'
     ),
     'ok'
 
@@ -2323,26 +2547,40 @@ from checks
 order by category, name;
 `;
 
-const tmp = mkdtempSync(join(tmpdir(), "aulaflow-remote-"));
-const sqlFile = join(tmp, "verify.sql");
-writeFileSync(sqlFile, sql, "utf8");
+function executeLinkedSql(sqlText, prefix) {
+  const tmp = mkdtempSync(join(tmpdir(), prefix));
+  const sqlFile = join(tmp, "verify.sql");
+  writeFileSync(sqlFile, sqlText, "utf8");
 
-const command =
-  process.platform === "win32"
-    ? "cmd.exe"
-    : "npx";
-const args =
-  process.platform === "win32"
-    ? ["/d", "/c", `npx --yes supabase db query --linked --file ${sqlFile}`]
-    : ["--yes", "supabase", "db", "query", "--linked", "--file", sqlFile];
+  const command = process.platform === "win32" ? "cmd.exe" : "npx";
+  const args =
+    process.platform === "win32"
+      ? ["/d", "/c", `npx --yes supabase db query --linked --file ${sqlFile}`]
+      : ["--yes", "supabase", "db", "query", "--linked", "--file", sqlFile];
 
-const result = spawnSync(command, args, {
-  cwd: ROOT,
-  encoding: "utf8",
-  windowsHide: true,
-});
+  const result = spawnSync(command, args, {
+    cwd: ROOT,
+    encoding: "utf8",
+    windowsHide: true,
+  });
 
-rmSync(tmp, { recursive: true, force: true });
+  rmSync(tmp, { recursive: true, force: true });
+  return result;
+}
+
+const ownershipResult = executeLinkedSql(ownershipSql, "aulaflow-remote-ownership-");
+
+if (ownershipResult.status !== 0) {
+  console.error("A prova remota de ownership do lease falhou.");
+  if (ownershipResult.error) console.error(ownershipResult.error.message);
+  if (ownershipResult.stderr) console.error(ownershipResult.stderr.trim());
+  if (ownershipResult.stdout) console.error(ownershipResult.stdout.trim());
+  process.exit(ownershipResult.status ?? 1);
+}
+
+console.log("✓ PostgreSQL remoto: claim A -> reclaim B -> stale A -> finalize B, com rollback");
+
+const result = executeLinkedSql(sql, "aulaflow-remote-");
 
 if (result.status !== 0) {
   console.error("A consulta remota falhou.");

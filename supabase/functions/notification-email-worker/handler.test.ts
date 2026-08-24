@@ -1,11 +1,21 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { handleWorkerRequest, type ClaimedDelivery, type WorkerDependencies } from "./handler.ts";
+import { PROVIDER_TIMEOUT_MS } from "../_shared/email-transport.ts";
+import {
+  BATCH_SIZE,
+  handleWorkerRequest,
+  LEASE_RUNTIME_MARGIN_SECONDS,
+  LEASE_SECONDS,
+  MAX_SEQUENTIAL_PROVIDER_SECONDS,
+  type ClaimedDelivery,
+  type WorkerDependencies,
+} from "./handler.ts";
 
 const TOKEN = "token-de-teste";
 
 const DELIVERY: ClaimedDelivery = {
   delivery_id: "11111111-1111-4111-8111-111111111111",
+  lease_token: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
   recipient_email: "aluno@example.com",
   subject: "Aula marcada",
   body: 'Tem a aula "Treino" em 20/08 às 18:00.',
@@ -100,7 +110,13 @@ describe("o ciclo do worker", () => {
   it("lote vazio devolve um resumo a zeros", async () => {
     const response = await handleWorkerRequest(post(), deps());
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ claimed: 0, sent: 0, retried: 0, failed: 0 });
+    expect(await response.json()).toEqual({
+      claimed: 0,
+      sent: 0,
+      retried: 0,
+      failed: 0,
+      stale: 0,
+    });
   });
 
   it("uma entrega aceite pelo fornecedor é fechada como enviada", async () => {
@@ -110,9 +126,16 @@ describe("o ciclo do worker", () => {
 
     const response = await handleWorkerRequest(post(), dependencies);
 
-    expect(await response.json()).toEqual({ claimed: 1, sent: 1, retried: 0, failed: 0 });
+    expect(await response.json()).toEqual({
+      claimed: 1,
+      sent: 1,
+      retried: 0,
+      failed: 0,
+      stale: 0,
+    });
     expect(dependencies.finalize).toHaveBeenCalledWith({
       deliveryId: DELIVERY.delivery_id,
+      leaseToken: DELIVERY.lease_token,
       outcome: "sent",
       providerMessageId: "msg_1",
       error: null,
@@ -148,7 +171,13 @@ describe("o ciclo do worker", () => {
 
     const response = await handleWorkerRequest(post(), dependencies);
 
-    expect(await response.json()).toEqual({ claimed: 1, sent: 0, retried: 1, failed: 0 });
+    expect(await response.json()).toEqual({
+      claimed: 1,
+      sent: 0,
+      retried: 1,
+      failed: 0,
+      stale: 0,
+    });
     expect(dependencies.finalize).toHaveBeenCalledWith(
       expect.objectContaining({ outcome: "retry", error: "HTTP 500" }),
     );
@@ -163,7 +192,13 @@ describe("o ciclo do worker", () => {
         finalize: vi.fn().mockResolvedValue({ data: "failed", error: null }),
       }),
     );
-    expect(await response.json()).toEqual({ claimed: 1, sent: 0, retried: 0, failed: 1 });
+    expect(await response.json()).toEqual({
+      claimed: 1,
+      sent: 0,
+      retried: 0,
+      failed: 1,
+      stale: 0,
+    });
   });
 
   it("uma exceção no transporte não derruba o lote", async () => {
@@ -203,7 +238,13 @@ describe("o ciclo do worker", () => {
       }),
     );
 
-    expect(await response.json()).toEqual({ claimed: 2, sent: 1, retried: 0, failed: 1 });
+    expect(await response.json()).toEqual({
+      claimed: 2,
+      sent: 1,
+      retried: 0,
+      failed: 1,
+      stale: 0,
+    });
   });
 
   it("um erro a reclamar responde 500 sem detalhes", async () => {
@@ -232,7 +273,13 @@ describe("falhar a FECHAR não é o fornecedor ter falhado", () => {
       }),
     );
 
-    expect(await response.json()).toEqual({ claimed: 1, sent: 0, retried: 0, failed: 0 });
+    expect(await response.json()).toEqual({
+      claimed: 1,
+      sent: 0,
+      retried: 0,
+      failed: 0,
+      stale: 0,
+    });
   });
 
   it("e não repete imediatamente o envio", async () => {
@@ -260,12 +307,19 @@ describe("a resposta nunca leva nada de privado", () => {
 
     expect(text).not.toContain(DELIVERY.recipient_email);
     expect(text).not.toContain(DELIVERY.delivery_id);
+    expect(text).not.toContain(DELIVERY.lease_token);
     expect(text).not.toContain(DELIVERY.subject);
     expect(text).not.toContain(DELIVERY.body);
     expect(text).not.toContain("re_chave");
     expect(text).not.toContain(TOKEN);
     expect(text).not.toContain("msg_1");
-    expect(JSON.parse(text)).toEqual({ claimed: 1, sent: 1, retried: 0, failed: 0 });
+    expect(JSON.parse(text)).toEqual({
+      claimed: 1,
+      sent: 1,
+      retried: 0,
+      failed: 0,
+      stale: 0,
+    });
   });
 
   it("nem sequer quando o fornecedor devolve um erro descritivo", async () => {
@@ -284,5 +338,76 @@ describe("a resposta nunca leva nada de privado", () => {
     const text = await response.text();
     expect(text).not.toContain(DELIVERY.recipient_email);
     expect(text).not.toContain("inválido");
+  });
+});
+
+describe("ownership do claim", () => {
+  it("propaga exatamente o token que o PostgreSQL devolveu", async () => {
+    const dependencies = deps({
+      claim: vi.fn().mockResolvedValue({ data: [DELIVERY], error: null }),
+    });
+
+    await handleWorkerRequest(post(), dependencies);
+
+    expect(dependencies.finalize).toHaveBeenCalledWith(
+      expect.objectContaining({
+        deliveryId: DELIVERY.delivery_id,
+        leaseToken: DELIVERY.lease_token,
+      }),
+    );
+  });
+
+  it("mantém o token individual de duas deliveries", async () => {
+    const second = {
+      ...DELIVERY,
+      delivery_id: "22222222-2222-4222-8222-222222222222",
+      lease_token: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    };
+    const finalize = vi.fn().mockResolvedValue({ data: "sent", error: null });
+
+    await handleWorkerRequest(
+      post(),
+      deps({
+        claim: vi.fn().mockResolvedValue({ data: [DELIVERY, second], error: null }),
+        finalize,
+      }),
+    );
+
+    expect(finalize.mock.calls.map(([input]) => [input.deliveryId, input.leaseToken])).toEqual([
+      [DELIVERY.delivery_id, DELIVERY.lease_token],
+      [second.delivery_id, second.lease_token],
+    ]);
+  });
+
+  it("trata stale_claim como concorrência normal e não inventa outcome", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const response = await handleWorkerRequest(
+      post(),
+      deps({
+        claim: vi.fn().mockResolvedValue({ data: [DELIVERY], error: null }),
+        finalize: vi.fn().mockResolvedValue({ data: "stale_claim", error: null }),
+      }),
+    );
+
+    expect(await response.json()).toEqual({
+      claimed: 1,
+      sent: 0,
+      retried: 0,
+      failed: 0,
+      stale: 1,
+    });
+    expect(error).not.toHaveBeenCalled();
+    error.mockRestore();
+  });
+});
+
+describe("limite temporal do lote", () => {
+  it("mantém o pior I/O sequencial muito abaixo do lease", () => {
+    expect(PROVIDER_TIMEOUT_MS).toBe(10_000);
+    expect(BATCH_SIZE).toBe(5);
+    expect(LEASE_SECONDS).toBe(300);
+    expect(MAX_SEQUENTIAL_PROVIDER_SECONDS).toBe(50);
+    expect(LEASE_RUNTIME_MARGIN_SECONDS).toBe(250);
+    expect(MAX_SEQUENTIAL_PROVIDER_SECONDS).toBeLessThan(LEASE_SECONDS);
   });
 });

@@ -9,6 +9,7 @@ import {
 import {
   classifyProviderResult,
   networkFailureResult,
+  PROVIDER_TIMEOUT_MS,
   providerErrorName,
   providerIdempotencyKey,
   sanitizeProviderError,
@@ -277,6 +278,59 @@ describe("sendEmailViaResend", () => {
     const result = await sendEmailViaResend(request, fetchImpl);
     expect(result.outcome).toBe("retry");
     expect(result.error).toContain("ECONNRESET");
+  });
+
+  it("aborta um pedido preso sem esperar pelo timeout real", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchImpl = vi.fn((_url: string, init: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init.signal?.addEventListener("abort", () => {
+            reject(new Error(`Bearer ${request.apiKey}`));
+          });
+        }),
+      );
+
+      const pending = sendEmailViaResend(request, fetchImpl, 1_000);
+      const init = fetchImpl.mock.calls[0]?.[1] as RequestInit;
+
+      expect(init.signal).toBeInstanceOf(AbortSignal);
+      expect(init.signal?.aborted).toBe(false);
+      expect((init.headers as Record<string, string>)["Idempotency-Key"]).toBe(
+        request.idempotencyKey,
+      );
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      const result = await pending;
+
+      expect(init.signal?.aborted).toBe(true);
+      expect(result).toEqual({ outcome: "retry", error: "provider request timed out" });
+      expect(result.error).not.toContain(request.apiKey);
+      expect(result.error?.length).toBeLessThanOrEqual(300);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("limita qualquer override ao timeout máximo do provider", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchImpl = vi.fn((_url: string, init: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+        }),
+      );
+
+      const pending = sendEmailViaResend(request, fetchImpl, PROVIDER_TIMEOUT_MS * 2);
+      await vi.advanceTimersByTimeAsync(PROVIDER_TIMEOUT_MS);
+
+      expect(await pending).toEqual({
+        outcome: "retry",
+        error: "provider request timed out",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("422 é definitivo", async () => {

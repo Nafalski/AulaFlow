@@ -15,6 +15,11 @@ export type ProviderResult = {
   error?: string;
 };
 
+// Cinco pedidos sequenciais deste tamanho cabem folgadamente no lease de 300 s
+// do worker. A relação completa vive e é testada em `handler.ts`.
+export const PROVIDER_TIMEOUT_MS = 10_000;
+const PROVIDER_TIMEOUT_ERROR = "provider request timed out";
+
 /**
  * A chave de idempotência da entrega, estável em todas as tentativas.
  *
@@ -138,8 +143,12 @@ export type FetchLike = (url: string, init: RequestInit) => Promise<Response>;
 export async function sendEmailViaResend(
   request: ResendRequest,
   fetchImpl: FetchLike,
+  timeoutMs = PROVIDER_TIMEOUT_MS,
 ): Promise<ProviderResult> {
   let response: Response;
+  const controller = new AbortController();
+  const boundedTimeoutMs = Math.max(1, Math.min(timeoutMs, PROVIDER_TIMEOUT_MS));
+  const timeout = setTimeout(() => controller.abort(), boundedTimeoutMs);
 
   try {
     response = await fetchImpl("https://api.resend.com/emails", {
@@ -154,6 +163,7 @@ export async function sendEmailViaResend(
         // Sem versão de ambiente, sem identificadores, sem dados pessoais.
         "User-Agent": USER_AGENT,
       },
+      signal: controller.signal,
       body: JSON.stringify({
         from: request.from,
         to: [request.to],
@@ -163,7 +173,12 @@ export async function sendEmailViaResend(
       }),
     });
   } catch (error) {
+    if (controller.signal.aborted) {
+      return networkFailureResult(PROVIDER_TIMEOUT_ERROR);
+    }
     return networkFailureResult(error instanceof Error ? error.message : "network failure");
+  } finally {
+    clearTimeout(timeout);
   }
 
   const raw = await response.text().catch(() => "");

@@ -763,6 +763,7 @@ export type NotificationDelivery = {
   // nenhuma view a expõe — `recipient_email` em particular nunca sai daqui.
   recipient_email: string | null;
   locked_at: Timestamp | null;
+  lease_token: UUID | null;
   provider_message_id: string | null;
   skip_reason: string | null;
   created_at: Timestamp;
@@ -1684,7 +1685,13 @@ export type Database = {
         Row: NotificationDelivery;
         Insert: Insertable<
           NotificationDelivery,
-          Audited | "status" | "attempts" | "last_error" | "scheduled_for" | "sent_at"
+          | Audited
+          | "status"
+          | "attempts"
+          | "last_error"
+          | "scheduled_for"
+          | "sent_at"
+          | "lease_token"
         >;
         Update: Partial<NotificationDelivery>;
         Relationships: [];
@@ -2328,6 +2335,36 @@ export type Database = {
           p_membership_id?: UUID | null;
         };
         Returns: ClubAvailabilityCalendarRecord[];
+      };
+      /** RPC interna do worker; não tem EXECUTE para browser. */
+      claim_email_deliveries: {
+        Args: {
+          p_batch_size?: number;
+          p_lease_seconds?: number;
+          p_now?: Timestamp;
+          p_claim_contract_version?: number;
+        };
+        Returns: {
+          delivery_id: UUID;
+          lease_token: UUID;
+          recipient_email: string;
+          subject: string;
+          body: string;
+          notified_at: Timestamp;
+          attempts: number;
+        }[];
+      };
+      /** RPC interna do worker; o lease token prova ownership do claim. */
+      finalize_email_delivery: {
+        Args: {
+          p_delivery_id: UUID;
+          p_lease_token: UUID;
+          p_outcome: string;
+          p_provider_message_id?: string | null;
+          p_error?: string | null;
+          p_now?: Timestamp;
+        };
+        Returns: string;
       };
     };
     Enums: {

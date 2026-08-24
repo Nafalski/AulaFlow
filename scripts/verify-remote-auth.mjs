@@ -7510,6 +7510,7 @@ try {
     await mustReject(`${label} nao fecha entregas de email`, async () =>
       client.rpc("finalize_email_delivery", {
         p_delivery_id: deterministicUuid("8c-fake-delivery"),
+        p_lease_token: deterministicUuid("8c-fake-lease"),
         p_outcome: "sent",
       }),
     );
@@ -7644,6 +7645,16 @@ try {
 
   section("Conta bloqueada e anonimo");
   await signIn(blockedClient, credentials.blocked.email, credentials.blocked.password, "Conta bloqueada");
+  await mustReject("Conta bloqueada nao reclama entregas de email", async () =>
+    blockedClient.rpc("claim_email_deliveries", { p_batch_size: 5 }),
+  );
+  await mustReject("Conta bloqueada nao fecha entregas de email", async () =>
+    blockedClient.rpc("finalize_email_delivery", {
+      p_delivery_id: deterministicUuid("8c-blocked-fake-delivery"),
+      p_lease_token: deterministicUuid("8c-blocked-fake-lease"),
+      p_outcome: "sent",
+    }),
+  );
   await mustReturnNoRows("Conta bloqueada nao le views de pacotes", () =>
     blockedClient.from("teacher_package_records").select("id").limit(1),
   );

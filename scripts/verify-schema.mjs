@@ -13860,7 +13860,7 @@ section("Etapa 8C — outbox de email");
 async function deliveriesOf(notificationId) {
   return rows(
     `select id, channel, status, attempts, scheduled_for, recipient_email,
-            skip_reason, provider_message_id, locked_at, last_error
+            skip_reason, provider_message_id, locked_at, lease_token, last_error
        from public.notification_deliveries
       where notification_id = $1`,
     [notificationId],
@@ -13887,6 +13887,22 @@ async function setPreference(profileId, patch) {
   await db.query(
     `update public.notification_preferences set ${assignments} where profile_id = $1`,
     [profileId, ...Object.values(patch)],
+  );
+}
+
+async function finalizeEmailDelivery({
+  deliveryId,
+  leaseToken,
+  outcome,
+  providerMessageId = null,
+  error = null,
+  now = null,
+}) {
+  return one(
+    `select public.finalize_email_delivery(
+       $1, $2, $3, $4, $5, coalesce($6::timestamptz, now())
+     ) as result`,
+    [deliveryId, leaseToken, outcome, providerMessageId, error, now],
   );
 }
 
@@ -13944,6 +13960,10 @@ check(
 check(
   offDelivery.delivery?.last_error === null && offDelivery.delivery?.recipient_email === null,
   "uma entrega suprimida não guarda erro nem endereço",
+);
+check(
+  offDelivery.delivery?.locked_at === null && offDelivery.delivery?.lease_token === null,
+  "uma entrega suprimida nasce sem ownership pendurado",
 );
 await setPreference(SCHED_PROFILE, { email_enabled: true });
 
@@ -14134,10 +14154,15 @@ await db.query(
     where status = 'pending'`,
 );
 
-const claimTarget = await notifyAndFetchDelivery(SCHED_PROFILE, "lesson_created", "8c:claim:1");
+const claimTarget = await notifyAndFetchDelivery(
+  SCHED_PROFILE,
+  "lesson_created",
+  "8c:claim:1",
+  "2026-08-18T09:00:00Z",
+);
 
 const claimed = await rows(
-  `select * from public.claim_email_deliveries(10, 300, now())`,
+  `select * from public.claim_email_deliveries(10, 300, '2026-08-18T10:00:00Z')`,
 );
 check(
   claimed.some((row) => row.delivery_id === claimTarget.delivery.id),
@@ -14149,8 +14174,9 @@ check(
   "o conteúdo vem do aviso histórico, e não do estado atual da aula",
 );
 check(
-  (await deliveriesOf(claimTarget.notificationId))[0].locked_at !== null,
-  "reclamar deixa o arrendamento marcado",
+  (await deliveriesOf(claimTarget.notificationId))[0].lease_token === claimedRow?.lease_token &&
+    claimedRow?.lease_token !== null,
+  "o token devolvido pelo claim é exatamente o token armazenado",
 );
 
 // Reclamar não é tentar: `attempts` só sobe quando se fala com o fornecedor.
@@ -14161,7 +14187,7 @@ check(
 
 // Um segundo worker, na mesma janela, não vê a linha arrendada.
 const secondClaim = await rows(
-  `select * from public.claim_email_deliveries(10, 300, now())`,
+  `select * from public.claim_email_deliveries(10, 300, '2026-08-18T10:02:00Z')`,
 );
 check(
   !secondClaim.some((row) => row.delivery_id === claimTarget.delivery.id),
@@ -14170,9 +14196,13 @@ check(
 
 check(
   (
-    await one(`select public.finalize_email_delivery($1, 'sent', 'msg_abc', null) as result`, [
-      claimTarget.delivery.id,
-    ])
+    await finalizeEmailDelivery({
+      deliveryId: claimTarget.delivery.id,
+      leaseToken: claimedRow.lease_token,
+      outcome: "sent",
+      providerMessageId: "msg_abc",
+      now: "2026-08-18T10:03:00Z",
+    })
   ).result === "sent",
   "fechar com sucesso devolve sent",
 );
@@ -14182,14 +14212,17 @@ check(
   "a entrega enviada guarda a tentativa e o identificador do fornecedor",
 );
 check(
-  sentRow.locked_at === null && sentRow.last_error === null,
-  "o sucesso limpa o arrendamento e o erro anterior",
+  sentRow.locked_at === null && sentRow.lease_token === null && sentRow.last_error === null,
+  "o sucesso limpa ownership e o erro anterior",
 );
 check(
   (
-    await one(`select public.finalize_email_delivery($1, 'sent', 'msg_outro', null) as result`, [
-      claimTarget.delivery.id,
-    ])
+    await finalizeEmailDelivery({
+      deliveryId: claimTarget.delivery.id,
+      leaseToken: claimedRow.lease_token,
+      outcome: "sent",
+      providerMessageId: "msg_outro",
+    })
   ).result === "sent",
   "fechar a mesma entrega outra vez não a reabre nem volta a contar",
 );
@@ -14199,21 +14232,36 @@ check(
 );
 
 // ── RECUO PROGRESSIVO ──────────────────────────────────────────────────────
-const retryTarget = await notifyAndFetchDelivery(SCHED_PROFILE, "lesson_created", "8c:retry:1");
+const retryTarget = await notifyAndFetchDelivery(
+  SCHED_PROFILE,
+  "lesson_created",
+  "8c:retry:1",
+  "2026-08-18T09:00:00Z",
+);
 const backoffs = [];
+let attemptAt = "2026-08-18T10:00:00Z";
 for (let attempt = 1; attempt <= 5; attempt += 1) {
-  const outcome = await one(
-    `select public.finalize_email_delivery($1, 'retry', null, 'HTTP 500', '2026-08-18T10:00:00Z'::timestamptz) as result`,
-    [retryTarget.delivery.id],
+  const attemptClaims = await rows(
+    `select * from public.claim_email_deliveries(10, 300, $1::timestamptz)`,
+    [attemptAt],
   );
+  const attemptClaim = attemptClaims.find((row) => row.delivery_id === retryTarget.delivery.id);
+  check(Boolean(attemptClaim?.lease_token), `a tentativa ${attempt} recebe ownership antes do envio`);
+  const outcome = await finalizeEmailDelivery({
+    deliveryId: retryTarget.delivery.id,
+    leaseToken: attemptClaim.lease_token,
+    outcome: "retry",
+    error: "HTTP 500",
+    now: attemptAt,
+  });
   const row = (await deliveriesOf(retryTarget.notificationId))[0];
   backoffs.push({
     result: outcome.result,
     status: row.status,
     attempts: row.attempts,
-    minutes:
-      (row.scheduled_for.getTime() - Date.parse("2026-08-18T10:00:00Z")) / 60000,
+    minutes: (row.scheduled_for.getTime() - Date.parse(attemptAt)) / 60000,
   });
+  attemptAt = row.scheduled_for.toISOString();
 }
 check(
   backoffs.slice(0, 4).every((step) => step.result === "retry"),
@@ -14232,18 +14280,30 @@ check(
   "ao fim do limite de tentativas a entrega passa a falhada",
 );
 check(
-  (await deliveriesOf(retryTarget.notificationId))[0].locked_at === null,
-  "uma entrega falhada não fica com o arrendamento preso",
+  (await deliveriesOf(retryTarget.notificationId))[0].locked_at === null &&
+    (await deliveriesOf(retryTarget.notificationId))[0].lease_token === null,
+  "uma entrega falhada não fica com ownership preso",
 );
 
 // Uma falha definitiva não gasta cinco tentativas a saber o que já se sabe.
-const permanent = await notifyAndFetchDelivery(SCHED_PROFILE, "lesson_created", "8c:permanente");
+const permanent = await notifyAndFetchDelivery(
+  SCHED_PROFILE,
+  "lesson_created",
+  "8c:permanente",
+  "2026-08-18T09:00:00Z",
+);
+const permanentClaims = await rows(
+  `select * from public.claim_email_deliveries(10, 300, '2026-08-18T10:00:00Z')`,
+);
+const permanentClaim = permanentClaims.find((row) => row.delivery_id === permanent.delivery.id);
 check(
   (
-    await one(
-      `select public.finalize_email_delivery($1, 'failed', null, 'invalid recipient') as result`,
-      [permanent.delivery.id],
-    )
+    await finalizeEmailDelivery({
+      deliveryId: permanent.delivery.id,
+      leaseToken: permanentClaim.lease_token,
+      outcome: "failed",
+      error: "invalid recipient",
+    })
   ).result === "failed",
   "um erro inequívoco do pedido falha à primeira",
 );
@@ -14253,17 +14313,28 @@ check(
 );
 
 // Uma entrega falhada não bloqueia as seguintes.
-const afterFailure = await notifyAndFetchDelivery(SCHED_PROFILE, "lesson_created", "8c:seguinte");
+const afterFailure = await notifyAndFetchDelivery(
+  SCHED_PROFILE,
+  "lesson_created",
+  "8c:seguinte",
+  "2026-08-18T09:00:00Z",
+);
 const claimAfterFailure = await rows(
-  `select * from public.claim_email_deliveries(10, 300, now())`,
+  `select * from public.claim_email_deliveries(10, 300, '2026-08-18T10:00:00Z')`,
 );
 check(
   claimAfterFailure.some((row) => row.delivery_id === afterFailure.delivery.id),
   "uma entrega falhada não impede as seguintes de serem reclamadas",
 );
-await db.query(`select public.finalize_email_delivery($1, 'sent', 'msg_x', null)`, [
-  afterFailure.delivery.id,
-]);
+const afterFailureClaim = claimAfterFailure.find(
+  (row) => row.delivery_id === afterFailure.delivery.id,
+);
+await finalizeEmailDelivery({
+  deliveryId: afterFailure.delivery.id,
+  leaseToken: afterFailureClaim.lease_token,
+  outcome: "sent",
+  providerMessageId: "msg_x",
+});
 
 // ── ARRENDAMENTO EXPIRADO ──────────────────────────────────────────────────
 //
@@ -14277,10 +14348,13 @@ const stale = await notifyAndFetchDelivery(
   "8c:arrendamento",
   "2026-08-18T09:00:00Z",
 );
-await rows(`select * from public.claim_email_deliveries(10, 300, '2026-08-18T10:00:00Z'::timestamptz)`);
+const claimA = await rows(
+  `select * from public.claim_email_deliveries(10, 300, '2026-08-18T10:00:00Z'::timestamptz)`,
+);
+const staleClaimA = claimA.find((row) => row.delivery_id === stale.delivery.id);
 check(
-  (await deliveriesOf(stale.notificationId))[0].locked_at !== null,
-  "a entrega fica reclamada",
+  Boolean(staleClaimA?.lease_token),
+  "o worker A recebe um token ao reclamar a entrega",
 );
 const beforeTimeout = await rows(
   `select * from public.claim_email_deliveries(10, 300, '2026-08-18T10:02:00Z'::timestamptz)`,
@@ -14292,13 +14366,72 @@ check(
 const afterTimeout = await rows(
   `select * from public.claim_email_deliveries(10, 300, '2026-08-18T10:10:00Z'::timestamptz)`,
 );
+const staleClaimB = afterTimeout.find((row) => row.delivery_id === stale.delivery.id);
 check(
-  afterTimeout.some((row) => row.delivery_id === stale.delivery.id),
-  "passado o arrendamento, outro worker recupera o trabalho",
+  Boolean(staleClaimB?.lease_token),
+  "passado o arrendamento, o worker B recupera o trabalho",
 );
-await db.query(`select public.finalize_email_delivery($1, 'sent', 'msg_y', null)`, [
-  stale.delivery.id,
-]);
+check(
+  staleClaimA.lease_token !== staleClaimB.lease_token,
+  "o reclaim gera token B diferente do token A",
+);
+
+const beforeStaleFinalize = (await deliveriesOf(stale.notificationId))[0];
+for (const [outcome, providerMessageId, error] of [
+  ["sent", "msg_stale_a", null],
+  ["retry", null, "HTTP 500 stale"],
+  ["failed", null, "invalid stale"],
+]) {
+  const staleOutcome = await finalizeEmailDelivery({
+    deliveryId: stale.delivery.id,
+    leaseToken: staleClaimA.lease_token,
+    outcome,
+    providerMessageId,
+    error,
+    now: "2026-08-18T10:11:00Z",
+  });
+  check(
+    staleOutcome.result === "stale_claim",
+    `o finalize ${outcome} do worker A é recusado como stale_claim`,
+  );
+}
+
+const afterStaleFinalize = (await deliveriesOf(stale.notificationId))[0];
+check(
+  afterStaleFinalize.status === "pending" && afterStaleFinalize.attempts === 0,
+  "sent/retry/failed stale não mudam estado nem tentativas",
+);
+check(
+  afterStaleFinalize.lease_token === staleClaimB.lease_token &&
+    afterStaleFinalize.locked_at.getTime() === beforeStaleFinalize.locked_at.getTime(),
+  "o ownership e o locked_at do worker B ficam intactos",
+);
+check(
+  afterStaleFinalize.scheduled_for.getTime() === beforeStaleFinalize.scheduled_for.getTime() &&
+    afterStaleFinalize.provider_message_id === null &&
+    afterStaleFinalize.last_error === null,
+  "o worker A não altera agenda, provider_message_id nem erro",
+);
+
+const validB = await finalizeEmailDelivery({
+  deliveryId: stale.delivery.id,
+  leaseToken: staleClaimB.lease_token,
+  outcome: "sent",
+  providerMessageId: "msg_y",
+  now: "2026-08-18T10:12:00Z",
+});
+check(validB.result === "sent", "o worker B finaliza com o token atual");
+const finalizedByB = (await deliveriesOf(stale.notificationId))[0];
+check(
+  finalizedByB.status === "sent" &&
+    finalizedByB.attempts === 1 &&
+    finalizedByB.provider_message_id === "msg_y",
+  "o finalize válido de B conta uma tentativa e guarda o provider correto",
+);
+check(
+  finalizedByB.locked_at === null && finalizedByB.lease_token === null,
+  "o finalize válido de B limpa todo o ownership",
+);
 
 // ── A PREFERÊNCIA MUDA DEPOIS DE A ENTREGA ESTAR EM FILA ───────────────────
 const queued = await notifyAndFetchDelivery(SCHED_PROFILE, "lesson_created", "8c:mudou");
@@ -14313,6 +14446,11 @@ check(
 check(
   (await deliveriesOf(queued.notificationId))[0].status === "skipped",
   "essa entrega passa a suprimida em vez de ficar pendente para sempre",
+);
+const queuedAfterSkip = (await deliveriesOf(queued.notificationId))[0];
+check(
+  queuedAfterSkip.locked_at === null && queuedAfterSkip.lease_token === null,
+  "o skip decidido no claim limpa todo o ownership",
 );
 
 await setPreference(SCHED_PROFILE, { email_enabled: true });
@@ -14363,7 +14501,10 @@ check(
 const quietRow = (await deliveriesOf(quietLate.notificationId))[0];
 check(quietRow.status === "pending", "a entrega continua pendente, e não suprimida");
 check(quietRow.attempts === 0, "reagendar por silêncio não gasta uma tentativa");
-check(quietRow.locked_at === null, "e não fica com o arrendamento preso");
+check(
+  quietRow.locked_at === null && quietRow.lease_token === null,
+  "e não fica com ownership preso",
+);
 check(
   quietRow.scheduled_for.toISOString() === "2026-09-10T11:00:00.000Z",
   "passa a estar agendada para as 12:00 locais, o fim do silêncio",
@@ -14381,9 +14522,13 @@ check(
   afterQuiet.some((row) => row.delivery_id === quietLate.delivery.id),
   "acabado o silêncio, a entrega é reclamada normalmente",
 );
-await db.query(`select public.finalize_email_delivery($1, 'sent', 'msg_quiet', null)`, [
-  quietLate.delivery.id,
-]);
+const afterQuietClaim = afterQuiet.find((row) => row.delivery_id === quietLate.delivery.id);
+await finalizeEmailDelivery({
+  deliveryId: quietLate.delivery.id,
+  leaseToken: afterQuietClaim.lease_token,
+  outcome: "sent",
+  providerMessageId: "msg_quiet",
+});
 
 // ── (8C.1) O MESMO, COM O INTERVALO QUE ATRAVESSA A MEIA-NOITE ────────────
 await setPreference(SCHED_PROFILE, { quiet_hours_start: null, quiet_hours_end: null });
@@ -14463,9 +14608,15 @@ check(
   azoresClaim.some((row) => row.delivery_id === azoresDelivery.delivery.id),
   "mudar para os Açores torna o mesmo instante enviável, porque lá ainda são 21:00",
 );
-await db.query(`select public.finalize_email_delivery($1, 'sent', 'msg_azores', null)`, [
-  azoresDelivery.delivery.id,
-]);
+const azoresDeliveryClaim = azoresClaim.find(
+  (row) => row.delivery_id === azoresDelivery.delivery.id,
+);
+await finalizeEmailDelivery({
+  deliveryId: azoresDelivery.delivery.id,
+  leaseToken: azoresDeliveryClaim.lease_token,
+  outcome: "sent",
+  providerMessageId: "msg_azores",
+});
 await db.query(`update public.profiles set timezone = 'Europe/Lisbon' where id = $1`, [
   SCHED_PROFILE,
 ]);
@@ -14528,7 +14679,11 @@ await mustReject("nenhum cliente escreve no outbox", () =>
 
 for (const fn of [
   `public.claim_email_deliveries(1, 300, now())`,
-  `public.finalize_email_delivery('00000000-0000-4000-8000-000000000000'::uuid, 'sent', null, null)`,
+  `public.finalize_email_delivery(
+     '00000000-0000-4000-8000-000000000000'::uuid,
+     '11111111-1111-4111-8111-111111111111'::uuid,
+     'sent', null, null
+   )`,
   `public.email_delivery_block_reason('00000000-0000-4000-8000-000000000000'::uuid, 'lesson_created')`,
   `public.email_delivery_schedule('00000000-0000-4000-8000-000000000000'::uuid, now())`,
   `public.dispatch_email_worker()`,

@@ -14,7 +14,10 @@
 
 import { createClient } from "jsr:@supabase/supabase-js@2";
 
-import { sendEmailViaResend } from "../_shared/email-transport.ts";
+import {
+  PROVIDER_TIMEOUT_MS,
+  sendEmailViaResend,
+} from "../_shared/email-transport.ts";
 import {
   handleWorkerRequest,
   type ClaimedDelivery,
@@ -64,10 +67,12 @@ Deno.serve(async (request: Request) => {
           idempotencyKey: input.idempotencyKey,
         },
         fetch,
+        PROVIDER_TIMEOUT_MS,
       ),
     finalize: async (input) => {
       const { data, error } = await supabase.rpc("finalize_email_delivery", {
         p_delivery_id: input.deliveryId,
+        p_lease_token: input.leaseToken,
         p_outcome: input.outcome,
         p_provider_message_id: input.providerMessageId,
         p_error: input.error,

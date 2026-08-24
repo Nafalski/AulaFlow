@@ -14,6 +14,7 @@
 
 import { renderNotificationEmail } from "../_shared/email-render.ts";
 import {
+  PROVIDER_TIMEOUT_MS,
   providerIdempotencyKey,
   type ProviderResult,
 } from "../_shared/email-transport.ts";
@@ -21,6 +22,7 @@ import {
 /** Uma entrega reclamada, tal como `claim_email_deliveries()` a devolve. */
 export type ClaimedDelivery = {
   delivery_id: string;
+  lease_token: string;
   recipient_email: string;
   subject: string;
   body: string;
@@ -49,20 +51,23 @@ export type WorkerDependencies = {
   }) => Promise<ProviderResult>;
   finalize: (input: {
     deliveryId: string;
+    leaseToken: string;
     outcome: ProviderResult["outcome"];
     providerMessageId: string | null;
     error: string | null;
   }) => Promise<{ data: string | null; error: unknown }>;
 };
 
-// Lote pequeno de propósito: uma invocação por minuto com 20 emails esvazia
-// 1200 por hora, e um lote grande só serviria para uma invocação lenta segurar
-// entregas que a seguinte podia já ter feito.
-export const BATCH_SIZE = 20;
+// Cinco pedidos sequenciais com timeout de 10 s ocupam no máximo 50 s de I/O
+// externo. Num lease de 300 s sobram 250 s para render, RPCs e variação do
+// runtime. A relação é testada para não se degradar por alteração isolada.
+export const BATCH_SIZE = 5;
 
 // O arrendamento tem de ser mais longo do que a pior invocação plausível, senão
 // um worker lento vê o seu próprio trabalho ser reclamado por outro.
 export const LEASE_SECONDS = 300;
+export const MAX_SEQUENTIAL_PROVIDER_SECONDS = (BATCH_SIZE * PROVIDER_TIMEOUT_MS) / 1000;
+export const LEASE_RUNTIME_MARGIN_SECONDS = LEASE_SECONDS - MAX_SEQUENTIAL_PROVIDER_SECONDS;
 
 function json(body: Record<string, unknown>, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -109,7 +114,7 @@ export async function handleWorkerRequest(
   }
 
   const batch = Array.isArray(claimed.data) ? claimed.data : [];
-  const summary = { claimed: batch.length, sent: 0, retried: 0, failed: 0 };
+  const summary = { claimed: batch.length, sent: 0, retried: 0, failed: 0, stale: 0 };
 
   for (const delivery of batch) {
     const rendered = renderNotificationEmail({
@@ -137,6 +142,7 @@ export async function handleWorkerRequest(
 
     const finalized = await deps.finalize({
       deliveryId: delivery.delivery_id,
+      leaseToken: delivery.lease_token,
       outcome: result.outcome,
       providerMessageId: result.messageId ?? null,
       error: result.error ?? null,
@@ -155,7 +161,10 @@ export async function handleWorkerRequest(
       continue;
     }
 
-    if (finalized.data === "sent") summary.sent += 1;
+    // Perder o lease para outro worker é concorrência normal. O PostgreSQL já
+    // recusou a escrita; não se inventa um desfecho nem se regista dado algum.
+    if (finalized.data === "stale_claim") summary.stale += 1;
+    else if (finalized.data === "sent") summary.sent += 1;
     else if (finalized.data === "retry") summary.retried += 1;
     else if (finalized.data === "failed") summary.failed += 1;
   }

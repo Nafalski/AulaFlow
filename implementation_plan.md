@@ -1366,11 +1366,13 @@ A decisão D-07 estava escrita desde a Fase 1 e explicava-se a si própria: *com
 
 **O interruptor in-app saiu da interface.** A 8A decidiu que o aviso dentro da aplicação é o histórico do facto e é sempre escrito. Um interruptor que não desliga nada é uma promessa falsa; a coluna fica por compatibilidade e nenhum formulário lhe toca. A caixa continua a mostrar tudo.
 
-**Reclamar é atómico**: `for update ... skip locked` mais arrendamento em `locked_at`. Dois workers nunca apanham a mesma entrega, e um arrendamento expirado permite recuperar o trabalho de um worker que morreu — sem depender da memória de nenhum processo.
+**Reclamar é atómico e tem ownership**: `for update ... skip locked` mais `locked_at + lease_token`. Cada claim real gera um UUID novo, inclusive ao recuperar um lease expirado; `finalize_email_delivery()` exige o token atual e um worker antigo recebe `stale_claim` sem alterar estado, tentativas, agenda ou ownership do sucessor. O estado continua `pending`, sem uma máquina paralela de `processing`.
 
 **`attempts` conta tentativas reais de envio**, e sobe no `finalize`. Recuo de 1 min, 5 min, 15 min, 1 h, 4 h; ao fim de cinco, `failed`. Uma entrega falhada nunca bloqueia as seguintes.
 
-**`sent` significa "o fornecedor aceitou"**, e não "chegou à caixa de entrada". A chave de idempotência (`aulaflow-email/<delivery_id>`) é estável em todas as tentativas e é a segunda defesa, depois da constraint única. Não se promete exactly-once: um HTTP externo tem sempre uma janela em que não se sabe se a aceitação se perdeu no regresso.
+**`sent` significa "o fornecedor aceitou"**, e não "chegou à caixa de entrada". A chave de idempotência (`aulaflow-email/<delivery_id>`) é estável em todas as tentativas e é a segunda defesa, depois do ownership na base de dados. Não se promete exactly-once: um HTTP externo tem sempre uma janela em que não se sabe se a aceitação se perdeu no regresso.
+
+**O lease tem orçamento temporal explícito.** O transporte aborta cada pedido ao fim de 10 s e transforma timeout em `retry` sanitizado. O worker reclama 5 entregas por lote e envia-as sequencialmente: são no máximo 50 s de I/O externo num lease de 300 s, deixando 250 s para composição, RPCs e variação do runtime.
 
 **Dois jobs `pg_cron`, porque são dois trabalhos**: o da 8B produz factos de hora a hora; o da 8C consome o outbox ao minuto. Juntá-los amarraria a produção de factos à latência do fornecedor. O segredo do worker vive no Vault e é lido em cada execução — nunca numa migração.
 

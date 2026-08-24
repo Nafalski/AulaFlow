@@ -700,7 +700,7 @@ Quem desliga o email entre as duas decisões não recebe o que estava em fila �
 
 **Uma ficha sem conta ligada não recebe email.** Não há notificação in-app, logo não há entrega. É contrato deliberado desta etapa, não falha silenciosa; o email para fichas por reclamar fica para outra altura.
 
-**Reclamar é atómico.** `claim_email_deliveries()` usa `for update ... skip locked` mais um arrendamento em `locked_at`: dois workers em paralelo nunca apanham a mesma entrega, e um arrendamento **expirado** deixa outro worker recuperar o trabalho de um que morreu. O estado vive todo na base de dados.
+**Reclamar é atómico e tem ownership.** `claim_email_deliveries()` usa `for update ... skip locked` e grava `locked_at + lease_token`: cada claim real recebe um UUID novo, inclusive ao recuperar um lease expirado. `finalize_email_delivery()` exige o token atual e devolve `stale_claim` sem tocar na linha quando um worker antigo regressa. A chave idempotente do fornecedor continua a ser a segunda defesa, não substitui ownership na base de dados. O worker processa 5 emails sequenciais com timeout HTTP de 10 s num lease de 300 s: 50 s máximos de I/O externo e 250 s de margem para RPCs/runtime.
 
 **`attempts` conta tentativas REAIS de envio**, e sobe no `finalize`, não no `claim`. Reclamar e não enviar (porque a preferência mudou) não é uma tentativa. O recuo é 1 min, 5 min, 15 min, 1 h, 4 h, e ao fim de cinco tentativas a entrega passa a `failed` — uma entrega falhada nunca bloqueia as seguintes.
 
