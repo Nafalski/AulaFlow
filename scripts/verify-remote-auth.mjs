@@ -7848,18 +7848,26 @@ try {
     .single();
   check(!restored.error, "As preferencias do aluno voltam ao estado inicial");
 
+  const teacherPrefsBefore = await getSingle(
+    "preferencias iniciais do professor",
+    teacherClient
+      .from("notification_preferences")
+      .select("profile_id, email_enabled")
+      .eq("profile_id", teacherUser.id),
+  );
+
   // Alterar a linha de outra pessoa nao afeta linha nenhuma: a policy filtra
   // pelo proprio, e um update que nao encontra linha nao e uma excecao.
   const crossUser = await studentClient
     .from("notification_preferences")
-    .update({ email_enabled: false })
+    .update({ email_enabled: !teacherPrefsBefore.email_enabled })
     .eq("profile_id", teacherUser.id)
     .select("profile_id");
   check(
     !crossUser.error && (crossUser.data ?? []).length === 0,
     "Um aluno nao altera as preferencias de outra conta",
   );
-  const teacherStillOn = await getSingle(
+  const teacherPrefsAfter = await getSingle(
     "preferencias do professor",
     teacherClient
       .from("notification_preferences")
@@ -7867,11 +7875,11 @@ try {
       .eq("profile_id", teacherUser.id),
   );
   check(
-    teacherStillOn.email_enabled === true,
+    teacherPrefsAfter.email_enabled === teacherPrefsBefore.email_enabled,
     "E as preferencias do professor ficaram como estavam",
   );
 
-  // ── Uma operacao de dominio continua a funcionar, e deixa o email em fila ──
+  // ── Uma operacao de dominio preserva o aviso interno e suprime o email E2E ──
   //
   // Nao ha aqui nenhuma chamada ao fornecedor: o trigger escreve uma linha na
   // mesma transacao e acaba. E por isso que uma indisponibilidade do Resend nao
@@ -7904,6 +7912,36 @@ try {
   check(
     !("recipient_email" in ((outboxInbox.data ?? [])[0] ?? {})),
     "A projecao da caixa nunca traz o endereco de email",
+  );
+
+  const outboxNotification = (outboxInbox.data ?? []).find(
+    (row) => row.type === "lesson_created",
+  );
+  const outboxDelivery = outboxNotification
+    ? await getSingle(
+        "entrega externa suprimida da conta E2E",
+        fixtureClient
+          .from("notification_deliveries")
+          .select(
+            "status, attempts, recipient_email, skip_reason, locked_at, lease_token, " +
+              "sent_at, provider_message_id",
+          )
+          .eq("notification_id", outboxNotification.id),
+      )
+    : null;
+  check(
+    outboxDelivery?.status === "skipped" &&
+      outboxDelivery.skip_reason === "email_disabled" &&
+      outboxDelivery.recipient_email === null,
+    "A conta E2E nao gera email externo pendente",
+  );
+  check(
+    outboxDelivery?.attempts === 0 &&
+      outboxDelivery.locked_at === null &&
+      outboxDelivery.lease_token === null &&
+      outboxDelivery.sent_at === null &&
+      outboxDelivery.provider_message_id === null,
+    "A entrega E2E suprimida nunca foi reclamada nem enviada",
   );
 
   section("Conta bloqueada e anonimo");

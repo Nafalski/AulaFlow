@@ -194,6 +194,26 @@ try {
     return data;
   }
 
+  async function normalizeNotificationPreferences(profileIds) {
+    const { data, error } = await admin
+      .from("notification_preferences")
+      .update({ email_enabled: false, in_app_enabled: true })
+      .in("profile_id", profileIds)
+      .select("profile_id, email_enabled, in_app_enabled");
+    if (error) throw error;
+
+    const normalized = data ?? [];
+    if (
+      normalized.length !== profileIds.length ||
+      normalized.some(
+        (preferences) =>
+          preferences.email_enabled !== false || preferences.in_app_enabled !== true,
+      )
+    ) {
+      throw new Error("Nao foi possivel isolar o email externo nas seis contas E2E.");
+    }
+  }
+
   const created = {};
   for (const [key, definition] of Object.entries(users)) {
     created[key] = await ensureUser(definition);
@@ -236,6 +256,8 @@ try {
     email: users.studentB.email,
   });
 
+  await normalizeNotificationPreferences(Object.values(created).map((user) => user.id));
+
   console.log(`Supabase remoto: ${projectRef}`);
   console.log("Dados E2E prontos:");
   console.log(`  Professor A: ${users.teacherA.email} (${maskId(teacherA.id)})`);
@@ -244,6 +266,7 @@ try {
   console.log(`  Aluno B: ${users.studentB.email} (${maskId(studentB.id)})`);
   console.log(`  Admin: ${users.admin.email} (${maskId(created.admin.id)})`);
   console.log(`  Bloqueada: ${users.blocked.email} (${maskId(created.blocked.id)})`);
+  console.log("  Email externo: desativado nas 6 contas E2E; avisos internos ativos");
   console.log("Nenhuma senha, chave, JWT ou cookie foi impresso.");
 } catch (error) {
   console.error(`Setup E2E recusado/falhou: ${summarizeError(error)}`);

@@ -135,6 +135,22 @@ function section(title) {
 /** Mascara identificadores nos registos: úteis para depurar, inúteis para vazar. */
 const mask = (value) => (typeof value === "string" ? `${value.slice(0, 8)}…` : String(value));
 
+function currentQuietWindow(timeZone, durationMinutes = 5) {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone,
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(new Date());
+  const hour = Number(parts.find((part) => part.type === "hour")?.value);
+  const minute = Number(parts.find((part) => part.type === "minute")?.value);
+  const start = hour * 60 + minute;
+  const end = (start + durationMinutes) % (24 * 60);
+  const format = (total) =>
+    `${String(Math.floor(total / 60)).padStart(2, "0")}:${String(total % 60).padStart(2, "0")}`;
+  return { start: format(start), end: format(end) };
+}
+
 // ── Sessão real, pelo formulário real ───────────────────────────────────────
 
 /**
@@ -757,10 +773,18 @@ async function createReschedulableLesson(client) {
         .maybeSingle()
     : { data: null };
 
-  const target = await findFreeSlot(client, {
+  let target = await findFreeSlot(client, {
     skipDays: [origin.day],
     maxDay: reservedPackage?.expires_on ?? null,
   });
+  // Prefere outro dia, mas um pacote que expire cedo pode cobrir apenas o dia
+  // da origem. Outro horário livre nesse dia continua a ser um reagendamento
+  // válido e preserva toda a cobertura transacional e de interface do cenário.
+  if (!target) {
+    target = await findFreeSlot(client, {
+      maxDay: reservedPackage?.expires_on ?? null,
+    });
+  }
   if (!target) {
     console.log("  · fixture de reagendamento: sem destino livre dentro da validade do pacote");
     return null;
@@ -1821,8 +1845,11 @@ async function studentNotificationsScenario(browser, apiClient) {
       .filter({ hasText: "Aula marcada" })
       .first();
     const oldText = (await oldCard.count()) > 0 ? await oldCard.innerText() : "";
+    const displayDate = (day) => day.split("-").reverse().join("/");
+    const oldMoment = `${displayDate(slot.day)} às ${slot.time}`;
+    const destinationMoment = `${displayDate(destination.day)} às ${destination.time}`;
     check(
-      oldText.includes(slot.time) && !oldText.includes(destination.time),
+      oldText.includes(oldMoment) && !oldText.includes(destinationMoment),
       "O aviso de criação continua a mostrar o horário antigo",
       oldText.replace(/\s+/g, " ").slice(0, 140),
     );
@@ -2484,8 +2511,19 @@ async function preferencesScenario(browser, apiClient) {
   await page.getByRole("heading", { name: "Avisos e lembretes" }).first().waitFor({
     timeout: 20_000,
   });
+  const ownProfile = await preferenceClient
+    .from("profiles")
+    .select("timezone")
+    .eq("id", preferenceProfileId)
+    .single();
+  if (ownProfile.error || !ownProfile.data) {
+    throw new Error(`Ler fuso horário do aluno: ${ownProfile.error?.message}`);
+  }
+  const safeQuietWindow = currentQuietWindow(ownProfile.data.timezone);
+  await page.locator('input[name="quietHoursStart"]').fill(safeQuietWindow.start);
+  await page.locator('input[name="quietHoursEnd"]').fill(safeQuietWindow.end);
   await page.locator('input[name="emailEnabled"]').check();
-  await submitNotificationPreferences(page, "Voltar a ligar o email");
+  await submitNotificationPreferences(page, "Voltar a ligar o email em silencio");
 
   const slotOn = billable ? await findFreeSlot(apiClient) : null;
   let onLessonId = null;
@@ -2539,6 +2577,19 @@ async function preferencesScenario(browser, apiClient) {
   check(
     revived[0]?.status === "skipped",
     "Voltar a ligar não ressuscita a entrega já suprimida",
+  );
+
+  await page.goto(`${BASE_URL}/aluno/perfil`, { waitUntil: "domcontentloaded" });
+  await page.getByRole("heading", { name: "Avisos e lembretes" }).first().waitFor({
+    timeout: 20_000,
+  });
+  await page.locator('input[name="emailEnabled"]').uncheck();
+  await page.locator('input[name="quietHoursStart"]').fill("");
+  await page.locator('input[name="quietHoursEnd"]').fill("");
+  await submitNotificationPreferences(page, "Restaurar isolamento do email E2E");
+  check(
+    !(await page.locator('input[name="emailEnabled"]').isChecked()),
+    "O cenário restaura o email externo desligado pela própria interface",
   );
 
   // ── 390px ──
@@ -2907,6 +2958,46 @@ async function cleanUpFixtures(account) {
   check(true, `Fixtures deste guião arrumadas (${cleaned})`);
 }
 
+async function restoreEmailIsolation(account) {
+  const client = createClient(env.NEXT_PUBLIC_SUPABASE_URL, env.NEXT_PUBLIC_SUPABASE_ANON_KEY, {
+    auth: { autoRefreshToken: false, persistSession: false },
+  });
+  let authData = null;
+  for (let attempt = 1; attempt <= 3 && !authData?.user; attempt += 1) {
+    const result = await client.auth.signInWithPassword({
+      email: account.email,
+      password: account.password,
+    });
+    authData = result.data;
+    if (!authData.user && attempt < 3) {
+      await new Promise((resolve) => setTimeout(resolve, attempt * 2_000));
+    }
+  }
+  if (!authData?.user) {
+    throw new Error(`Nao foi possivel restaurar o isolamento E2E de ${account.role}.`);
+  }
+
+  try {
+    const { data, error } = await client
+      .from("notification_preferences")
+      .update({ email_enabled: false, in_app_enabled: true })
+      .eq("profile_id", authData.user.id)
+      .select("email_enabled, in_app_enabled")
+      .single();
+    if (error || data?.email_enabled !== false || data?.in_app_enabled !== true) {
+      throw new Error(`O isolamento E2E de ${account.role} nao ficou persistido.`);
+    }
+  } finally {
+    await client.auth.signOut().catch(() => {});
+  }
+}
+
+async function restoreBrowserEmailIsolation() {
+  await restoreEmailIsolation(ACCOUNTS.teacher);
+  await restoreEmailIsolation(ACCOUNTS.student);
+  check(true, "Email externo voltou a ficar desativado nas contas do browser E2E");
+}
+
 const consoleErrors = [];
 
 async function main() {
@@ -2992,7 +3083,11 @@ async function main() {
       consoleErrors.slice(0, 3).join(" | "),
     );
   } finally {
-    await browser.close();
+    try {
+      await browser.close();
+    } finally {
+      await restoreBrowserEmailIsolation();
+    }
   }
 
   await lessons.client.auth.signOut().catch(() => {});

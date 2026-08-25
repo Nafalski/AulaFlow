@@ -449,8 +449,8 @@ A estrutura fica pronta para notificações push (Fase 8).
 | **5** | Calendário e criação de aulas, com reserva de créditos | **Concluído** — disponibilidade, calendário, clubes, locais, recursos, criação/edição de aulas, conflitos atómicos, reserva atómica de créditos, recorrência semanal segura e revisão integrada |
 | **6** | Cancelamento, reagendamento, presenças, histórico | **Concluída** — 6A/6B: presença, falta/no-show, conclusão normal/mista e cancelamentos com `reserved -> available` ou `reserved -> used` seguros. 6C.1/1A/1B: contrato transacional de reagendamento, chave de idempotência obrigatória e concorrência real provada. 6C.2: interface operacional, com editar conteúdo e reagendar colocação separados no PostgreSQL |
 | **7** | Área do aluno: aulas, saldo, confirmação da participação | **Concluída** — 7A: contrato de confirmação individual, com `requires_confirmation` ligado, escrita direta fechada e RSVP separado de presença. 7B: o professor pede ao criar, o aluno responde pela própria participação, provado em browser e mobile |
-| **8** | Notificações, lembretes e expiração agendada | **8A e 8B concluídas; 8C implementada e por fechar** — a fundação da Fase 1 foi ligada (producers por trigger, caixa in-app, lida/por ler e contador) e o agendador `pg_cron` corre de hora a hora com lembretes de 24 h e 2 h, saldo baixo por episódio, pacote a expirar e expiração automática em datas civis de Lisboa. A 8C entrega o outbox transacional, o worker em Edge Function, as preferências por tipo e as horas de silêncio, validados contra fornecedor simulado — falta a verificação com credencial real. Falta ainda a 8D (revisão integrada da Fase 8) |
-| **9** | Supabase real, concorrência, acessibilidade, deployment | **Parcialmente concluído** — Supabase/Auth reais validados até à 8B (540 verificações, verdes em duas execuções consecutivas); 954 verificações de esquema em PGlite; agendador `pg_cron` instalado e provado no remoto, incluindo duas execuções em paralelo sem duplicar; browser automatizado com sessão GoTrue real, verde em dev e em build de produção; deployment pendente |
+| **8** | Notificações, lembretes e expiração agendada | **8A, 8B e 8C concluídas em DEV** — a fundação da Fase 1 foi ligada (producers por trigger, caixa in-app, lida/por ler e contador), o agendador `pg_cron` corre de hora a hora e o worker de email corre ao minuto. A 8C fechou o outbox transacional, a Edge Function, as preferências, as horas de silêncio, o envio real controlado e a operação permanente do cron em desenvolvimento. Falta a 8D (revisão integrada da Fase 8); a Fase 8 como um todo continua em curso |
+| **9** | Supabase real, concorrência, acessibilidade, deployment | **Parcialmente concluído** — Supabase/Auth reais validados até à 8C (612 verificações, verdes em execuções consecutivas); 1.111 verificações de esquema em PGlite; os dois jobs `pg_cron`, `pg_net` e a Edge Function estão provados no DEV; browser automatizado com sessão GoTrue real, verde em dev e em build de produção; fechamento geral de deployment continua pendente |
 
 A ordem segue as prioridades pedidas: primeiro a área do professor ao computador, depois as regras seguras de créditos, depois o aluno no telemóvel.
 
@@ -1352,7 +1352,7 @@ Corrigir a validade **rearma** o aviso: a chave de "a expirar" inclui `expires_o
 
 `run_scheduled_notifications()` não tem `EXECUTE` para `authenticated`, `anon` nem `PUBLIC`. Nenhuma Server Action o chama e nenhum formulário envia um instante. Um parâmetro de relógio ao alcance do browser deixaria qualquer pessoa adiantar o tempo do domínio e expirar o pacote de outra. A suite Auth recusa-o explicitamente a aluno, professor, admin e anónimo — incluindo com um `p_now` forjado.
 
-### Implementado na Etapa 8C — email transacional pelo outbox
+### Concluído na Etapa 8C — email transacional pelo outbox
 
 A decisão D-07 estava escrita desde a Fase 1 e explicava-se a si própria: *com envio direto, uma falha da API de email faria falhar a operação inteira*. `notification_deliveries` era esse outbox, criado e nunca usado. A 8C ligou-o.
 
@@ -1396,11 +1396,13 @@ O RLS continua a decidir **quais linhas** pertencem à sessão, mas deixou de se
 
 O catálogo local e remoto fixa essa fronteira, e os testes Auth/PostgREST tentam explicitamente contorná-la com JWT real de aluno, professor, administrador, conta bloqueada e anónimo. O hardening anterior de `lessons.private_notes` e `student_profiles.notes` foi preservado, não refeito.
 
-#### O que ficou por verificar
+#### Fechamento operacional em DEV
 
-O projeto de desenvolvimento **não tem `RESEND_API_KEY`, remetente verificado nem os segredos da Edge Function configurados**, e criar uma conta no fornecedor em nome do utilizador não é decisão de quem implementa. Toda a lógica está validada contra um transporte simulado — sucesso, 429, 500, falha de rede, 422 definitivo, limite de tentativas, arrendamento expirado e concorrência —, mas **não houve envio real**.
+A **8C está formalmente fechada no projeto de desenvolvimento**. A Edge Function foi publicada e a autenticação do worker foi provada nos três caminhos: token ausente e token errado recebem `401`; o token correto chega ao handler. O percurso real `pg_net -> Edge Function -> Resend` enviou apenas para o endereço oficial de teste `delivered@resend.dev`, gravou `sent`, uma tentativa, `provider_message_id` e `sent_at`, e limpou o ownership. Repetir a operação não duplicou o envio, e a chave estável devolveu a mesma operação no fornecedor. Nenhum utilizador real do AulaFlow foi contactado.
 
-Por isso a **8C não está formalmente fechada**. Falta: configurar os segredos, publicar a Edge Function no projeto de desenvolvimento, e um envio de teste para um endereço de teste do fornecedor, confirmando `provider_message_id` e que a repetição não duplica.
+O bloqueio operacional encontrado no fecho eram **2.322 entregas antigas** das seis fixtures E2E para o domínio reservado `aulaflow.test`. Foram classificadas por domínio, perfil/Auth e identidade exata, e depois preservadas como histórico terminal `skipped`, sem forjar envio nem apagar notificações. O setup E2E passa a normalizar essas seis contas com email externo desligado e avisos internos ativos; o browser restaura o mesmo estado mesmo depois de testar temporariamente a preferência ligada.
+
+O Vault de DEV conserva `aulaflow_email_worker_url` e `aulaflow_email_worker_token`. Os dois jobs permanecem únicos e ativos, e ciclos automáticos consecutivos do worker chegaram à função real com HTTP `200` e `claimed = 0`. A ativação fica permanente em DEV. A **8D continua pendente**, portanto a Fase 8 como um todo ainda não está concluída.
 
 #### Defeito pré-existente encontrado pela cobertura nova
 
@@ -1408,7 +1410,7 @@ O bloqueio intermitente do formulário em "A guardar…" foi fechado no contrato
 
 #### O que a 8B deliberadamente não faz
 
-Nenhum envio: nem email, nem push, nem WhatsApp. O agendador escreve em tabelas; a entrega externa é a 8C e é trabalho de um worker que lê o outbox. `notification_preferences` governa **entrega**, e por isso continua sem ser lida por ninguém. Não há aviso ao professor, não há limiar configurável por organização e não há cancelamento automático de nada.
+O agendador da 8B não envia por si: escreve em tabelas, e a entrega externa pertence ao worker da 8C. `notification_preferences` governa **entrega** e é reavaliada pelo worker. Push e WhatsApp continuam fora do âmbito. Não há aviso ao professor, não há limiar configurável por organização e não há cancelamento automático de nada.
 
 ### Fase 2 — estado por item
 
@@ -1421,10 +1423,10 @@ Nenhum envio: nem email, nem push, nem WhatsApp. O agendador escreve em tabelas;
 | Claim automático por email confirmado | **Concluído** | Idempotente, com bloqueio de linha, isolamento, recusa de ambiguidade e de fichas ligadas/inativas |
 | Código de convite legado | **Desativado** | Valores eliminados, coluna limitada a `NULL`, sem GRANT e parâmetro recusado; nunca voltou a ser uma credencial |
 | Preparação de ligação | **Concluído (estado)** | Registo administrativo sem token, URL ou segredo; a interface não afirma envio de email |
-| Preferências de notificação | **Concluído** | Persistência de canais/eventos; entrega automática continua planeada para a Fase 8 |
+| Preferências de notificação | **Concluído** | Persistência de canais/eventos e entrega automática pelo outbox concluídas nas Etapas 8A–8C |
 | Diretório administrativo | **Concluído** | Pesquisa, filtros, professores, detalhe, estados vazios/erro/loading e resposta mobile/desktop |
 | Bloqueio e reativação | **Concluído** | RPC exclusiva de admin, sem auto-bloqueio, motivo, auditoria e revogação efetiva por RLS |
-| Validação num Supabase remoto | **Concluído para as Fases 4, 5, 6, 7, 8A e 8B** | Migrações, catálogo remoto, GoTrue/Auth, JWT/PostgREST, contas reais, calendário seguro, aulas, conflitos, reserva, recorrência, presença, conclusão, privacidade e concorrência validados por RPC/Auth real |
+| Validação num Supabase remoto | **Concluído até à Etapa 8C** | Migrações, catálogo remoto, GoTrue/Auth, JWT/PostgREST, contas reais, calendário seguro, aulas, conflitos, reserva, recorrência, presença, conclusão, notificações, email controlado, privacidade e concorrência validados por RPC/Auth real |
 
 ### Concluído na Fase 2
 
@@ -1450,11 +1452,9 @@ Nenhum envio: nem email, nem push, nem WhatsApp. O agendador escreve em tabelas;
 ### Limitações ainda ativas
 
 - **Não há upload de avatar.** Não existe bucket de Storage nem política de objetos; a interface usa iniciais e explica a limitação.
-- **Preferências de email não significam entrega automática.** Ficam persistidas, mas outbox/worker e lembretes agendados chegam na Fase 8.
 - **Preparar uma ligação não envia email.** A Fase 3 guarda apenas um estado auditável e sem segredo; entrega real por email continua fora desta etapa, embora o claim/Auth real já esteja coberto pelos testes remotos de desenvolvimento.
 - **A interface de pacotes ainda é parcial.** `/professor/pacotes` gere modelos, atribuição, consulta, ajustes administrativos e histórico; `/aluno/pacotes` mostra os próprios pacotes. Transferências/fusões/divisões continuam pendentes; consumo e libertação de créditos já acontecem através das aulas.
-- **A expiração de pacotes não é automática.** `refresh_package_status()` marca `expired` quando é chamada, mas nada corre à meia-noite. Precisa de uma tarefa agendada — Fase 8, com os lembretes.
-- **`credit_expired` e `credit_transferred_*` existem no enum mas não têm função.** Ficam para quando a expiração automática e a transferência entre pacotes forem implementadas numa fase futura.
+- **`credit_expired` e `credit_transferred_*` existem no enum mas não têm função.** A expiração automática não movimenta créditos; os tipos de transferência ficam para quando houver transferência entre pacotes.
 - **A validação remota já cobre concorrência real de aulas/créditos/recorrência/conclusão.** `db:verify:auth` abre sessões reais paralelas para disputar o último crédito, combinar conflito de agenda com reserva, testar séries incompatíveis, dupla conclusão e conclusão contra edição; a 6B acrescenta double cancel, cancel x complete, participant cancel x lesson cancel e no-show x complete. Deployment e auditoria completa de acessibilidade continuam fora desta etapa.
 - **Server Actions do ciclo operacional continuam sem 6C.** Criar aula reserva créditos; a 6A marca presença/conclui aula normal; a 6B cancela aula, cancela participação de turma, marca falta/no-show e conclui turma mista. Reagendamento operacional continua para a Fase 6C.
 

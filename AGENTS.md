@@ -316,7 +316,7 @@ Alvo: WCAG 2.1 AA. Os componentes de `components/ui/` já resolvem o essencial �
 - `claim_student_profile()` corre em `getSessionUser()` apenas depois de `auth.getUser()`, para uma conta de aluno ainda sem ficha. Email não confirmado, ambiguidade, ficha inativa/ligada ou conta bloqueada são recusados.
 - O código de convite legado está definitivamente desativado: a coluna aceita apenas `NULL`, não tem GRANT e o parâmetro legado é recusado. Não o reativar.
 - Sem bucket de Storage, o avatar é composto por iniciais. Não acrescentar um upload que não consiga persistir.
-- Preferências de avisos já persistem; envio externo e tarefas agendadas continuam na Fase 8.
+- Preferências de avisos, tarefas agendadas e envio externo pelo outbox estão concluídos nas Etapas 8A–8C; preservar a separação entre facto in-app e entrega.
 
 ### Gestão operacional (Fase 3)
 
@@ -612,7 +612,7 @@ Não existe forma de ligar ou desligar o pedido numa aula **já criada**, e é d
 
 **As preferências governam ENTREGA, não a existência do facto.** O comentário da Fase 1 já o dizia — as horas de silêncio adiam o "empurrar", não escondem. Na 8A a notificação in-app é sempre escrita; os booleanos por tipo e por canal passam a ser lidos pelo worker de email na 8C. Nenhum valor por omissão foi alterado.
 
-**Ainda não implementado (8C):** entrega por email a partir do outbox. Push fica para depois; WhatsApp continua fora do MVP.
+**Implementado na 8C:** entrega por email a partir do outbox, com preferências, horas de silêncio, lease, recuo e idempotência. Push fica para depois; WhatsApp continua fora do MVP.
 
 ### O agendador (Etapa 8B)
 
@@ -715,6 +715,8 @@ Quem desliga o email entre as duas decisões não recebe o que estava em fila �
 **O conteúdo vem do snapshot.** O `claim` não faz JOIN a `lessons`: um aviso de criação escrito às 18:00 não passa a dizer 20:00 porque a aula foi reagendada. Todo o texto dinâmico é escapado antes de entrar em HTML; não há imagens remotas, pixel de rastreio nem scripts. Os links vão para `/aluno/notificacoes` e `/aluno/perfil` — rotas que existem — e nunca levam token.
 
 **Dois jobs, porque são dois trabalhos.** `aulaflow-scheduled-notifications` (`5 * * * *`) produz factos; `aulaflow-email-worker` (`* * * * *`) consome o outbox. Juntá-los amarraria a produção de factos à latência do fornecedor. O job de email chama `dispatch_email_worker()`, que lê URL e token do **Vault** e faz o POST por `pg_net`. Nenhum segredo entra numa migração.
+
+**Fechamento operacional DEV concluído.** A Edge Function e a autenticação do worker foram provadas; o envio real usou apenas `delivered@resend.dev`, a idempotência do Resend devolveu a mesma operação e nenhum utilizador real foi contactado. As 2.322 entregas antigas das seis fixtures E2E foram preservadas como `skipped`, sem apagar notificações nem forjar envios. O setup e o teardown do browser deixam email externo desligado nessas contas e avisos in-app ativos. `aulaflow_email_worker_url` e `aulaflow_email_worker_token` permanecem no Vault, e ciclos automáticos consecutivos responderam HTTP 200 com `claimed = 0`. A 8D continua pendente.
 
 **O 409 do fornecedor não se lê pelo estado.** O Resend usa-o para duas coisas opostas, e distingue-as pelo nome estruturado do erro: `concurrent_idempotent_requests` é transitório e volta a ser tentado; `invalid_idempotent_request` — mesma chave, corpo diferente — não melhora com repetição e falha logo. Um 409 desconhecido é tratado como transitório, porque a incerteza aqui é sobre concorrência e o limite de cinco tentativas impede o ciclo. Lê-se o campo, nunca uma substring da mensagem.
 
@@ -1078,7 +1080,7 @@ Interface em `/professor/clubes/[id]/calendario`, com filtro por professor no UR
 
 **Não implementado:** aulas, participantes, locais, campos, recursos, conflitos, reservas e créditos. Os únicos estados são disponível e indisponível — não escrever "ocupado", "reservado", "lotado", "vagas" ou "conflito", porque nada disso existe ainda para ser verdade.
 
-Ordem atual: Fases 6 e 7 concluídas; 8A e 8B fechadas. A 8C está implementada e validada de ponta a ponta contra um fornecedor simulado — falta a verificação com credencial real do fornecedor, e por isso **não está formalmente fechada**. A revisão integrada da Fase 8 (8D) continua pendente.
+Ordem atual: Fases 6 e 7 concluídas; 8A, 8B e 8C fechadas. A 8C está validada de ponta a ponta em DEV, incluindo Edge Function, autenticação, Resend real controlado, idempotência, Vault e cron/pg_net. A revisão integrada da Fase 8 (8D) continua pendente, portanto a Fase 8 ainda não está concluída como um todo.
 
 ### `src/types/database.ts`
 
@@ -1116,8 +1118,8 @@ Não existe um comando de formatação separado. Use `npm run lint:fix` apenas p
 | 5 | Calendário e criação de aulas com reserva | **Concluído** — disponibilidade, projeção segura, refinamento visual, clubes/membros, calendário partilhado, locais com moradas manuais, campos/salas/áreas, criação/edição de aulas, conflitos atómicos, reserva atómica de créditos, recorrência semanal segura e revisão integrada |
 | 6 | Cancelamento, reagendamento, presenças e histórico | **Concluído** — 6A/6B: presença, falta/no-show, conclusão normal/mista, cancelamento de aula e de participação com `reserved -> available` ou `reserved -> used` seguros. 6C.1/6C.1A/6C.1B: contrato transacional de reagendamento, chave de idempotência obrigatória em namespace próprio e sete corridas de concorrência com JWTs reais. 6C.2: interface operacional, com a fronteira entre editar conteúdo e reagendar colocação imposta no PostgreSQL |
 | 7 | Área do aluno: aulas, créditos e confirmação | **Concluído** — 7A: contrato de confirmação individual, com `requires_confirmation` ligado, escrita direta na resposta fechada e RSVP separado de presença. 7B: o professor pede confirmação ao criar, o aluno responde pela sua própria participação, validado em browser e mobile |
-| 8 | Notificações, lembretes e expiração agendada | **Em curso** — 8A: producers dos eventos de aula, caixa in-app do aluno, lida/por ler e contador. 8B: agendador `pg_cron` de hora a hora, lembretes de 24 h e 2 h, saldo baixo por episódio, pacote a expirar e expiração automática em datas civis de Lisboa. 8C: outbox materializado por trigger na mesma transação, worker em Edge Function, preferências por tipo, horas de silêncio no fuso da conta, recuo, arrendamento e idempotência do fornecedor — **por fechar até haver credencial real do fornecedor**. Falta a 8D (revisão integrada) |
-| 9 | Supabase real, concorrência, acessibilidade e deployment | **Parcialmente concluído** — RLS em PGlite e validação real com JWTs até à Fase 8B; concorrência real de aulas, créditos, recorrência, conclusão, reagendamento e confirmação coberta; browser em dev e em build de produção; deployment pendente |
+| 8 | Notificações, lembretes e expiração agendada | **Em curso** — 8A: producers dos eventos de aula, caixa in-app do aluno, lida/por ler e contador. 8B: agendador `pg_cron` de hora a hora, lembretes de 24 h e 2 h, saldo baixo por episódio, pacote a expirar e expiração automática em datas civis de Lisboa. 8C: **concluída em DEV**, com outbox, worker em Edge Function, preferências, horas de silêncio, recuo, ownership, Resend real controlado, idempotência e cron permanente. Falta a 8D (revisão integrada) |
+| 9 | Supabase real, concorrência, acessibilidade e deployment | **Parcialmente concluído** — RLS em PGlite e validação real com JWTs até à Etapa 8C; concorrência real de aulas, créditos, recorrência, conclusão, reagendamento, confirmação e outbox coberta; Edge Function e cron ativos em DEV; browser em dev e em build de produção; fechamento geral de deployment pendente |
 
 **Ao concluir uma fase ou etapa:** `npm run check`, corrigir tudo o que falhe, atualizar `implementation_plan.md`, e resumir o que foi criado e como testar manualmente.
 
