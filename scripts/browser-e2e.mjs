@@ -135,7 +135,36 @@ function section(title) {
 /** Mascara identificadores nos registos: úteis para depurar, inúteis para vazar. */
 const mask = (value) => (typeof value === "string" ? `${value.slice(0, 8)}…` : String(value));
 
-function currentQuietWindow(timeZone, durationMinutes = 5) {
+/**
+ * Quatro horas, e não cinco minutos.
+ *
+ * O cenário liga o email da conta E2E durante alguns segundos para provar que um
+ * facto novo entra na fila de envio, e volta a desligá-lo a seguir. Entre as
+ * duas coisas, o `aulaflow-email-worker` do DEV passa AO MINUTO: qualquer
+ * intervalo em que o email esteja ligado é uma corrida, e a janela de silêncio é
+ * o que a ganha.
+ *
+ * Cinco minutos chegavam quando tudo corria bem. Mas o que se passa entre ligar
+ * e desligar não é instantâneo — criar a aula, três consultas que saem para a
+ * CLI do Supabase com repetição e recuo, e várias navegações com esperas de 20 a
+ * 30 segundos. Um remoto lento multiplica isso, e a janela acabava antes do
+ * teardown.
+ *
+ * Pior ainda é o processo morrer entre as duas coisas: aí o `finally` não corre,
+ * `email_enabled` fica `true`, e a janela passa a ser a ÚNICA proteção. Quatro
+ * horas dão margem para alguém reparar, e continuam a expirar sozinhas — uma
+ * janela esquecida não silencia aquela conta para sempre.
+ *
+ * A hora de início é truncada ao minuto, o que faz a janela começar mais cedo do
+ * que agora: é o lado seguro do arredondamento. Atravessar a meia-noite não é
+ * problema — `email_delivery_schedule()` trata `start > end` como o intervalo
+ * noturno e cobre `clock >= start` mais `clock < end`. E o `% 1440` só produziria
+ * `start = end` — que a constraint recusa — para durações múltiplas de um dia
+ * inteiro; o `clamp` torna isso impossível.
+ */
+const E2E_QUIET_WINDOW_MINUTES = 4 * 60;
+
+function currentQuietWindow(timeZone, durationMinutes = E2E_QUIET_WINDOW_MINUTES) {
   const parts = new Intl.DateTimeFormat("en-GB", {
     timeZone,
     hour: "2-digit",
@@ -144,8 +173,9 @@ function currentQuietWindow(timeZone, durationMinutes = 5) {
   }).formatToParts(new Date());
   const hour = Number(parts.find((part) => part.type === "hour")?.value);
   const minute = Number(parts.find((part) => part.type === "minute")?.value);
+  const span = Math.min(Math.max(Math.round(durationMinutes), 1), 24 * 60 - 1);
   const start = hour * 60 + minute;
-  const end = (start + durationMinutes) % (24 * 60);
+  const end = (start + span) % (24 * 60);
   const format = (total) =>
     `${String(Math.floor(total / 60)).padStart(2, "0")}:${String(total % 60).padStart(2, "0")}`;
   return { start: format(start), end: format(end) };
@@ -2996,6 +3026,40 @@ async function restoreBrowserEmailIsolation() {
   await restoreEmailIsolation(ACCOUNTS.teacher);
   await restoreEmailIsolation(ACCOUNTS.student);
   check(true, "Email externo voltou a ficar desativado nas contas do browser E2E");
+
+  // ── E nenhuma entrega E2E fica em condições de sair ──
+  //
+  // A entrega criada com o email ligado continua `pending`: só uma passagem do
+  // worker lhe muda o estado, e nada a reclamou ainda. Estar pendente não é o
+  // problema — o problema seria estar ENVIÁVEL. Com `email_enabled = false`
+  // restaurado, `email_delivery_block_reason()` devolve `email_disabled` para
+  // todas elas, e o primeiro claim que lhes tocar marca-as `skipped`.
+  //
+  // É a decisão do próprio produto que se verifica aqui, e não um estado forçado
+  // à mão: por isso a consulta chama a mesma função que o worker chamaria.
+  const residue = await queryDatabase(
+    `select
+       count(*)::int as pendentes,
+       count(*) filter (
+         where public.email_delivery_block_reason(n.recipient_profile_id, n.type) is null
+       )::int as enviaveis
+     from public.notification_deliveries d
+     join public.notifications n on n.id = d.notification_id
+     where d.channel = 'email'
+       and d.status = 'pending'
+       and d.recipient_email like '%@aulaflow.test'`,
+  ).catch(() => null);
+
+  if (residue === null) {
+    check(false, "O resíduo do outbox E2E é verificável");
+    return;
+  }
+
+  check(
+    residue[0]?.enviaveis === 0,
+    "Nenhuma entrega para @aulaflow.test fica em condições de ser enviada",
+    `${residue[0]?.enviaveis} enviáveis em ${residue[0]?.pendentes} pendentes`,
+  );
 }
 
 const consoleErrors = [];
