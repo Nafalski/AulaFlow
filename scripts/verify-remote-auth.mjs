@@ -4047,14 +4047,19 @@ try {
     }
   };
 
-  const retireStalePhase6OperationalLessons = async () => {
+  const retireStaleOperationalLessons = async () => {
     const staleLessons = await teacherClient
       .from("teacher_lesson_schedule_records")
       .select("id, title, status")
       .in("status", ["scheduled", "confirmed"])
-      .or("title.ilike.Aula E2E 6A%,title.ilike.Serie E2E 6A%,title.ilike.Aula E2E 6B%,title.ilike.Serie E2E 6B%,title.ilike.Aula E2E 6C%");
+      .or(
+        "title.ilike.Aula E2E 6A%,title.ilike.Serie E2E 6A%," +
+          "title.ilike.Aula E2E 6B%,title.ilike.Serie E2E 6B%," +
+          "title.ilike.Aula E2E 6C%,title.ilike.Aula E2E 8A%," +
+          "title.ilike.Aula E2E 8B%,title.ilike.Aula E2E 8C%",
+      );
     if (staleLessons.error) {
-      throw new Error(`Limpar fixtures 6A/6B/6C: ${summarizeError(staleLessons.error)}`);
+      throw new Error(`Limpar fixtures operacionais: ${summarizeError(staleLessons.error)}`);
     }
 
     for (const staleLesson of staleLessons.data ?? []) {
@@ -4086,12 +4091,10 @@ try {
       }
     }
 
-    if ((staleLessons.data ?? []).length > 0) {
-      ok(`Fixtures operacionais antigas 6A/6B canceladas (${staleLessons.data.length})`);
-    }
+    ok(`Fixtures operacionais antigas canceladas (${staleLessons.data?.length ?? 0})`);
   };
 
-  await retireStalePhase6OperationalLessons();
+  await retireStaleOperationalLessons();
   await retireStalePhase6TeacherBLessons();
 
   const createPhase6Lesson = async ({ index, title, date = phase6PastDate, studentId = studentsA.id, groupId = null }) => {

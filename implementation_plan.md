@@ -450,7 +450,7 @@ A estrutura fica pronta para notificações push (Fase 8).
 | **6** | Cancelamento, reagendamento, presenças, histórico | **Concluída** — 6A/6B: presença, falta/no-show, conclusão normal/mista e cancelamentos com `reserved -> available` ou `reserved -> used` seguros. 6C.1/1A/1B: contrato transacional de reagendamento, chave de idempotência obrigatória e concorrência real provada. 6C.2: interface operacional, com editar conteúdo e reagendar colocação separados no PostgreSQL |
 | **7** | Área do aluno: aulas, saldo, confirmação da participação | **Concluída** — 7A: contrato de confirmação individual, com `requires_confirmation` ligado, escrita direta fechada e RSVP separado de presença. 7B: o professor pede ao criar, o aluno responde pela própria participação, provado em browser e mobile |
 | **8** | Notificações, lembretes e expiração agendada | **Concluída em DEV — 8A, 8B, 8C e 8D fechadas.** Producers transacionais por trigger, caixa in-app, agendador `pg_cron`, outbox, preferências, horas de silêncio, lease com ownership, Edge Function e transporte Resend foram revistos como uma cadeia integrada. A revisão 8D não encontrou regressão funcional ou de segurança e não exigiu alteração de runtime |
-| **9** | Supabase real, concorrência, acessibilidade, deployment | **Parcialmente concluído** — Supabase/Auth reais validados até ao fechamento da 8D (666 verificações, verdes em duas execuções consecutivas); 1.113 verificações de esquema em PGlite; os dois jobs `pg_cron`, `pg_net` e a Edge Function estão provados no DEV; browser automatizado com sessão GoTrue real, verde em dev e em build de produção; fechamento geral de deployment continua pendente |
+| **9** | Supabase real, concorrência, acessibilidade, deployment | **9A concluída; fase aberta** — auditoria de prontidão fechada no repositório e no DEV público. Supabase/Auth, catálogo, cron, `pg_net`, Edge, PWA e browser foram revistos; os P1 internos demonstrados foram corrigidos. Criar e validar os recursos externos de produção continua pendente e o lançamento não começou |
 
 A ordem segue as prioridades pedidas: primeiro a área do professor ao computador, depois as regras seguras de créditos, depois o aluno no telemóvel.
 
@@ -1417,6 +1417,18 @@ O fechamento passou com 601 testes Vitest, 1.113 verificações PostgreSQL locai
 #### Defeito pré-existente encontrado pela cobertura nova
 
 O bloqueio intermitente do formulário em "A guardar…" foi fechado no contrato de runtime. A escrita no Supabase concluía, mas `revalidatePath()` anexava o novo RSC payload à mesma resposta da Server Action; quando esse Flight stream era abortado, `useActionState` nunca recebia o fim apesar de o valor já estar persistido. A Action de preferências passou a devolver apenas o estado serializável confirmado, e o formulário preserva os valores durante o reset automático do React 19. O browser exige agora que o pending termine sem reload, confronta cada um de dez submits consecutivos com uma leitura sob JWT real e cobre sucesso, validação, erro controlado, clique rápido, aluno, professor e 390 px.
+
+#### Auditoria de prontidão para produção — Etapa 9A
+
+A 9A mapeou todas as variáveis por audiência e runtime, separou explicitamente o DEV público do futuro ambiente de produção e reviu Auth, callbacks, cookies, headers, build Next, migrações, catálogo remoto, cron, `pg_net`, Vault, Edge Function, outbox, observabilidade, PWA e acessibilidade. O procedimento futuro, as dependências externas e a ordem segura de bootstrap ficaram registados em [`production_readiness.md`](production_readiness.md). Nenhum projeto, domínio, DNS, chave ou dado de produção foi criado ou alterado.
+
+Foram corrigidos três P1 demonstrados no repositório: `NEXT_PUBLIC_SITE_URL` deixou de cair silenciosamente em `localhost` quando `NODE_ENV=production`; os cookies SSR do Supabase passaram a usar `Secure` em produção, conservando `SameSite=Lax` e o acesso necessário ao cliente; e o Next passou a remover `X-Powered-By` e a enviar globalmente `nosniff`, proteção contra frames, referrer estrito e uma Permissions Policy mínima. CSP fica para uma implementação P2 com nonce compatível com Next e Server Actions.
+
+A repetição exigida do gate Auth encontrou ainda uma falha da própria fixture: aulas futuras 8B/8C permaneciam ativas, mas a limpeza só reconhecia títulos 6A–6C, esgotando a banda de datas depois de várias execuções. A rotina passou a cancelar também apenas os prefixos controlados `Aula E2E 8A/8B/8C`; duas execuções consecutivas voltaram a fechar em exatamente 666 verificações.
+
+O fechamento da 9A passou com 607 testes Vitest, 1.113 verificações PostgreSQL locais, build de produção, 115 verificações remotas de catálogo, 666 verificações Auth/PostgREST em duas execuções consecutivas e 245 verificações de browser tanto no servidor DEV como no build de produção local. O catálogo mantém 66 migrações locais/remotas alinhadas, `db push --dry-run` sem pendências, os dois jobs únicos ativos, Edge `ACTIVE` e ciclos recentes de cron/`pg_net` sem falhas observadas. O DEV público foi reservado para o smoke final do commit publicado.
+
+**Fase 8 permanece fechada. Etapa 9A fechada. Lançamento em produção não iniciado. Fase 9 aberta.**
 
 #### O que a 8B deliberadamente não faz
 

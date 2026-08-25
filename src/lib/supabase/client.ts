@@ -3,6 +3,7 @@
 import { createBrowserClient } from "@supabase/ssr";
 
 import { getPublicEnv } from "@/lib/env";
+import { authCookieOptions } from "@/lib/supabase/cookie-options";
 import type { Database } from "@/types/database";
 
 let client: ReturnType<typeof createBrowserClient<Database>> | null = null;
@@ -24,6 +25,7 @@ export function createSupabaseBrowserClient() {
   client = createBrowserClient<Database>(
     env.NEXT_PUBLIC_SUPABASE_URL,
     env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
+    { cookieOptions: authCookieOptions() },
   );
   return client;
 }

@@ -9,6 +9,7 @@ A começar pelo **beach tennis**, com arquitetura preparada para outras modalida
 > A **Etapa 6C.1** acrescenta o contrato transacional de reagendamento: a aula original fica histórica, a substituta herda participantes e reserva, e nenhum saldo se move. A **Etapa 6C.2** liga-o à aplicação e separa as duas intenções: editar muda conteúdo (título e observações), reagendar muda a colocação (data, hora, local, campo) e deixa rasto. A duração é preservada, e o reagendamento afeta apenas esta ocorrência. Repetições concorrentes da mesma intenção devolvem a mesma substituta; reutilizar a chave com outro destino continua a ser conflito. Reagendamento pelo aluno e alteração de série inteira continuam por implementar.
 > A **Fase 7** está concluída. Ao criar uma aula, o professor pode pedir confirmação aos participantes; o aluno vê o pedido na sua área e responde pela sua própria participação. Confirmar é RSVP — responde a "vou a esta aula", nunca a "estive nesta aula" — por isso não escreve presença nem move créditos. Numa série, cada aula é confirmada à parte; ao reagendar, a resposta e o `confirmed_at` original acompanham a aula nova, tenha ou não reserva ativa. Dizer que não vai e self-cancel continuam por implementar.
 > A **Fase 8 está concluída em DEV**. A 8A fechou a caixa in-app, a 8B os avisos agendados, a 8C o email transacional pelo outbox e a 8D reviu o percurso integrado desde o evento de domínio até ao fornecedor, incluindo privacidade, preferências, horas de silêncio, concorrência, cron e Edge Function.
+> A **auditoria de prontidão da Fase 9A está concluída**. O lançamento em produção não começou e a Fase 9 permanece aberta; a matriz de ambientes, os bloqueios externos e a ordem de bootstrap estão em [`production_readiness.md`](production_readiness.md).
 > Self-service de cancelamento do aluno, política configurável de janelas, pagamentos e transferência/fusão de pacotes continuam nas etapas seguintes.
 
 ---
@@ -112,12 +113,13 @@ npm run db:setup:e2e -- --confirm-development
 npm run db:verify:auth -- --confirm-development
 ```
 
-Confirme também no painel Supabase que o provider Email está ativo, a confirmação de email está ligada, o Site URL é `http://localhost:3000` e a Redirect URL inclui `http://localhost:3000/auth/callback`.
+No DEV local, confirme também no painel Supabase que o provider Email está ativo, a confirmação está ligada, o Site URL é `http://localhost:3000` e a Redirect URL inclui `http://localhost:3000/auth/callback`. Produção usa o seu próprio domínio HTTPS e nunca este valor local.
 
 ## Documentação
 
 | Ficheiro | Conteúdo |
 |---|---|
+| [`production_readiness.md`](production_readiness.md) | Matriz de ambientes, findings da 9A e bootstrap futuro de produção |
 | [`implementation_plan.md`](implementation_plan.md) | Arquitetura, modelo de dados, decisões técnicas e fases |
 | [`AGENTS.md`](AGENTS.md) | Estrutura, convenções, comandos e configuração |
 | [`.env.example`](.env.example) | Variáveis de ambiente necessárias |

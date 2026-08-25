@@ -73,7 +73,7 @@ Painel Supabase → **Project Settings → API**:
 |---|---|
 | `NEXT_PUBLIC_SUPABASE_URL` | Project URL |
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | chave `anon` / `public` |
-| `SUPABASE_SERVICE_ROLE_KEY` | chave `service_role` — **só para tarefas agendadas da Fase 8** |
+| `SUPABASE_SERVICE_ROLE_KEY` | chave `service_role` — **só para scripts E2E locais**; o runtime Next atual não a usa e a Edge recebe a sua cópia injetada |
 
 ### 3. Aplicar as migrações
 
@@ -96,6 +96,10 @@ Em **Authentication → URL Configuration**, acrescentar às *Redirect URLs*:
 http://localhost:3000/auth/callback
 https://SEU-DOMINIO/auth/callback
 ```
+
+O Site URL de produção e `NEXT_PUBLIC_SITE_URL` têm de usar esse mesmo domínio
+HTTPS. O checklist completo, incluindo Vercel, Edge, Vault, cron e Resend, está
+em [`production_readiness.md`](production_readiness.md).
 
 ### 5. Criar o primeiro administrador
 
