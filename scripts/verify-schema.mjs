@@ -33,6 +33,22 @@ import { fileURLToPath } from "node:url";
 
 const MIGRATIONS = join(dirname(fileURLToPath(import.meta.url)), "..", "supabase", "migrations");
 
+const INTERNAL_EXECUTE_BOUNDARY = [
+  "public.handle_new_user()",
+  "public.lesson_notification_when(timestamp with time zone)",
+  "public.lisbon_date(timestamp with time zone)",
+  "public.log_lesson_change()",
+  "public.notify_lesson_cancelled()",
+  "public.notify_lesson_participant_created()",
+  "public.notify_lesson_participation_cancelled()",
+  "public.prevent_lesson_delete()",
+  "public.prevent_package_audit_mutation()",
+  "public.set_updated_at()",
+  "public.sync_user_email()",
+  "public.validate_teacher_profile_defaults()",
+  "public.validate_teacher_sport_scope()",
+];
+
 let failures = 0;
 let assertions = 0;
 
@@ -147,6 +163,25 @@ check(
   unprotected.length === 0,
   `row level security ativo nas ${tableCount} tabelas`,
   `tabelas sem RLS: ${unprotected.map((t) => t.tablename).join(", ")}`,
+);
+
+const internalExecuteLeaks = await rows(
+  `select expected.signature
+     from unnest($1::text[]) expected(signature)
+     left join pg_proc proc on proc.oid = to_regprocedure(expected.signature)
+    where proc.oid is null
+       or has_function_privilege('anon', proc.oid, 'EXECUTE')
+       or has_function_privilege('authenticated', proc.oid, 'EXECUTE')
+       or coalesce((
+         select bool_or(privilege.grantee = 0 and privilege.privilege_type = 'EXECUTE')
+           from aclexplode(coalesce(proc.proacl, acldefault('f', proc.proowner))) privilege
+       ), false)`,
+  [INTERNAL_EXECUTE_BOUNDARY],
+);
+check(
+  internalExecuteLeaks.length === 0,
+  `as ${INTERNAL_EXECUTE_BOUNDARY.length} funções internas endurecidas recusam PUBLIC, anon e authenticated`,
+  `fronteira EXECUTE em falta: ${internalExecuteLeaks.map((entry) => entry.signature).join(", ")}`,
 );
 
 // `lessons` pode ser editada pelo professor, mas nunca apagada.
@@ -460,6 +495,14 @@ const teacher = await one(
 );
 
 check(teacher?.role === "teacher", "trigger criou perfil de professor e organização");
+
+await db.query(`update auth.users set email='prof.sync@exemplo.pt' where id=$1`, [TEACHER_UID]);
+check(
+  (await one(`select email from public.profiles where id=$1`, [TEACHER_UID])).email ===
+    "prof.sync@exemplo.pt",
+  "trigger sincroniza a alteração de email da conta com o perfil",
+);
+await db.query(`update auth.users set email='prof@exemplo.pt' where id=$1`, [TEACHER_UID]);
 
 const policy = await one(`select * from public.resolve_cancellation_policy($1)`, [teacher.id]);
 check(

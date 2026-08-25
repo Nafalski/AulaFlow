@@ -39,6 +39,22 @@ const PROJECTION_ONLY_TABLES = [
   "student_package_audit_events",
 ];
 
+const INTERNAL_EXECUTE_TARGETS = [
+  { name: "handle_new_user" },
+  { name: "lesson_notification_when", args: { p_starts_at: "2026-01-15T12:00:00Z" } },
+  { name: "lisbon_date", args: { p_moment: "2026-01-15T12:00:00Z" } },
+  { name: "log_lesson_change" },
+  { name: "notify_lesson_cancelled" },
+  { name: "notify_lesson_participant_created" },
+  { name: "notify_lesson_participation_cancelled" },
+  { name: "prevent_lesson_delete" },
+  { name: "prevent_package_audit_mutation" },
+  { name: "set_updated_at" },
+  { name: "sync_user_email" },
+  { name: "validate_teacher_profile_defaults" },
+  { name: "validate_teacher_sport_scope" },
+];
+
 let assertions = 0;
 let failures = 0;
 const created = {};
@@ -91,6 +107,43 @@ async function mustReject(label, run) {
   } catch (error) {
     ok(`${label} — recusado`);
     return error;
+  }
+}
+
+async function mustRejectFunctionAccess(label, run) {
+  try {
+    const result = await run();
+    const error = result?.error;
+    const code = String(error?.code ?? "");
+    const message = String(error?.message ?? "");
+    const refusedAtBoundary =
+      code === "42501" ||
+      code === "PGRST202" ||
+      /permission denied for function|could not find the function|schema cache/i.test(message);
+
+    if (error && refusedAtBoundary) {
+      ok(`${label} — recusado na fronteira EXECUTE`);
+      return;
+    }
+
+    if (error) {
+      fail(`${label} — chegou ao corpo ou falhou pela razao errada: ${summarizeError(error)}`);
+      return;
+    }
+
+    fail(`${label} — foi aceite, e nao devia`);
+  } catch (error) {
+    const code = String(error?.code ?? "");
+    const message = String(error?.message ?? error ?? "");
+    if (
+      code === "42501" ||
+      code === "PGRST202" ||
+      /permission denied for function|could not find the function|schema cache/i.test(message)
+    ) {
+      ok(`${label} — recusado na fronteira EXECUTE`);
+      return;
+    }
+    fail(`${label} — excecao inesperada: ${summarizeError(error)}`);
   }
 }
 
@@ -646,6 +699,36 @@ try {
       p_reason: "indevido",
       p_idempotency_key: deterministicUuid(`admin-forbidden:${runId}`),
     }),
+  );
+
+  section("Fronteira EXECUTE de funcoes internas");
+  for (const actor of [
+    { label: "Anonimo", supabase: anonClient },
+    { label: "Aluno", supabase: studentClient },
+    { label: "Professor", supabase: teacherClient },
+    { label: "Admin", supabase: adminClient },
+  ]) {
+    for (const target of INTERNAL_EXECUTE_TARGETS) {
+      await mustRejectFunctionAccess(`${actor.label} nao executa ${target.name}`, () =>
+        actor.supabase.rpc(target.name, target.args),
+      );
+    }
+  }
+
+  const teacherRpcAfterHardening = await teacherClient.rpc(
+    "get_teacher_availability_calendar",
+    { p_start_date: startsOn, p_end_date: startsOn },
+  );
+  check(
+    !teacherRpcAfterHardening.error,
+    "RPC legitima de calendario continua acessivel ao professor",
+    `RPC legitima de calendario falhou: ${summarizeError(teacherRpcAfterHardening.error)}`,
+  );
+  const studentRpcAfterHardening = await studentClient.rpc("unread_notification_count");
+  check(
+    !studentRpcAfterHardening.error,
+    "RPC legitima de notificacoes continua acessivel ao aluno",
+    `RPC legitima de notificacoes falhou: ${summarizeError(studentRpcAfterHardening.error)}`,
   );
 
   section("Disponibilidade real");

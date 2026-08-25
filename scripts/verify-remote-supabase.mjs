@@ -432,6 +432,22 @@ const internalFunctions = [
   "create_lesson_occurrence",
 ];
 
+const internalExecuteBoundary = [
+  "public.handle_new_user()",
+  "public.lesson_notification_when(timestamp with time zone)",
+  "public.lisbon_date(timestamp with time zone)",
+  "public.log_lesson_change()",
+  "public.notify_lesson_cancelled()",
+  "public.notify_lesson_participant_created()",
+  "public.notify_lesson_participation_cancelled()",
+  "public.prevent_lesson_delete()",
+  "public.prevent_package_audit_mutation()",
+  "public.set_updated_at()",
+  "public.sync_user_email()",
+  "public.validate_teacher_profile_defaults()",
+  "public.validate_teacher_sport_scope()",
+];
+
 const ownershipSql = `
 begin;
 
@@ -621,6 +637,9 @@ authenticated_rpc(name) as (values
 ),
 internal_functions(name) as (values
     ${values(internalFunctions)}
+),
+internal_execute_boundary(signature) as (values
+    ${values(internalExecuteBoundary)}
 ),
 projection_only_tables(name) as (values
     ${values(projectionOnlyTables)}
@@ -834,6 +853,35 @@ checks as (
       left join pg_constraint constraint_info
         on constraint_info.conname = expected.name
       where constraint_info.oid is null
+    ), 'ok')
+
+  union all
+  select
+    'seguranca',
+    'funcoes internas endurecidas recusam EXECUTE de PUBLIC, anon e authenticated',
+    not exists (
+      select 1
+      from internal_execute_boundary expected
+      left join pg_proc proc on proc.oid = to_regprocedure(expected.signature)
+      where proc.oid is null
+         or has_function_privilege('anon', proc.oid, 'EXECUTE')
+         or has_function_privilege('authenticated', proc.oid, 'EXECUTE')
+         or coalesce((
+           select bool_or(privilege.grantee = 0 and privilege.privilege_type = 'EXECUTE')
+           from aclexplode(coalesce(proc.proacl, acldefault('f', proc.proowner))) privilege
+         ), false)
+    ),
+    coalesce((
+      select string_agg(expected.signature, ', ' order by expected.signature)
+      from internal_execute_boundary expected
+      left join pg_proc proc on proc.oid = to_regprocedure(expected.signature)
+      where proc.oid is null
+         or has_function_privilege('anon', proc.oid, 'EXECUTE')
+         or has_function_privilege('authenticated', proc.oid, 'EXECUTE')
+         or coalesce((
+           select bool_or(privilege.grantee = 0 and privilege.privilege_type = 'EXECUTE')
+           from aclexplode(coalesce(proc.proacl, acldefault('f', proc.proowner))) privilege
+         ), false)
     ), 'ok')
 
   union all
@@ -2658,4 +2706,5 @@ if (failures > 0) {
 }
 
 console.log("\nVerificacao remota estrutural concluida sem falhas.");
+console.log(`${rows.length} verificacoes remotas de catalogo passaram.`);
 console.log("Nota: Auth/PostgREST com contas reais e validado por `npm run db:verify:auth -- --confirm-development`.");

@@ -307,6 +307,7 @@ Alvo: WCAG 2.1 AA. Os componentes de `components/ui/` já resolvem o essencial �
 12. **Partilhar a agenda é sempre uma decisão do próprio.** `calendar_sharing_enabled` nasce `false` e só muda por `set_workspace_calendar_sharing()`, que não aceita alvo. Não criar caminho para owner, manager ou admin forçarem a partilha de outra pessoa.
 13. **Uma view nova não é privada por acidente.** No Supabase, views e funções herdam privilégios de `PUBLIC`/`anon` por omissão. Cada uma tem de ter `revoke all ... from public, anon` e um `grant` explícito — como em `..._workspace_grants.sql`. Não confiar na cláusula `WHERE` para fazer o trabalho de uma permissão.
 14. **RLS filtra linhas; grants e projeções filtram colunas.** Tabelas com contrato de leitura por view não dão `SELECT` bruto a `authenticated`: `attendance`, `lesson_participants`, `student_packages`, `package_credit_transactions`, `notifications`, `organization_members`, `organization_invitations`, `student_invitations` e `student_package_audit_events` são lidas apenas pelas projeções próprias. Não reabrir a tabela para resolver uma consulta da interface.
+15. **Função interna nasce com `EXECUTE` fechado.** Trigger functions e helpers exclusivos de funções, scheduler ou worker recebem `revoke all on function <assinatura exata> from public, anon, authenticated`. O disparo normal de um trigger e chamadas internas do owner não exigem abrir a função ao cliente. RPCs legítimas conservam apenas os grants explícitos dos seus chamadores.
 
 ### Perfis e definições (Fase 2)
 
