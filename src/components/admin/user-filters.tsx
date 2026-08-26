@@ -20,7 +20,7 @@ export function AdminUserFilters({
     <form
       action={currentPath}
       method="get"
-      className="grid gap-4 rounded-[var(--radius-card)] border border-line bg-surface p-4 lg:grid-cols-[minmax(16rem,1fr)_12rem_12rem_auto] lg:items-end"
+      className="grid gap-4 rounded-[var(--radius-card)] border border-line bg-surface p-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,12rem)_minmax(0,12rem)_auto] lg:items-end"
       aria-label="Filtrar utilizadores"
     >
       <TextField

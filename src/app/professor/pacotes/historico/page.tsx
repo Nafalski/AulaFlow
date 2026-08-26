@@ -182,7 +182,7 @@ export default async function PackageHistoryPage({
       </Card>
 
       {history && history.length > 0 ? (
-        <div className="overflow-hidden rounded-[var(--radius-card)] border border-line bg-surface">
+        <div className="overflow-x-auto rounded-[var(--radius-card)] border border-line bg-surface">
           <table className="w-full border-collapse text-left text-sm">
             <thead className="bg-sand-deep text-xs tracking-wide text-muted uppercase">
               <tr>

@@ -12,7 +12,7 @@ export function GroupFiltersForm({ filters }: { filters: GroupFilters }) {
       action="/professor/grupos"
       method="get"
       aria-label="Filtrar turmas"
-      className="grid gap-4 rounded-[var(--radius-card)] border border-line bg-surface p-4 md:grid-cols-[minmax(14rem,1fr)_12rem_auto] md:items-end"
+      className="grid gap-4 rounded-[var(--radius-card)] border border-line bg-surface p-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,12rem)_auto] lg:items-end"
     >
       <TextField
         name="search"

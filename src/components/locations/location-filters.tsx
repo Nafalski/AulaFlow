@@ -7,7 +7,7 @@ import type { LocationFilters } from "@/lib/validation/locations";
 export function LocationFiltersForm({ filters }: { filters: LocationFilters }) {
   const hasFilters = filters.search !== "" || filters.status !== "all" || filters.scope !== "all";
   return (
-    <form action="/professor/locais" method="get" aria-label="Filtrar locais" className="grid gap-4 rounded-[var(--radius-card)] border border-line bg-surface p-4 md:grid-cols-[minmax(12rem,1fr)_11rem_11rem_auto] md:items-end">
+    <form action="/professor/locais" method="get" aria-label="Filtrar locais" className="grid gap-4 rounded-[var(--radius-card)] border border-line bg-surface p-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,11rem)_minmax(0,11rem)_auto] lg:items-end">
       <TextField name="search" label="Pesquisar" type="search" defaultValue={filters.search} maxLength={120} placeholder="Nome, morada ou localidade" autoComplete="off" />
       <SelectField name="status" label="Estado" defaultValue={filters.status}>
         <option value="all">Todos</option>

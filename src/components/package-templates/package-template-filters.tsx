@@ -18,7 +18,7 @@ export function PackageTemplateFiltersForm({
       action="/professor/pacotes"
       method="get"
       aria-label="Filtrar modelos de pacotes"
-      className="grid gap-4 rounded-[var(--radius-card)] border border-line bg-surface p-4 lg:grid-cols-[minmax(14rem,1fr)_12rem_14rem_auto] lg:items-end"
+      className="grid gap-4 rounded-[var(--radius-card)] border border-line bg-surface p-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,12rem)_minmax(0,14rem)_auto] lg:items-end"
     >
       <TextField
         name="search"

@@ -11,7 +11,13 @@ export function Card({ variant = "raised", className, children, ...props }: Card
   return (
     <div
       className={cn(
-        "rounded-[var(--radius-card)] bg-surface",
+        // `min-w-0` não é decorativo: um filho de grid ou de flex nasce com
+        // `min-width: auto` e recusa-se a encolher abaixo do seu `min-content`.
+        // Um cartão com um email longo sem espaços — `nome.apelido.turma@
+        // dominio-comprido.pt` — passava a ser mais largo do que o telemóvel, e
+        // o `truncate` lá dentro nunca chegava a atuar porque não havia largura
+        // a que se agarrar. A página inteira ganhava scroll horizontal.
+        "min-w-0 rounded-[var(--radius-card)] bg-surface",
         variant === "raised" ? "shadow-card" : "border border-line",
         className,
       )}

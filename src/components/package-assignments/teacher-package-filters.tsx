@@ -32,7 +32,7 @@ export function TeacherPackageFiltersForm({
       action="/professor/pacotes"
       method="get"
       aria-label="Filtrar pacotes atribuídos"
-      className="grid gap-4 rounded-[var(--radius-card)] border border-line bg-surface p-4 lg:grid-cols-[minmax(14rem,1fr)_11rem_12rem_11rem_12rem_auto] lg:items-end"
+      className="grid gap-4 rounded-[var(--radius-card)] border border-line bg-surface p-4 xl:grid-cols-[minmax(0,1fr)_minmax(0,11rem)_minmax(0,12rem)_minmax(0,11rem)_minmax(0,12rem)_auto] xl:items-end"
     >
       <input type="hidden" name="tab" value={filters.tab} />
       <TextField

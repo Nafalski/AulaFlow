@@ -72,6 +72,22 @@
 @layer base {
   html {
     -webkit-text-size-adjust: 100%;
+
+    /*
+      A página nunca rola na horizontal — as tabelas largas rolam dentro do seu
+      próprio cartão, que é onde faz sentido.
+
+      Sem isto, uma tabela larga deixava a página com centenas de píxeis de
+      largura fantasma: deslizar o polegar para o lado no telemóvel levava a um
+      ecrã completamente vazio, o que parece uma avaria. O elemento que rola é o
+      `html`, e não o `body` — por isso é aqui que a regra tem de estar.
+
+      `clip` e não `hidden`: `hidden` criaria um contexto de scroll e partiria
+      todos os `position: sticky` da aplicação — a barra lateral, o cabeçalho e
+      as horas do calendário. `clip` corta sem criar scroller, e os
+      `overflow-x-auto` interiores continuam a funcionar.
+    */
+    overflow-x: clip;
   }
 
   body {

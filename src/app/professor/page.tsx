@@ -91,9 +91,9 @@ export default async function TeacherDashboardPage() {
     <div className="flex flex-col gap-6">
       <section>
         <p className="text-sm text-muted">{formatWeekdayDate(today)}</p>
-        <p className="mt-0.5 text-2xl font-extrabold tracking-tight text-ink">
+        <h1 className="mt-0.5 text-2xl font-extrabold tracking-tight text-ink">
           Olá, {firstName(user.profile.full_name)}
-        </p>
+        </h1>
       </section>
 
       <Alert tone="info" title="Agenda de hoje">

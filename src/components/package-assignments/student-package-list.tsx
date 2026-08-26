@@ -72,10 +72,16 @@ export function StudentPackageList({
         return (
           <Card key={pack.id} variant="plain">
             <CardHeader
+              // `flex` e não `inline-flex`: uma caixa inline dimensiona-se ao
+              // conteúdo, por isso crescia com o nome do pacote em vez de ocupar
+              // a largura disponível. E o `min-w-0` no filho é o que faz o
+              // `truncate` atuar — sem ele o seu tamanho mínimo é o texto
+              // inteiro sem quebras, e um nome comprido empurrava o cartão para
+              // fora do ecrã.
               title={
-                <span className="inline-flex min-w-0 items-center gap-2">
+                <span className="flex min-w-0 items-center gap-2">
                   <Ticket className="size-4.5 shrink-0 text-brand" aria-hidden="true" />
-                  <span className="truncate">{pack.name}</span>
+                  <span className="min-w-0 truncate">{pack.name}</span>
                 </span>
               }
               description={pack.sportName ?? "Todas as modalidades"}
