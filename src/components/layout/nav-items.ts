@@ -56,7 +56,6 @@ const TEACHER_NAV = [
   { href: "/professor/clubes", label: "Clubes", iconKey: "clubs" },
   { href: "/professor/convites", label: "Convites", iconKey: "invitations" },
   { href: "/professor/historico", label: "Histórico", iconKey: "history" },
-  { href: "/professor/notificacoes", label: "Avisos", iconKey: "bell" },
   {
     href: "/professor/definicoes",
     label: "Definições",

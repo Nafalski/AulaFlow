@@ -45,11 +45,9 @@ function DetailsLink({ student }: { student: StudentListItem }) {
 export function StudentList({
   students,
   hasFilters,
-  isTruncated,
 }: {
   students: StudentListItem[];
   hasFilters: boolean;
-  isTruncated: boolean;
 }) {
   if (students.length === 0) {
     return (
@@ -81,11 +79,8 @@ export function StudentList({
     <div className="flex flex-col gap-3">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <p className="text-sm font-semibold text-ink-soft">
-          {students.length} {students.length === 1 ? "aluno" : "alunos"}
+          {students.length} {students.length === 1 ? "aluno nesta página" : "alunos nesta página"}
         </p>
-        {isTruncated && (
-          <p className="text-xs text-muted">São apresentados os primeiros 200 resultados.</p>
-        )}
       </div>
 
       <div className="hidden overflow-x-auto rounded-[var(--radius-card)] border border-line bg-surface md:block">

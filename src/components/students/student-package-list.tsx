@@ -47,6 +47,7 @@ export function StudentPackageListCard({
                 <Link
                   key={pack.id}
                   href={`/professor/pacotes/atribuicoes/${pack.id}`}
+                  data-student-package-card
                   className="min-h-11 rounded-[var(--radius-field)] border border-line bg-surface p-3 transition-colors hover:border-brand/40"
                 >
                   <div className="flex items-start justify-between gap-3">
@@ -111,4 +112,3 @@ function Metric({ label, value }: { label: string; value: number }) {
     </div>
   );
 }
-

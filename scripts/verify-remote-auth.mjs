@@ -3908,13 +3908,16 @@ try {
   }
   ok(`Pacotes de fixture antigos retirados (${retiredPackages})`);
 
-  const phase6PastOffset = 1 + (phase6RunSeed % 3);
-  const phase6EditRaceOffset = 4 + (phase6RunSeed % 3);
-  const phase6FutureOffset = 32 + (phase6RunSeed % 8);
-  const phase6PastDate = dateOnlyFromNow(-phase6PastOffset);
-  const phase6EditRaceDate = dateOnlyFromNow(-phase6EditRaceOffset);
-  const phase6RecurringSecondDate = dateOnlyFromNow(7 - phase6PastOffset);
+  const phase6PastOffset = await pickUnusedWeeklyAvailabilityOffset(-60, -20, 2);
+  const phase6EditRaceOffset = await pickUnusedAvailabilityOffset(-180, -121);
+  const phase6FutureOffset = await pickUnusedAvailabilityOffset(32, 70);
+  const phase6PastDate = dateOnlyFromNow(phase6PastOffset);
+  const phase6EditRaceDate = dateOnlyFromNow(phase6EditRaceOffset);
+  const phase6RecurringSecondDate = dateOnlyFromNow(phase6PastOffset + 7);
   const phase6FutureDate = dateOnlyFromNow(phase6FutureOffset);
+  const phase6PastPackageStartsOn = dateOnlyFromNow(
+    Math.min(phase6PastOffset, phase6EditRaceOffset) - 1,
+  );
   const phase6PastPackageExpiresOn = dateOnlyFromNow(10);
   const phase6FuturePackageExpiresOn = dateOnlyFromNow(45);
   const phase6BaseMinute = 360 + (phase6RunSeed % 12);
@@ -3966,7 +3969,7 @@ try {
     40,
     deterministicUuid(`lesson-6a-package-a:${phase6RunSuffix}`),
     sportRow.id,
-    { expiresOn: phase6PastPackageExpiresOn },
+    { startsOn: phase6PastPackageStartsOn, expiresOn: phase6PastPackageExpiresOn },
   );
   const phase6FuturePackageA = await assignLessonPackage(
     teacherClient,
@@ -3987,7 +3990,7 @@ try {
     30,
     deterministicUuid(`lesson-6a-package-group:${phase6RunSuffix}`),
     sportRow.id,
-    { expiresOn: phase6PastPackageExpiresOn },
+    { startsOn: phase6PastPackageStartsOn, expiresOn: phase6PastPackageExpiresOn },
   );
   check(
     phase6PastPackageA.status === "active" &&

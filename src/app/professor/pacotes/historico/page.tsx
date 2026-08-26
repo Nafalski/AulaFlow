@@ -6,9 +6,11 @@ import { buttonClasses } from "@/components/ui/button";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { EmptyState } from "@/components/ui/empty-state";
 import { SelectField, TextField } from "@/components/ui/field";
+import { Pagination } from "@/components/ui/pagination";
 import { Badge } from "@/components/ui/status-badge";
 import { formatFullDate } from "@/lib/datetime";
 import { requireRole } from "@/lib/auth/session";
+import { pageQueryRange, pageSlice, readPageNumber } from "@/lib/pagination";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import {
   PACKAGE_ADMIN_EVENT_TYPES,
@@ -22,7 +24,7 @@ export const dynamic = "force-dynamic";
 
 type SearchParams = Record<string, string | string[] | undefined>;
 
-const HISTORY_LIMIT = 100;
+const HISTORY_PAGE_SIZE = 50;
 const HISTORY_COLUMNS =
   "id, source, student_package_id, student_name, package_name, event_type, quantity, available_after, reserved_after, used_after, reason, performed_by_name, corrects_transaction_id, created_at";
 
@@ -72,6 +74,7 @@ export default async function PackageHistoryPage({
   searchParams: Promise<SearchParams>;
 }) {
   const rawParams = await searchParams;
+  const page = readPageNumber(rawParams.pagina);
   await requireRole("teacher", "/professor/pacotes/historico");
 
   const parsedFilters = packageHistoryFiltersSchema.safeParse(readPackageHistoryFilters(rawParams));
@@ -80,11 +83,14 @@ export default async function PackageHistoryPage({
     : { search: null, source: "all" as const, eventType: null, responsible: null, from: null, to: null };
 
   const supabase = await createSupabaseServerClient();
+  const { from, to } = pageQueryRange(page, HISTORY_PAGE_SIZE);
   let query = supabase
     .from("teacher_package_history_records")
     .select(HISTORY_COLUMNS)
     .order("created_at", { ascending: false })
-    .limit(HISTORY_LIMIT);
+    .order("source", { ascending: true })
+    .order("id", { ascending: false })
+    .range(from, to);
 
   if (filters.search) {
     const pattern = `%${escapeLikePattern(filters.search)}%`;
@@ -104,6 +110,7 @@ export default async function PackageHistoryPage({
     console.error("[AulaFlow] Falha ao carregar histórico global de pacotes.", error);
     throw new Error("Não foi possível carregar o histórico de pacotes.");
   }
+  const paged = pageSlice(history ?? [], HISTORY_PAGE_SIZE);
 
   const hasFilters =
     Boolean(filters.search) ||
@@ -131,7 +138,7 @@ export default async function PackageHistoryPage({
               Movimentos de crédito e alterações administrativas autorizadas.
             </p>
           </div>
-          <Badge tone="neutral">{history?.length ?? 0} registos</Badge>
+          <Badge tone="neutral">{paged.rows.length} nesta página</Badge>
         </div>
       </header>
 
@@ -181,7 +188,7 @@ export default async function PackageHistoryPage({
         </CardBody>
       </Card>
 
-      {history && history.length > 0 ? (
+      {paged.rows.length > 0 ? (
         <div className="overflow-x-auto rounded-[var(--radius-card)] border border-line bg-surface">
           <table className="w-full border-collapse text-left text-sm">
             <thead className="bg-sand-deep text-xs tracking-wide text-muted uppercase">
@@ -198,7 +205,7 @@ export default async function PackageHistoryPage({
               </tr>
             </thead>
             <tbody className="divide-y divide-line">
-              {history.map((event) => (
+              {paged.rows.map((event) => (
                 <tr key={`${event.source}-${event.id}`}>
                   <td className="px-4 py-3">
                     <p className="font-bold text-ink">{eventLabel(event.event_type)}</p>
@@ -243,14 +250,29 @@ export default async function PackageHistoryPage({
       ) : (
         <EmptyState
           icon={History}
-          title={hasFilters ? "Nenhum registo corresponde aos filtros" : "Ainda não há histórico administrativo"}
+          title={
+            page > 1
+              ? "Esta página já não tem registos"
+              : hasFilters
+                ? "Nenhum registo corresponde aos filtros"
+                : "Ainda não há histórico administrativo"
+          }
           description={
-            hasFilters
-              ? "Altere ou limpe os filtros para voltar a ver todos os registos."
-              : "Os registos aparecerão quando houver atribuições, ajustes ou alterações administrativas."
+            page > 1
+              ? "Volte à página anterior para continuar a consultar o histórico."
+              : hasFilters
+                ? "Altere ou limpe os filtros para voltar a ver todos os registos."
+                : "Os registos aparecerão quando houver atribuições, ajustes ou alterações administrativas."
           }
         />
       )}
+
+      <Pagination
+        basePath="/professor/pacotes/historico"
+        searchParams={rawParams}
+        page={page}
+        hasNext={paged.hasNext}
+      />
     </div>
   );
 }

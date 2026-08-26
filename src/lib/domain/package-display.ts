@@ -5,7 +5,6 @@ import type {
   PackageStatus,
 } from "@/types/database";
 
-export const PACKAGE_LIST_LIMIT = 100;
 export const PACKAGE_EXPIRY_WARNING_DAYS = EXPIRY_WARNING_DAYS;
 
 export const PACKAGE_ORIGIN_LABELS: Record<PackageAssignmentOrigin, string> = {

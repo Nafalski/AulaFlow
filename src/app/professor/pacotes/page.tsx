@@ -16,16 +16,11 @@ import {
 import { Alert } from "@/components/ui/alert";
 import { buttonClasses } from "@/components/ui/button";
 import { EmptyState } from "@/components/ui/empty-state";
-import { Badge } from "@/components/ui/status-badge";
-import {
-  balanceAttention,
-  expiryAttention,
-  PACKAGE_LIST_LIMIT,
-  PACKAGE_ORIGIN_LABELS,
-  sortPackageSnapshots,
-} from "@/lib/domain/package-display";
+import { Pagination } from "@/components/ui/pagination";
+import { PACKAGE_ORIGIN_LABELS } from "@/lib/domain/package-display";
 import { lisbonDateKey } from "@/lib/datetime";
 import { requireRole } from "@/lib/auth/session";
+import { pageQueryRange, pageSlice, readPageNumber } from "@/lib/pagination";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import {
   packageTemplateFiltersSchema,
@@ -38,6 +33,7 @@ export const dynamic = "force-dynamic";
 
 type SearchParams = Record<string, string | string[] | undefined>;
 type Tab = "templates" | "assigned";
+const ASSIGNED_PAGE_SIZE = 25;
 
 function valueOf(params: SearchParams, key: string): string | undefined {
   const value = params[key];
@@ -127,6 +123,7 @@ export default async function TeacherPackagesPage({
 }) {
   const rawSearchParams = await searchParams;
   const tab = readTab(rawSearchParams);
+  const assignedPage = readPageNumber(rawSearchParams.pagina);
   const user = await requireRole("teacher", "/professor/pacotes");
   const teacherId = user.teacherId;
   const organizationId = user.profile.organization_id;
@@ -171,12 +168,17 @@ export default async function TeacherPackagesPage({
   if (templateFilters.sportId) templateQuery = templateQuery.eq("sport_id", templateFilters.sportId);
 
   const assignedFilters = readAssignedFilters(rawSearchParams);
+  const assignedRange = pageQueryRange(assignedPage, ASSIGNED_PAGE_SIZE);
   let assignedQuery = supabase
     .from("teacher_package_records")
     .select(
       "id, student_id, student_name, name, sport_id, sport_name, initial_credits, credits_available, credits_reserved, credits_used, starts_on, expires_on, status, origin, paid_amount_cents, created_at",
     )
-    .limit(PACKAGE_LIST_LIMIT);
+    .order("status", { ascending: true })
+    .order("expires_on", { ascending: true, nullsFirst: false })
+    .order("created_at", { ascending: false })
+    .order("id", { ascending: false })
+    .range(assignedRange.from, assignedRange.to);
 
   if (assignedFilters.search) {
     const pattern = `%${escapeLikePattern(assignedFilters.search)}%`;
@@ -216,7 +218,8 @@ export default async function TeacherPackagesPage({
     isActive: template.is_active,
   }));
 
-  const assignedPackages = sortPackageSnapshots((assignedResult.data ?? []).map(toEntry));
+  const pagedAssigned = pageSlice(assignedResult.data ?? [], ASSIGNED_PAGE_SIZE);
+  const assignedPackages = pagedAssigned.rows.map(toEntry);
   const hasTemplateFilters =
     templateFilters.search !== "" || templateFilters.status !== "all" || templateFilters.sportId !== null;
   const hasAssignedFilters =
@@ -225,14 +228,6 @@ export default async function TeacherPackagesPage({
     assignedFilters.sportId !== null ||
     assignedFilters.balance !== "all" ||
     assignedFilters.expiry !== "all";
-
-  const assignedSummary = {
-    active: assignedPackages.filter((pack) => pack.status === "active").length,
-    low: assignedPackages.filter((pack) => balanceAttention(pack.creditsAvailable) === "low").length,
-    empty: assignedPackages.filter((pack) => balanceAttention(pack.creditsAvailable) === "empty").length,
-    expiring: assignedPackages.filter((pack) => expiryAttention(pack.expiresOn, today).attention === "soon").length,
-    expired: assignedPackages.filter((pack) => expiryAttention(pack.expiresOn, today).attention === "expired").length,
-  };
 
   return (
     <div className="flex flex-col gap-6">
@@ -304,22 +299,23 @@ export default async function TeacherPackagesPage({
         </>
       ) : (
         <>
-          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
-            <SummaryMetric label="Ativos" value={assignedSummary.active} />
-            <SummaryMetric label="Saldo baixo" value={assignedSummary.low} tone="warning" />
-            <SummaryMetric label="Sem saldo" value={assignedSummary.empty} tone="danger" />
-            <SummaryMetric label="A expirar" value={assignedSummary.expiring} tone="warning" />
-            <SummaryMetric label="Expirados" value={assignedSummary.expired} tone="danger" />
-          </div>
           <TeacherPackageFiltersForm filters={assignedFilters} sports={sports} />
           {assignedPackages.length === 0 ? (
             <EmptyState
               icon={Ticket}
-              title={hasAssignedFilters ? "Nenhum pacote corresponde aos filtros" : "Ainda não existem pacotes atribuídos"}
+              title={
+                assignedPage > 1
+                  ? "Esta página já não tem pacotes"
+                  : hasAssignedFilters
+                    ? "Nenhum pacote corresponde aos filtros"
+                    : "Ainda não existem pacotes atribuídos"
+              }
               description={
-                hasAssignedFilters
-                  ? "Altere ou limpe os filtros para voltar a ver todos os pacotes atribuídos."
-                  : "Ainda não existem pacotes atribuídos. Atribua um modelo ou crie um pacote personalizado para um aluno."
+                assignedPage > 1
+                  ? "Volte à página anterior para continuar a consultar os pacotes atribuídos."
+                  : hasAssignedFilters
+                    ? "Altere ou limpe os filtros para voltar a ver todos os pacotes atribuídos."
+                    : "Ainda não existem pacotes atribuídos. Atribua um modelo ou crie um pacote personalizado para um aluno."
               }
               action={
                 !hasAssignedFilters ? (
@@ -332,26 +328,14 @@ export default async function TeacherPackagesPage({
           ) : (
             <TeacherPackageList packages={assignedPackages} today={today} />
           )}
+          <Pagination
+            basePath="/professor/pacotes"
+            searchParams={rawSearchParams}
+            page={assignedPage}
+            hasNext={pagedAssigned.hasNext}
+          />
         </>
       )}
-    </div>
-  );
-}
-
-function SummaryMetric({
-  label,
-  value,
-  tone = "neutral",
-}: {
-  label: string;
-  value: number;
-  tone?: "neutral" | "warning" | "danger";
-}) {
-  return (
-    <div className="rounded-[var(--radius-card)] border border-line bg-surface p-4">
-      <p className="text-2xl font-extrabold text-ink">{value}</p>
-      <p className="mt-1 text-sm font-semibold text-muted">{label}</p>
-      {tone !== "neutral" && <Badge tone={tone}>{tone === "danger" ? "Atenção" : "Vigiar"}</Badge>}
     </div>
   );
 }

@@ -320,6 +320,35 @@ async function panelText(page) {
   }
 }
 
+async function scanNotificationPages(page, needles, maxPages = 40) {
+  const matches = new Map(needles.map((needle) => [needle, []]));
+  const visitedText = [];
+  let pagesAfterAllFound = null;
+
+  for (let pageNumber = 1; pageNumber <= maxPages; pageNumber += 1) {
+    const suffix = pageNumber === 1 ? "" : `?pagina=${pageNumber}`;
+    await page.goto(`${BASE_URL}/aluno/notificacoes${suffix}`, {
+      waitUntil: "domcontentloaded",
+    });
+    await page.getByRole("heading", { name: "Avisos" }).first().waitFor({ timeout: 20_000 });
+
+    const cardTexts = await page.locator("main li[data-notification-id]").allInnerTexts();
+    visitedText.push(...cardTexts);
+    for (const needle of needles) {
+      matches.get(needle).push(...cardTexts.filter((text) => text.includes(needle)));
+    }
+
+    const allFound = needles.every((needle) => matches.get(needle).length > 0);
+    if (allFound && pagesAfterAllFound === null) pagesAfterAllFound = 1;
+    else if (pagesAfterAllFound === 0) break;
+    else if (pagesAfterAllFound !== null) pagesAfterAllFound -= 1;
+
+    if ((await page.getByRole("link", { name: "Seguinte" }).count()) === 0) break;
+  }
+
+  return { matches, text: visitedText.join(" ") };
+}
+
 
 /**
  * Espera que o painel mostre um estado — o repintar chega logo a seguir à
@@ -1737,13 +1766,12 @@ async function studentNotificationsScenario(browser, apiClient) {
     "Havendo avisos por ler na conta, a pagina oferece marcar todos como lidos",
   );
 
-  // Quando ha mais do que a janela mostra, isso e dito.
+  // A caixa consulta apenas uma janela e oferece navegacao para o resto.
   const shownCount = await page.locator("main ul li").count();
-  const saysWindow = (await panelText(page)).includes("A mostrar os 50 avisos mais recentes");
   check(
-    shownCount < 50 || saysWindow,
-    "Com mais avisos do que os mostrados, a pagina di-lo",
-    `${shownCount} mostrados · aviso de janela ${saysWindow}`,
+    shownCount <= 25 && (shownCount < 25 || (await page.getByRole("link", { name: "Seguinte" }).count()) > 0),
+    "A caixa limita a pagina e oferece navegacao para avisos anteriores",
+    `${shownCount} mostrados`,
   );
 
   const card = page.locator("li").filter({ hasText: title }).first();
@@ -2137,36 +2165,32 @@ async function scheduledNotificationsScenario(browser, apiClient) {
     page.on("pageerror", (error) => consoleErrors.push(error.message.slice(0, 160)));
   });
   const page = await signIn(context, ACCOUNTS.student);
-  await page.goto(`${BASE_URL}/aluno/notificacoes`, { waitUntil: "domcontentloaded" });
-  await page.getByRole("heading", { name: "Avisos" }).first().waitFor({ timeout: 20_000 });
+  const reminderName = `${FIXTURE_PREFIX}lembrete ${stamp}`;
+  const notificationNames = [expiringName, expiredName, lowName, zeroName];
+  if (reminderStartsAt) notificationNames.push(reminderName);
+  const notificationScan = await scanNotificationPages(page, notificationNames);
+  const inbox = notificationScan.text;
 
-  const inbox = await page.locator("main").innerText();
-
-  check(inbox.includes(expiringName), "(B) O aviso de pacote a expirar aparece na caixa");
-  check(inbox.includes(expiredName), "(D) O aviso de pacote expirado aparece na caixa");
-  check(inbox.includes(lowName), "(C) O aviso de saldo baixo aparece na caixa");
+  check(notificationScan.matches.get(expiringName).length > 0, "(B) O aviso de pacote a expirar aparece na caixa");
+  check(notificationScan.matches.get(expiredName).length > 0, "(D) O aviso de pacote expirado aparece na caixa");
+  check(notificationScan.matches.get(lowName).length > 0, "(C) O aviso de saldo baixo aparece na caixa");
   check(
-    inbox.includes(zeroName),
+    notificationScan.matches.get(zeroName).length > 0,
     "(8B.2) O aviso do pacote esgotado aparece na caixa",
   );
-  const zeroCard = page.locator("main li").filter({ hasText: zeroName }).first();
-  const zeroText = (await zeroCard.count()) > 0 ? await zeroCard.innerText() : "";
+  const zeroText = notificationScan.matches.get(zeroName)[0] ?? "";
   check(
     /Já não há aulas disponíveis/.test(zeroText),
     "(8B.2) A mensagem corresponde a zero creditos",
     zeroText.slice(0, 80),
   );
   if (reminderStartsAt) {
-    check(/Lembrete/.test(inbox), "(A) O lembrete da aula aparece na caixa");
+    const reminderText = notificationScan.matches.get(reminderName)[0] ?? "";
+    check(reminderText.length > 0, "(A) O lembrete da aula aparece na caixa");
 
     // O relogio foi adiantado tres horas antes da aula: cai na janela das 24h,
     // mas e o PROPRIO dia. Um titulo a dizer "amanha" seria falso, e e por isso
     // que a 8B.1 o trocou por "Lembrete de aula".
-    const reminderCard = page
-      .locator("main li")
-      .filter({ hasText: `${FIXTURE_PREFIX}lembrete ${stamp}` })
-      .first();
-    const reminderText = (await reminderCard.count()) > 0 ? await reminderCard.innerText() : "";
     check(
       reminderText.length > 0 && !/amanh/i.test(reminderText),
       "(A) O lembrete nao afirma 'amanha' para uma aula do proprio dia",
@@ -2196,12 +2220,12 @@ async function scheduledNotificationsScenario(browser, apiClient) {
   );
 
   // ── Uma segunda passagem nao duplica nada ──
-  const cardsBefore = await page.locator("main li").count();
   await runScheduler();
-  await page.reload({ waitUntil: "domcontentloaded" });
-  await page.getByRole("heading", { name: "Avisos" }).first().waitFor({ timeout: 20_000 });
+  const repeatedScan = await scanNotificationPages(page, notificationNames);
   check(
-    (await page.locator("main li").count()) === cardsBefore,
+    notificationNames.every(
+      (name) => repeatedScan.matches.get(name).length === notificationScan.matches.get(name).length,
+    ),
     "Correr o agendador outra vez nao duplica avisos",
   );
 
@@ -2868,6 +2892,169 @@ async function mobileNotificationsScenario(browser) {
   await context.close();
 }
 
+async function paginatedSurfacesScenario(browser) {
+  section("Superficies paginadas e historicos");
+
+  const studentContext = await browser.newContext();
+  studentContext.on("page", (page) => {
+    page.on("console", (message) => {
+      if (message.type() === "error") consoleErrors.push(message.text().slice(0, 160));
+    });
+    page.on("pageerror", (error) => consoleErrors.push(error.message.slice(0, 160)));
+  });
+  const studentPage = await signIn(studentContext, ACCOUNTS.student);
+
+  await studentPage.goto(`${BASE_URL}/aluno/pacotes`, { waitUntil: "domcontentloaded" });
+  await studentPage.getByRole("heading", { name: "Os seus pacotes" }).waitFor({ timeout: 20_000 });
+  const firstPackageCards = studentPage.locator("[data-student-package-card]");
+  const firstPackageNames = await firstPackageCards.evaluateAll((cards) =>
+    cards.map((card) => card.querySelector("h2")?.textContent?.trim() ?? ""),
+  );
+  const firstPackageHeight = await studentPage.evaluate(
+    () => document.documentElement.scrollHeight,
+  );
+  check(
+    (await firstPackageCards.count()) === 12,
+    "Pacotes do aluno limitam a primeira pagina a 12",
+  );
+  check(firstPackageHeight < 10_000, "Pacotes do aluno deixam de produzir uma pagina gigante", `${firstPackageHeight}px`);
+
+  await Promise.all([
+    studentPage.waitForURL((url) => url.searchParams.get("pagina") === "2", { timeout: 20_000 }),
+    studentPage.getByRole("link", { name: "Seguinte" }).click(),
+  ]);
+  const secondPackageCards = studentPage.locator("[data-student-package-card]");
+  const secondPackageNames = await secondPackageCards.evaluateAll((cards) =>
+    cards.map((card) => card.querySelector("h2")?.textContent?.trim() ?? ""),
+  );
+  check(
+    (await secondPackageCards.count()) === 12,
+    "A segunda pagina de pacotes abre com mais 12 registos",
+  );
+  check(
+    firstPackageNames.every((name) => !secondPackageNames.includes(name)),
+    "Paginas adjacentes de pacotes nao repetem registos",
+  );
+  check(
+    (await studentPage.getByRole("link", { name: "Anterior" }).count()) === 1,
+    "A segunda pagina oferece voltar a anterior",
+  );
+
+  await studentPage.goto(`${BASE_URL}/aluno/historico?pagina=invalida`, {
+    waitUntil: "domcontentloaded",
+  });
+  await studentPage
+    .locator("main")
+    .getByRole("heading", { name: "Histórico", exact: true })
+    .waitFor({ timeout: 20_000 });
+  const studentHistoryCards = await studentPage.locator("[data-history-card]").count();
+  check(studentHistoryCards === 20, "Historico do aluno limita a pagina a 20 aulas");
+  check(
+    (await studentPage.getByText("Página 1", { exact: true }).count()) === 1,
+    "Parametro de pagina invalido e tratado como primeira pagina",
+  );
+  check(
+    !(await panelText(studentPage)).includes("chega na Fase"),
+    "Historico do aluno deixou de ser um placeholder de fase",
+  );
+
+  await studentContext.close();
+
+  const teacherContext = await browser.newContext();
+  teacherContext.on("page", (page) => {
+    page.on("console", (message) => {
+      if (message.type() === "error") consoleErrors.push(message.text().slice(0, 160));
+    });
+    page.on("pageerror", (error) => consoleErrors.push(error.message.slice(0, 160)));
+  });
+  const teacherPage = await signIn(teacherContext, ACCOUNTS.teacher);
+
+  await teacherPage.goto(`${BASE_URL}/professor/alunos`, { waitUntil: "domcontentloaded" });
+  await teacherPage
+    .locator("main")
+    .getByRole("heading", { name: "Alunos", exact: true })
+    .waitFor({ timeout: 20_000 });
+  check(
+    (await teacherPage.locator("main tbody tr").count()) === 50,
+    "Diretorio do professor limita a pagina a 50 alunos",
+  );
+
+  await teacherPage.goto(`${BASE_URL}/professor/alunos?search=e2e_aulaflow_aluno_a`, {
+    waitUntil: "domcontentloaded",
+  });
+  const studentDetailHref = await teacherPage
+    .getByRole("link", { name: /Abrir ficha de e2e_aulaflow_aluno_a/ })
+    .first()
+    .getAttribute("href");
+  check(Boolean(studentDetailHref), "A ficha controlada do aluno fica acessivel pela pesquisa");
+  if (studentDetailHref) {
+    await teacherPage.goto(`${BASE_URL}${studentDetailHref}`, { waitUntil: "domcontentloaded" });
+    await teacherPage
+      .locator("main")
+      .getByRole("heading", { name: "e2e_aulaflow_aluno_a", exact: true })
+      .waitFor({ timeout: 20_000 });
+    const detailPackageCount = await teacherPage.locator("[data-student-package-card]").count();
+    const detailHeight = await teacherPage.evaluate(() => document.documentElement.scrollHeight);
+    check(detailPackageCount === 12, "Ficha do aluno limita os pacotes a 12 por pagina");
+    check(detailHeight < 12_000, "Ficha do aluno deixa de produzir uma pagina gigante", `${detailHeight}px`);
+  }
+
+  await teacherPage.goto(`${BASE_URL}/professor/grupos`, { waitUntil: "domcontentloaded" });
+  await teacherPage
+    .locator("main")
+    .getByRole("heading", { name: "Turmas", exact: true })
+    .waitFor({ timeout: 20_000 });
+  check((await teacherPage.locator("main tbody tr").count()) === 25, "Turmas limitam a pagina a 25");
+
+  await teacherPage.goto(`${BASE_URL}/professor/pacotes?tab=assigned`, {
+    waitUntil: "domcontentloaded",
+  });
+  await teacherPage
+    .locator("main")
+    .getByRole("heading", { name: "Pacotes", exact: true })
+    .waitFor({ timeout: 20_000 });
+  check(
+    (await teacherPage.locator("main tbody tr").count()) === 25,
+    "Pacotes atribuidos limitam a pagina a 25",
+  );
+
+  await teacherPage.goto(`${BASE_URL}/professor/pacotes/historico`, {
+    waitUntil: "domcontentloaded",
+  });
+  await teacherPage
+    .locator("main")
+    .getByRole("heading", { name: "Histórico", exact: true })
+    .waitFor({ timeout: 20_000 });
+  check(
+    (await teacherPage.locator("main tbody tr").count()) === 50,
+    "Historico global de pacotes limita a pagina a 50",
+  );
+
+  await teacherPage.goto(`${BASE_URL}/professor/historico`, { waitUntil: "domcontentloaded" });
+  await teacherPage
+    .locator("main")
+    .getByRole("heading", { name: "Histórico de aulas", exact: true })
+    .waitFor({ timeout: 20_000 });
+  check(
+    (await teacherPage.locator("[data-history-card]").count()) === 20,
+    "Historico do professor limita a pagina a 20 aulas",
+  );
+  await teacherContext.close();
+
+  const mobileContext = await browser.newContext({ viewport: { width: 390, height: 844 } });
+  const mobilePage = await signIn(mobileContext, ACCOUNTS.student);
+  await mobilePage.goto(`${BASE_URL}/aluno/historico`, { waitUntil: "domcontentloaded" });
+  await mobilePage
+    .locator("main")
+    .getByRole("heading", { name: "Histórico", exact: true })
+    .waitFor({ timeout: 20_000 });
+  const mobileOverflow = await mobilePage.evaluate(
+    () => document.documentElement.scrollWidth - window.innerWidth,
+  );
+  check(mobileOverflow <= 1, "Historico do aluno cabe em 390px", `${mobileOverflow}px`);
+  await mobileContext.close();
+}
+
 async function mobileScenario(browser, lessonId) {
   section("Telemóvel — 390×844");
   const context = await browser.newContext({ viewport: { width: 390, height: 844 } });
@@ -3136,6 +3323,7 @@ async function main() {
     await preferencesScenario(browser, lessons.client);
     await teacherPreferencesScenario(browser);
     await mobileNotificationsScenario(browser);
+    await paginatedSurfacesScenario(browser);
 
     await mobileScenario(browser, lessons.operable ?? lessons.cancellable);
     await mobileRescheduleScenario(browser, replacementId);

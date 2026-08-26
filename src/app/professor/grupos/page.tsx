@@ -6,7 +6,9 @@ import { GroupFiltersForm } from "@/components/groups/group-filters";
 import { GroupList } from "@/components/groups/group-list";
 import { buttonClasses } from "@/components/ui/button";
 import { EmptyState } from "@/components/ui/empty-state";
+import { Pagination } from "@/components/ui/pagination";
 import { requireRole } from "@/lib/auth/session";
+import { pageQueryRange, pageSlice, readPageNumber } from "@/lib/pagination";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { groupFiltersSchema, readGroupFilters } from "@/lib/validation/groups";
 
@@ -14,6 +16,7 @@ export const metadata: Metadata = { title: "Turmas" };
 export const dynamic = "force-dynamic";
 
 type SearchParams = Record<string, string | string[] | undefined>;
+const PAGE_SIZE = 25;
 
 function escapeLikePattern(value: string): string {
   return value.replace(/[\\%_]/g, (character) => `\\${character}`);
@@ -25,15 +28,20 @@ export default async function TeacherGroupsPage({
   searchParams: Promise<SearchParams>;
 }) {
   await requireRole("teacher", "/professor/grupos");
-  const rawFilters = readGroupFilters(await searchParams);
+  const rawSearchParams = await searchParams;
+  const page = readPageNumber(rawSearchParams.pagina);
+  const rawFilters = readGroupFilters(rawSearchParams);
   const parsedFilters = groupFiltersSchema.safeParse(rawFilters);
   const filters = parsedFilters.success ? parsedFilters.data : { search: "", status: "all" as const };
   const supabase = await createSupabaseServerClient();
+  const { from, to } = pageQueryRange(page, PAGE_SIZE);
 
   let query = supabase
     .from("teacher_group_records")
     .select("id, name, sport_id, participant_count, max_participants, is_active")
-    .order("name");
+    .order("name")
+    .order("id")
+    .range(from, to);
 
   if (filters.search) query = query.ilike("name", `%${escapeLikePattern(filters.search)}%`);
   if (filters.status !== "all") query = query.eq("is_active", filters.status === "active");
@@ -44,7 +52,8 @@ export default async function TeacherGroupsPage({
     throw new Error("Não foi possível carregar as turmas.");
   }
 
-  const sportIds = [...new Set(data.flatMap((group) => (group.sport_id ? [group.sport_id] : [])))];
+  const paged = pageSlice(data, PAGE_SIZE);
+  const sportIds = [...new Set(paged.rows.flatMap((group) => (group.sport_id ? [group.sport_id] : [])))];
   const sportsResult = sportIds.length > 0
     ? await supabase.from("sports").select("id, name").in("id", sportIds)
     : { data: [], error: null };
@@ -54,7 +63,7 @@ export default async function TeacherGroupsPage({
   }
   const sportNames = new Map(sportsResult.data.map((sport) => [sport.id, sport.name]));
 
-  const groups = data.map((group) => ({
+  const groups = paged.rows.map((group) => ({
     id: group.id,
     name: group.name,
     sportName: group.sport_id ? sportNames.get(group.sport_id) ?? null : null,
@@ -88,6 +97,13 @@ export default async function TeacherGroupsPage({
       ) : (
         <GroupList groups={groups} />
       )}
+
+      <Pagination
+        basePath="/professor/grupos"
+        searchParams={rawSearchParams}
+        page={page}
+        hasNext={paged.hasNext}
+      />
     </div>
   );
 }

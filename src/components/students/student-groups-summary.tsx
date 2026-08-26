@@ -15,7 +15,7 @@ export function StudentGroupsSummary({ groups }: { groups: StudentGroupSummaryIt
     <Card variant="plain">
       <CardHeader
         title="Turmas do aluno"
-        description={`${groups.length} ${groups.length === 1 ? "turma associada" : "turmas associadas"}.`}
+        description={`${groups.length} ${groups.length === 1 ? "turma" : "turmas"} nesta página.`}
       />
       <CardBody>
         {groups.length === 0 ? (

@@ -70,7 +70,7 @@ export function StudentPackageList({
         const packageMovements = movementsByPackage.get(pack.id) ?? [];
 
         return (
-          <Card key={pack.id} variant="plain">
+          <Card key={pack.id} variant="plain" data-student-package-card>
             <CardHeader
               // `flex` e não `inline-flex`: uma caixa inline dimensiona-se ao
               // conteúdo, por isso crescia com o nome do pacote em vez de ocupar
@@ -158,4 +158,3 @@ function Metric({ label, value }: { label: string; value: number }) {
     </div>
   );
 }
-

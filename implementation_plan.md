@@ -491,7 +491,7 @@ A ordem segue as prioridades pedidas: primeiro a área do professor ao computado
 - `/professor/pacotes`: separadores para **modelos de pacotes** e **pacotes atribuídos**, preservando a gestão da Etapa 1A
 - Lista administrativa de pacotes atribuídos com pesquisa por aluno/pacote, filtros por estado, modalidade, saldo baixo/sem saldo e validade próxima/expirada
 - Resumo simples do professor: ativos, saldo baixo, sem saldo, a expirar e expirados
-- Tabela no desktop e cartões no mobile; limite de 100 pacotes por consulta para evitar carregamento sem limite nesta etapa
+- Tabela no desktop e cartões no mobile; a revisão pré-produção posterior substituiu o limite fixo de 100 por paginação no servidor de 25 pacotes, preservando filtros e ordem estável
 - `/professor/pacotes/atribuicoes/[id]`: detalhe completo em modo consulta, com aluno, modelo de origem, saldos, datas, origem, valor, notas administrativas, responsável e histórico básico
 - `/professor/alunos/[id]`: secção funcional de pacotes do aluno, mantendo o botão de atribuição e sem edição de saldos
 - `/aluno/pacotes`: página mobile-first com cartões, saldos simples, validade, estado, barra de utilização e movimentos básicos seguros
@@ -1429,6 +1429,16 @@ A repetição exigida do gate Auth encontrou ainda uma falha da própria fixture
 O fechamento da 9A passou com 607 testes Vitest, 1.113 verificações PostgreSQL locais, build de produção, 115 verificações remotas de catálogo, 666 verificações Auth/PostgREST em duas execuções consecutivas e 245 verificações de browser tanto no servidor DEV como no build de produção local. O catálogo mantém 66 migrações locais/remotas alinhadas, `db push --dry-run` sem pendências, os dois jobs únicos ativos, Edge `ACTIVE` e ciclos recentes de cron/`pg_net` sem falhas observadas. O DEV público foi reservado para o smoke final do commit publicado.
 
 **Fase 8 permanece fechada. Etapa 9A fechada. Lançamento em produção não iniciado. Fase 9 aberta.**
+
+#### Fechamento tardio das superfícies de histórico e listas grandes
+
+A revisão pré-produção encontrou dois placeholders antigos ligados pela navegação: `/aluno/historico` ainda prometia a Fase 7 e `/professor/historico` ainda prometia a Fase 6, embora os contratos dessas fases e as projeções seguras já estivessem concluídos. Ambos passaram a ser históricos reais, somente leitura e paginados. O aluno lê exclusivamente `student_lesson_records`: vê apenas a própria participação, RSVP, presença/falta e efeito de crédito, sem notas privadas, colegas, custo, identificador de pacote ou campos administrativos. O professor usa `teacher_lesson_schedule_records` para consultar os desfechos das próprias aulas.
+
+O relato de uma página com centenas de milhares de píxeis foi reproduzido no DEV controlado. `/aluno/pacotes` devolvia 797 pacotes sem `range()`, renderizava 797 cartões e atingia 335.326 px; `/professor/alunos/[id]` para o mesmo aluno devolvia os mesmos 797 pacotes e atingia 202.038 px. A ficha ainda carregava todas as memberships de turma, um segundo crescimento independente. As consultas passaram a ser limitadas no servidor, com filtros antes do intervalo e desempate por ID: 12 pacotes por página para o aluno e para a ficha, 12 turmas na ficha, 20 aulas nos históricos, 25 turmas/pacotes atribuídos/avisos, 50 alunos e 50 eventos no histórico global de pacotes. Parâmetros inválidos voltam com segurança à primeira página, e os controlos Anterior/Seguinte preservam os restantes filtros no URL.
+
+Modelos de pacote, locais, recursos, convites e diretórios administrativos permaneceram sem paginação por terem cardinalidade controlada ou pequena no domínio/DEV. Os limites de 30 eventos e 80 movimentações corrigíveis no detalhe de uma atribuição continuam intencionais. Não houve migração, novo grant ou acesso a tabela bruta. O placeholder de `/professor/notificacoes` permanece deliberadamente fora da navegação: a Fase 8 definiu explicitamente que não há avisos para o professor, portanto reexpô-lo exige primeiro um contrato de produto.
+
+**A revisão de placeholders e listas grandes fica fechada sem reabrir a Fase 8 ou a 9A. Lançamento em produção não iniciado. Fase 9 aberta.**
 
 #### O que a 8B deliberadamente não faz
 

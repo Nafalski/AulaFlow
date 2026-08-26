@@ -18,10 +18,12 @@ import { StudentStatusBadges } from "@/components/students/student-status-badges
 import { StudentStatusForm } from "@/components/students/student-status-form";
 import { buttonClasses } from "@/components/ui/button";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
+import { Pagination } from "@/components/ui/pagination";
 import { Badge } from "@/components/ui/status-badge";
 import { requireRole } from "@/lib/auth/session";
-import { PACKAGE_ORIGIN_LABELS, sortPackageSnapshots } from "@/lib/domain/package-display";
+import { PACKAGE_ORIGIN_LABELS } from "@/lib/domain/package-display";
 import { formatFullDate, lisbonDateKey } from "@/lib/datetime";
+import { pageQueryRange, pageSlice, readPageNumber, type UrlSearchParams } from "@/lib/pagination";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { studentIdSchema } from "@/lib/validation/students";
 import { initials } from "@/lib/utils";
@@ -32,6 +34,8 @@ const PACKAGE_SUMMARY_COLUMNS =
   "student_id, package_count, usable_package_count, credits_available, credits_reserved, credits_used";
 const STUDENT_PACKAGE_COLUMNS =
   "id, student_id, student_name, name, sport_name, initial_credits, credits_available, credits_reserved, credits_used, starts_on, expires_on, status, origin, paid_amount_cents, notes, created_at";
+const PACKAGE_PAGE_SIZE = 12;
+const GROUP_PAGE_SIZE = 12;
 
 const EMPTY_PACKAGE_SUMMARY: StudentPackageSummaryData = {
   package_count: 0,
@@ -48,21 +52,27 @@ async function loadStudentGroups(
   studentId: string,
   teacherId: string,
   organizationId: string,
-): Promise<StudentGroupSummaryItem[]> {
+  page: number,
+): Promise<{ groups: StudentGroupSummaryItem[]; hasNext: boolean }> {
   const supabase = await createSupabaseServerClient();
+  const range = pageQueryRange(page, GROUP_PAGE_SIZE);
   const { data: memberships, error: membershipError } = await supabase
     .from("group_members")
-    .select("group_id")
+    .select("group_id, joined_at")
     .eq("student_id", studentId)
-    .eq("is_active", true);
+    .eq("is_active", true)
+    .order("joined_at", { ascending: false })
+    .order("group_id", { ascending: false })
+    .range(range.from, range.to);
 
   if (membershipError) {
     console.error("[AulaFlow] Falha ao carregar as turmas do aluno.", membershipError);
     throw new Error("Não foi possível carregar as turmas do aluno.");
   }
 
-  const groupIds = memberships.map((membership) => membership.group_id);
-  if (groupIds.length === 0) return [];
+  const pagedMemberships = pageSlice(memberships, GROUP_PAGE_SIZE);
+  const groupIds = pagedMemberships.rows.map((membership) => membership.group_id);
+  if (groupIds.length === 0) return { groups: [], hasNext: false };
 
   const { data, error } = await supabase
     .from("groups")
@@ -77,15 +87,27 @@ async function loadStudentGroups(
     throw new Error("Não foi possível carregar as turmas do aluno.");
   }
 
-  return data;
+  const groupsById = new Map(data.map((group) => [group.id, group]));
+  return {
+    groups: groupIds.flatMap((groupId) => {
+      const group = groupsById.get(groupId);
+      return group ? [group] : [];
+    }),
+    hasNext: pagedMemberships.hasNext,
+  };
 }
 
 export default async function StudentDetailPage({
   params,
+  searchParams,
 }: {
   params: Promise<{ id: string }>;
+  searchParams: Promise<UrlSearchParams>;
 }) {
   const { id } = await params;
+  const resolvedSearchParams = await searchParams;
+  const packagePage = readPageNumber(resolvedSearchParams.paginaPacotes);
+  const groupPage = readPageNumber(resolvedSearchParams.paginaTurmas);
   const parsedId = studentIdSchema.safeParse({ studentId: id });
   if (!parsedId.success) notFound();
 
@@ -95,6 +117,7 @@ export default async function StudentDetailPage({
   }
 
   const supabase = await createSupabaseServerClient();
+  const packageRange = pageQueryRange(packagePage, PACKAGE_PAGE_SIZE);
   const { data: student, error } = await supabase
     .from("teacher_student_management_records")
     .select(STUDENT_DETAIL_COLUMNS)
@@ -119,8 +142,12 @@ export default async function StudentDetailPage({
       .from("teacher_package_records")
       .select(STUDENT_PACKAGE_COLUMNS)
       .eq("student_id", student.id)
-      .order("created_at", { ascending: false }),
-    loadStudentGroups(student.id, user.teacherId, user.profile.organization_id),
+      .order("status", { ascending: true })
+      .order("expires_on", { ascending: true, nullsFirst: false })
+      .order("created_at", { ascending: false })
+      .order("id", { ascending: false })
+      .range(packageRange.from, packageRange.to),
+    loadStudentGroups(student.id, user.teacherId, user.profile.organization_id, groupPage),
   ]);
 
   if (packageResult.error) {
@@ -133,26 +160,25 @@ export default async function StudentDetailPage({
   }
 
   const packageSummary = packageResult.data ?? EMPTY_PACKAGE_SUMMARY;
-  const packages = sortPackageSnapshots(
-    (packageListResult.data ?? []).map((pack) => ({
-      id: pack.id,
-      studentId: pack.student_id,
-      studentName: pack.student_name,
-      name: pack.name,
-      sportName: pack.sport_name,
-      initialCredits: pack.initial_credits,
-      creditsAvailable: pack.credits_available,
-      creditsReserved: pack.credits_reserved,
-      creditsUsed: pack.credits_used,
-      startsOn: pack.starts_on,
-      expiresOn: pack.expires_on,
-      status: pack.status,
-      originLabel: PACKAGE_ORIGIN_LABELS[pack.origin],
-      paidAmountCents: pack.paid_amount_cents,
-      notes: pack.notes,
-      createdAt: pack.created_at,
-    })),
-  );
+  const pagedPackages = pageSlice(packageListResult.data ?? [], PACKAGE_PAGE_SIZE);
+  const packages = pagedPackages.rows.map((pack) => ({
+    id: pack.id,
+    studentId: pack.student_id,
+    studentName: pack.student_name,
+    name: pack.name,
+    sportName: pack.sport_name,
+    initialCredits: pack.initial_credits,
+    creditsAvailable: pack.credits_available,
+    creditsReserved: pack.credits_reserved,
+    creditsUsed: pack.credits_used,
+    startsOn: pack.starts_on,
+    expiresOn: pack.expires_on,
+    status: pack.status,
+    originLabel: PACKAGE_ORIGIN_LABELS[pack.origin],
+    paidAmountCents: pack.paid_amount_cents,
+    notes: pack.notes,
+    createdAt: pack.created_at,
+  }));
   const today = lisbonDateKey(new Date());
 
   return (
@@ -261,7 +287,21 @@ export default async function StudentDetailPage({
           />
           <StudentPackageSummary summary={packageSummary} />
           <StudentPackageListCard packages={packages} today={today} />
-          <StudentGroupsSummary groups={groups} />
+          <Pagination
+            basePath={`/professor/alunos/${student.id}`}
+            searchParams={resolvedSearchParams}
+            page={packagePage}
+            hasNext={pagedPackages.hasNext}
+            pageParam="paginaPacotes"
+          />
+          <StudentGroupsSummary groups={groups.groups} />
+          <Pagination
+            basePath={`/professor/alunos/${student.id}`}
+            searchParams={resolvedSearchParams}
+            page={groupPage}
+            hasNext={groups.hasNext}
+            pageParam="paginaTurmas"
+          />
           <StudentStatusForm
             studentId={student.id}
             fullName={student.full_name}

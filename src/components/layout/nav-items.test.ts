@@ -66,7 +66,6 @@ describe("navItemsForRole", () => {
       "/professor/clubes",
       "/professor/convites",
       "/professor/historico",
-      "/professor/notificacoes",
       "/professor/definicoes",
     ]);
 

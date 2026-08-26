@@ -5,7 +5,9 @@ import { StudentFiltersForm } from "./student-filters";
 import { StudentList, type StudentListItem } from "./student-list";
 import { Alert } from "@/components/ui/alert";
 import { buttonClasses } from "@/components/ui/button";
+import { Pagination } from "@/components/ui/pagination";
 import { requireRole } from "@/lib/auth/session";
+import { pageQueryRange, pageSlice, readPageNumber } from "@/lib/pagination";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import {
   readStudentFilters,
@@ -15,7 +17,7 @@ import {
 
 const STUDENT_LIST_COLUMNS =
   "id, full_name, email, phone, is_active, profile_id, account_status, invitation_status";
-const MAX_RESULTS = 200;
+const PAGE_SIZE = 50;
 
 export type StudentDirectorySearchParams = Record<
   string,
@@ -24,6 +26,10 @@ export type StudentDirectorySearchParams = Record<
 
 function escapeIlikePattern(value: string) {
   return value.replace(/[\\%_]/g, "\\$&");
+}
+
+function quotePostgrestValue(value: string) {
+  return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 
 function parseFilters(searchParams: StudentDirectorySearchParams): {
@@ -48,7 +54,9 @@ export async function StudentDirectory({
   }
 
   const { filters, invalid } = parseFilters(searchParams);
+  const page = readPageNumber(searchParams.pagina);
   const supabase = await createSupabaseServerClient();
+  const { from, to } = pageQueryRange(page, PAGE_SIZE);
 
   const buildQuery = () => {
     let query = supabase
@@ -57,7 +65,7 @@ export async function StudentDirectory({
       .eq("organization_id", organizationId)
       .eq("created_by_teacher_id", teacherId)
       .order("full_name", { ascending: true })
-      .limit(MAX_RESULTS + 1);
+      .order("id", { ascending: true });
 
     switch (filters.status) {
       case "active":
@@ -80,48 +88,33 @@ export async function StudentDirectory({
         break;
     }
 
-    return query;
+    return query.range(from, to);
   };
 
-  let rows: StudentListItem[];
-  if (filters.search === "") {
-    const { data, error } = await buildQuery();
-    if (error) {
-      console.error("[AulaFlow] Falha ao consultar os alunos do professor.", error);
-      throw new Error("Não foi possível carregar os alunos.");
-    }
-    rows = data ?? [];
-  } else {
+  let query = buildQuery();
+  if (filters.search !== "") {
     const literal = escapeIlikePattern(filters.search);
     const phoneLiteral = escapeIlikePattern(
       filters.search.replace(/[\s().–—-]/g, ""),
     );
-    const queries = [
-      buildQuery().ilike("full_name", `%${literal}%`),
-      buildQuery().ilike("email", `%${literal}%`),
+    const clauses = [
+      `full_name.ilike.${quotePostgrestValue(`%${literal}%`)}`,
+      `email.ilike.${quotePostgrestValue(`%${literal}%`)}`,
     ];
     if (phoneLiteral !== "") {
-      queries.push(buildQuery().ilike("phone", `%${phoneLiteral}%`));
+      clauses.push(`phone.ilike.${quotePostgrestValue(`%${phoneLiteral}%`)}`);
     }
-    const results = await Promise.all(queries);
-
-    const failed = results.find((result) => result.error);
-    if (failed?.error) {
-      console.error("[AulaFlow] Falha na pesquisa de alunos.", failed.error);
-      throw new Error("Não foi possível pesquisar os alunos.");
-    }
-
-    const unique = new Map<string, StudentListItem>();
-    for (const result of results) {
-      for (const row of result.data ?? []) unique.set(row.id, row);
-    }
-    rows = [...unique.values()].sort((left, right) =>
-      left.full_name.localeCompare(right.full_name, "pt-PT", { sensitivity: "base" }),
-    );
+    query = query.or(clauses.join(","));
   }
 
-  const isTruncated = rows.length > MAX_RESULTS;
-  const visibleRows = rows.slice(0, MAX_RESULTS);
+  const { data, error } = await query;
+  if (error) {
+    console.error("[AulaFlow] Falha ao consultar os alunos do professor.", error);
+    throw new Error("Não foi possível carregar os alunos.");
+  }
+
+  const paged = pageSlice(data ?? [], PAGE_SIZE);
+  const visibleRows: StudentListItem[] = paged.rows;
   const hasFilters = filters.search !== "" || filters.status !== "all";
 
   return (
@@ -149,7 +142,13 @@ export async function StudentDirectory({
       )}
 
       <StudentFiltersForm filters={filters} />
-      <StudentList students={visibleRows} hasFilters={hasFilters} isTruncated={isTruncated} />
+      <StudentList students={visibleRows} hasFilters={hasFilters} />
+      <Pagination
+        basePath="/professor/alunos"
+        searchParams={searchParams}
+        page={page}
+        hasNext={paged.hasNext}
+      />
     </div>
   );
 }

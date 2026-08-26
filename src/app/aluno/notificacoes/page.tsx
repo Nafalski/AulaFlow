@@ -7,16 +7,18 @@ import {
 } from "@/components/notifications/notification-list";
 import { SectionTitle } from "@/components/ui/card";
 import { EmptyState } from "@/components/ui/empty-state";
+import { Pagination } from "@/components/ui/pagination";
 import { Badge } from "@/components/ui/status-badge";
 import { requireRole } from "@/lib/auth/session";
 import { formatDateTime, formatRelativeDay } from "@/lib/datetime";
 import { unreadNotificationCount } from "@/lib/notifications/unread-count";
+import { pageQueryRange, pageSlice, readPageNumber, type UrlSearchParams } from "@/lib/pagination";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 
 export const metadata: Metadata = { title: "Avisos" };
 export const dynamic = "force-dynamic";
 
-const INBOX_LIMIT = 50;
+const INBOX_PAGE_SIZE = 25;
 
 /**
  * A caixa de avisos do aluno (Etapa 8A).
@@ -29,28 +31,26 @@ const INBOX_LIMIT = 50;
  * A projeção `user_notification_records` já filtra por `auth.uid()`: nunca traz
  * o aviso de outra pessoa, nem destinatário, organização ou payload em bruto.
  */
-export default async function StudentNotificationsPage() {
+export default async function StudentNotificationsPage({
+  searchParams,
+}: {
+  searchParams: Promise<UrlSearchParams>;
+}) {
+  const params = await searchParams;
+  const page = readPageNumber(params.pagina);
   await requireRole("student", "/aluno/notificacoes");
   const supabase = await createSupabaseServerClient();
+  const { from, to } = pageQueryRange(page, INBOX_PAGE_SIZE);
 
-  // O TOTAL POR LER VEM DA MESMA FONTE QUE O SINO.
-  //
-  // Derivá-lo dos 50 itens carregados dava números falsos nos dois sentidos:
-  // com 137 por ler, a página dizia "50 por ler"; e se as 50 mais recentes já
-  // estivessem lidas, a página dizia que não havia nada por ler — escondendo o
-  // botão que era a única forma de limpar o contador do sino.
-  //
-  // `count: "exact"` vem na mesma resposta da lista: dá para saber que há mais
-  // do que 50 sem carregar a caixa inteira, e sem uma segunda ida ao servidor.
-  const [{ data, error, count }, unreadCount] = await Promise.all([
+  // O total por ler continua a vir da mesma RPC que alimenta o sino. A página
+  // consulta apenas a janela pedida e nunca deriva esse total dos itens visíveis.
+  const [{ data, error }, unreadCount] = await Promise.all([
     supabase
       .from("user_notification_records")
-      .select(
-        "id, type, title, body, lesson_id, read_at, created_at, lesson_starts_at, location_name",
-        { count: "exact" },
-      )
+      .select("id, type, title, body, lesson_id, read_at, created_at, lesson_starts_at, location_name")
       .order("created_at", { ascending: false })
-      .limit(INBOX_LIMIT),
+      .order("id", { ascending: false })
+      .range(from, to),
     unreadNotificationCount(),
   ]);
 
@@ -59,9 +59,8 @@ export default async function StudentNotificationsPage() {
     throw new Error("Não foi possível carregar os seus avisos.");
   }
 
-  const notifications = data ?? [];
-  const totalNotifications = count ?? notifications.length;
-  const hasMoreThanShown = totalNotifications > notifications.length;
+  const paged = pageSlice(data ?? [], INBOX_PAGE_SIZE);
+  const notifications = paged.rows;
 
   return (
     <div className="flex flex-col gap-6">
@@ -78,7 +77,7 @@ export default async function StudentNotificationsPage() {
             {unreadCount === 1 ? "1 por ler" : `${unreadCount} por ler`}
           </Badge>
           {/* Aparece com base no total da CONTA, e não no que coube na lista:
-              um aviso por ler mais antigo do que os 50 mostrados continua a
+              um aviso por ler fora da página atual continua a
               precisar de forma de ser limpo. */}
           <MarkAllNotificationsReadButton />
         </div>
@@ -86,16 +85,15 @@ export default async function StudentNotificationsPage() {
 
       <section>
         <SectionTitle>Histórico</SectionTitle>
-        {hasMoreThanShown && (
-          <p className="mb-3 text-sm text-muted">
-            A mostrar os {INBOX_LIMIT} avisos mais recentes.
-          </p>
-        )}
         {notifications.length === 0 ? (
           <EmptyState
             icon={BellRing}
-            title="Ainda não tem avisos"
-            description="Quando o seu professor marcar, mudar ou cancelar uma aula, o aviso aparece aqui."
+            title={page > 1 ? "Esta página já não tem avisos" : "Ainda não tem avisos"}
+            description={
+              page > 1
+                ? "Volte à página anterior para continuar a consultar os seus avisos."
+                : "Quando o seu professor marcar, mudar ou cancelar uma aula, o aviso aparece aqui."
+            }
           />
         ) : (
           <ul className="flex flex-col gap-3">
@@ -152,6 +150,13 @@ export default async function StudentNotificationsPage() {
           </ul>
         )}
       </section>
+
+      <Pagination
+        basePath="/aluno/notificacoes"
+        searchParams={params}
+        page={page}
+        hasNext={paged.hasNext}
+      />
     </div>
   );
 }
