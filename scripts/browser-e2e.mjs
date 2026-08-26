@@ -213,6 +213,18 @@ async function signIn(context, account) {
   return page;
 }
 
+async function authenticatedApiClient(account) {
+  const client = createClient(env.NEXT_PUBLIC_SUPABASE_URL, env.NEXT_PUBLIC_SUPABASE_ANON_KEY, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
+  const { error } = await client.auth.signInWithPassword({
+    email: account.email,
+    password: account.password,
+  });
+  if (error) throw new Error(`Não foi possível preparar a sessão API de ${account.role}: ${error.message}`);
+  return client;
+}
+
 /**
  * Espera que o pending termine — a regressão principal desta fase.
  *
@@ -2892,8 +2904,92 @@ async function mobileNotificationsScenario(browser) {
   await context.close();
 }
 
-async function paginatedSurfacesScenario(browser) {
+const E2E_LOW_BALANCE_THRESHOLD = 2;
+const E2E_EXPIRY_WARNING_DAYS = 7;
+
+function browserLisbonDateKey() {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Europe/Lisbon",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date());
+  const part = (type) => parts.find((entry) => entry.type === type)?.value;
+  return `${part("year")}-${part("month")}-${part("day")}`;
+}
+
+function addCivilDateDays(value, days) {
+  const date = new Date(`${value}T00:00:00.000Z`);
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
+}
+
+async function exactCount(query, label) {
+  const { count, error } = await query;
+  if (error) throw new Error(`${label}: ${error.message}`);
+  return count ?? 0;
+}
+
+async function expectedTeacherPackageSummary(client, filters = {}) {
+  const today = browserLisbonDateKey();
+  const expiryBoundary = addCivilDateDays(today, E2E_EXPIRY_WARNING_DAYS);
+  const base = () => {
+    let query = client
+      .from("teacher_package_records")
+      .select("id", { count: "exact", head: true });
+    if (filters.status) query = query.eq("status", filters.status);
+    if (filters.balance === "low") {
+      query = query
+        .gte("credits_available", 1)
+        .lte("credits_available", E2E_LOW_BALANCE_THRESHOLD);
+    }
+    return query;
+  };
+
+  const [active, low, empty, expiring, expired] = await Promise.all([
+    exactCount(base().eq("status", "active"), "Contar pacotes ativos"),
+    exactCount(
+      base()
+        .gte("credits_available", 1)
+        .lte("credits_available", E2E_LOW_BALANCE_THRESHOLD),
+      "Contar pacotes com saldo baixo",
+    ),
+    exactCount(base().eq("credits_available", 0), "Contar pacotes sem saldo"),
+    exactCount(
+      base().gte("expires_on", today).lte("expires_on", expiryBoundary),
+      "Contar pacotes a expirar",
+    ),
+    exactCount(base().lt("expires_on", today), "Contar pacotes expirados"),
+  ]);
+  return { active, low, empty, expiring, expired };
+}
+
+async function visibleTeacherPackageSummary(page) {
+  const result = {};
+  for (const metric of ["active", "low", "empty", "expiring", "expired"]) {
+    const value = await page
+      .locator(`[data-package-summary="${metric}"] [data-summary-value]`)
+      .textContent();
+    result[metric] = Number(value);
+  }
+  return result;
+}
+
+async function paginatedSurfacesScenario(browser, teacherApiClient) {
   section("Superficies paginadas e historicos");
+
+  const studentApiClient = await authenticatedApiClient(ACCOUNTS.student);
+  const expectedStudentPackages = await studentApiClient
+    .from("student_package_records")
+    .select("id, operational_sort_rank, expires_on, created_at")
+    .order("operational_sort_rank", { ascending: true })
+    .order("expires_on", { ascending: true, nullsFirst: false })
+    .order("created_at", { ascending: false })
+    .order("id", { ascending: false })
+    .range(0, 23);
+  if (expectedStudentPackages.error) {
+    throw new Error(`Preparar ordem dos pacotes do aluno: ${expectedStudentPackages.error.message}`);
+  }
 
   const studentContext = await browser.newContext();
   studentContext.on("page", (page) => {
@@ -2907,8 +3003,8 @@ async function paginatedSurfacesScenario(browser) {
   await studentPage.goto(`${BASE_URL}/aluno/pacotes`, { waitUntil: "domcontentloaded" });
   await studentPage.getByRole("heading", { name: "Os seus pacotes" }).waitFor({ timeout: 20_000 });
   const firstPackageCards = studentPage.locator("[data-student-package-card]");
-  const firstPackageNames = await firstPackageCards.evaluateAll((cards) =>
-    cards.map((card) => card.querySelector("h2")?.textContent?.trim() ?? ""),
+  const firstPackageIds = await firstPackageCards.evaluateAll((cards) =>
+    cards.map((card) => card.getAttribute("data-package-id")),
   );
   const firstPackageHeight = await studentPage.evaluate(
     () => document.documentElement.scrollHeight,
@@ -2924,16 +3020,22 @@ async function paginatedSurfacesScenario(browser) {
     studentPage.getByRole("link", { name: "Seguinte" }).click(),
   ]);
   const secondPackageCards = studentPage.locator("[data-student-package-card]");
-  const secondPackageNames = await secondPackageCards.evaluateAll((cards) =>
-    cards.map((card) => card.querySelector("h2")?.textContent?.trim() ?? ""),
+  const secondPackageIds = await secondPackageCards.evaluateAll((cards) =>
+    cards.map((card) => card.getAttribute("data-package-id")),
   );
   check(
     (await secondPackageCards.count()) === 12,
     "A segunda pagina de pacotes abre com mais 12 registos",
   );
   check(
-    firstPackageNames.every((name) => !secondPackageNames.includes(name)),
+    firstPackageIds.every((id) => !secondPackageIds.includes(id)),
     "Paginas adjacentes de pacotes nao repetem registos",
+  );
+  const expectedStudentIds = (expectedStudentPackages.data ?? []).map((pack) => pack.id);
+  check(
+    JSON.stringify([...firstPackageIds, ...secondPackageIds]) ===
+      JSON.stringify(expectedStudentIds),
+    "Pacotes do aluno preservam a ordem operacional global entre paginas",
   );
   check(
     (await studentPage.getByRole("link", { name: "Anterior" }).count()) === 1,
@@ -2959,6 +3061,7 @@ async function paginatedSurfacesScenario(browser) {
   );
 
   await studentContext.close();
+  await studentApiClient.auth.signOut();
 
   const teacherContext = await browser.newContext();
   teacherContext.on("page", (page) => {
@@ -3006,6 +3109,19 @@ async function paginatedSurfacesScenario(browser) {
     .waitFor({ timeout: 20_000 });
   check((await teacherPage.locator("main tbody tr").count()) === 25, "Turmas limitam a pagina a 25");
 
+  const expectedTeacherPackages = await teacherApiClient
+    .from("teacher_package_records")
+    .select("id, operational_sort_rank, expires_on, created_at")
+    .order("operational_sort_rank", { ascending: true })
+    .order("expires_on", { ascending: true, nullsFirst: false })
+    .order("created_at", { ascending: false })
+    .order("id", { ascending: false })
+    .range(0, 49);
+  if (expectedTeacherPackages.error) {
+    throw new Error(`Preparar ordem dos pacotes do professor: ${expectedTeacherPackages.error.message}`);
+  }
+  const expectedUnfilteredSummary = await expectedTeacherPackageSummary(teacherApiClient);
+
   await teacherPage.goto(`${BASE_URL}/professor/pacotes?tab=assigned`, {
     waitUntil: "domcontentloaded",
   });
@@ -3016,6 +3132,94 @@ async function paginatedSurfacesScenario(browser) {
   check(
     (await teacherPage.locator("main tbody tr").count()) === 25,
     "Pacotes atribuidos limitam a pagina a 25",
+  );
+  const firstTeacherPackageIds = await teacherPage
+    .locator("main tbody tr[data-teacher-package-id]")
+    .evaluateAll((rows) => rows.map((row) => row.getAttribute("data-teacher-package-id")));
+  check(
+    JSON.stringify(await visibleTeacherPackageSummary(teacherPage)) ===
+      JSON.stringify(expectedUnfilteredSummary) &&
+      expectedUnfilteredSummary.active > 25,
+    "Resumo de pacotes conta todo o resultado, não apenas a pagina atual",
+    JSON.stringify(expectedUnfilteredSummary),
+  );
+
+  await Promise.all([
+    teacherPage.waitForURL((url) => url.searchParams.get("pagina") === "2", { timeout: 20_000 }),
+    teacherPage.getByRole("link", { name: "Seguinte" }).click(),
+  ]);
+  const secondTeacherPackageIds = await teacherPage
+    .locator("main tbody tr[data-teacher-package-id]")
+    .evaluateAll((rows) => rows.map((row) => row.getAttribute("data-teacher-package-id")));
+  check(
+    JSON.stringify([...firstTeacherPackageIds, ...secondTeacherPackageIds]) ===
+      JSON.stringify((expectedTeacherPackages.data ?? []).map((pack) => pack.id)),
+    "Pacotes do professor preservam a ordem operacional global entre paginas",
+  );
+
+  const filteredSummary = await expectedTeacherPackageSummary(teacherApiClient, {
+    status: "active",
+    balance: "low",
+  });
+  await teacherPage.goto(
+    `${BASE_URL}/professor/pacotes?tab=assigned&status=active&balance=low`,
+    { waitUntil: "domcontentloaded" },
+  );
+  await teacherPage
+    .locator("[data-package-summary=active]")
+    .waitFor({ timeout: 20_000 });
+  check(
+    JSON.stringify(await visibleTeacherPackageSummary(teacherPage)) ===
+      JSON.stringify(filteredSummary) &&
+      filteredSummary.active > 25,
+    "Resumo aplica os filtros ao conjunto completo antes de contar",
+    JSON.stringify(filteredSummary),
+  );
+
+  await teacherPage.goto(
+    `${BASE_URL}/professor/pacotes?tab=assigned&status=active&balance=low&pagina=2`,
+    { waitUntil: "domcontentloaded" },
+  );
+  await Promise.all([
+    teacherPage.waitForURL((url) => !url.searchParams.has("pagina"), { timeout: 20_000 }),
+    teacherPage.getByRole("button", { name: "Aplicar filtros" }).click(),
+  ]);
+  check(
+    !new URL(teacherPage.url()).searchParams.has("pagina"),
+    "Alterar filtros repõe a pagina atribuida para a primeira",
+  );
+
+  const { data: firstSport } = await teacherApiClient
+    .from("sports")
+    .select("id")
+    .eq("is_active", true)
+    .limit(1)
+    .maybeSingle();
+  if (!firstSport?.id) throw new Error("Não existe modalidade controlada para provar os links de filtro.");
+  const allFilterParams = new URLSearchParams({
+    tab: "assigned",
+    search: "Pacote",
+    status: "cancelled",
+    sportId: firstSport.id,
+    balance: "all",
+    expiry: "all",
+    pagina: "2",
+  });
+  await teacherPage.goto(`${BASE_URL}/professor/pacotes?${allFilterParams}`, {
+    waitUntil: "domcontentloaded",
+  });
+  const previousHref = await teacherPage.getByRole("link", { name: "Anterior" }).getAttribute("href");
+  const previousUrl = new URL(previousHref, BASE_URL);
+  check(
+    previousUrl.searchParams.get("tab") === "assigned" &&
+      previousUrl.searchParams.get("search") === "Pacote" &&
+      previousUrl.searchParams.get("status") === "cancelled" &&
+      previousUrl.searchParams.get("sportId") === firstSport.id &&
+      previousUrl.searchParams.get("balance") === "all" &&
+      previousUrl.searchParams.get("expiry") === "all" &&
+      previousUrl.searchParams.getAll("pagina").length === 0,
+    "Anterior preserva todos os filtros sem duplicar o parametro de pagina",
+    previousHref,
   );
 
   await teacherPage.goto(`${BASE_URL}/professor/pacotes/historico`, {
@@ -3323,7 +3527,7 @@ async function main() {
     await preferencesScenario(browser, lessons.client);
     await teacherPreferencesScenario(browser);
     await mobileNotificationsScenario(browser);
-    await paginatedSurfacesScenario(browser);
+    await paginatedSurfacesScenario(browser, lessons.client);
 
     await mobileScenario(browser, lessons.operable ?? lessons.cancellable);
     await mobileRescheduleScenario(browser, replacementId);

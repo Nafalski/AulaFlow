@@ -2499,6 +2499,26 @@ checks as (
 
   union all
   select
+    'estrutura',
+    'projecoes de pacotes expoem prioridade operacional paginavel',
+    (
+      select count(*) = 2
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name in ('student_package_records', 'teacher_package_records')
+        and column_name = 'operational_sort_rank'
+        and data_type = 'integer'
+    ),
+    coalesce((
+      select string_agg(table_name || '.' || column_name || ':' || data_type, ', ' order by table_name)
+      from information_schema.columns
+      where table_schema = 'public'
+        and table_name in ('student_package_records', 'teacher_package_records')
+        and column_name = 'operational_sort_rank'
+    ), 'ausente')
+
+  union all
+  select
     'privacidade',
     'view do aluno nao contem campos administrativos do pacote',
     not exists (

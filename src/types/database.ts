@@ -973,6 +973,7 @@ export type TeacherPackageRecord = {
   created_by_name: string | null;
   created_at: Timestamp;
   updated_at: Timestamp;
+  operational_sort_rank: number;
 };
 
 export type StudentPackageRecord = {
@@ -990,6 +991,7 @@ export type StudentPackageRecord = {
   status: PackageStatus;
   created_at: Timestamp;
   updated_at: Timestamp;
+  operational_sort_rank: number;
 };
 
 export type StudentPackageTransactionRecord = {

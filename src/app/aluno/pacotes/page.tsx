@@ -38,7 +38,7 @@ export default async function StudentPackagesPage({
   const packageResult = await supabase
     .from("student_package_records")
     .select(PACKAGE_COLUMNS)
-    .order("status", { ascending: true })
+    .order("operational_sort_rank", { ascending: true })
     .order("expires_on", { ascending: true, nullsFirst: false })
     .order("created_at", { ascending: false })
     .order("id", { ascending: false })

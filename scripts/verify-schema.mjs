@@ -2883,6 +2883,183 @@ check(
   `colunas indevidas na view do aluno: ${forbiddenStudentColumns.join(", ")}`,
 );
 
+async function verifyPackagePaginationSemantics() {
+const packageOrderingRank = {
+  active: 0,
+  not_started: 1,
+  suspended: 2,
+  depleted: 3,
+  expired: 4,
+  cancelled: 5,
+};
+const packageOrderingStatuses = Object.keys(packageOrderingRank);
+const packageOrderingPrefix = "Ordenação operacional paginada ";
+
+for (const [statusIndex, status] of packageOrderingStatuses.entries()) {
+  for (let itemIndex = 0; itemIndex < 6; itemIndex += 1) {
+    const initialStatus = status === "not_started" || status === "expired" ? status : "active";
+    const startsOffset = status === "not_started" ? 1 : -60;
+    const futureExpiryOffsets = [3, 20, 20, 20, 30, 40];
+    const expiredExpiryOffsets = [-40, -30, -30, -30, -20, -10];
+    const expiresOffset =
+      status === "active" && itemIndex === 5
+        ? null
+        : status === "expired"
+          ? expiredExpiryOffsets[itemIndex]
+          : futureExpiryOffsets[itemIndex];
+    const createdAt =
+      itemIndex === 1
+        ? "2026-08-03T10:00:00.000Z"
+        : itemIndex === 2 || itemIndex === 3
+          ? "2026-08-02T10:00:00.000Z"
+          : "2026-08-01T10:00:00.000Z";
+    const fixture = await one(
+      `insert into public.student_packages (
+         organization_id, student_id, teacher_id, name,
+         initial_credits, credits_total, credits_available, credits_reserved, credits_used,
+         starts_on, expires_on, status, created_by, created_at, updated_at
+       ) values (
+         $1, $2, $3, $4,
+         3, 3, 3, 0, 0,
+         (now() at time zone 'Europe/Lisbon')::date + $5::int,
+         case when $6::int is null then null
+              else (now() at time zone 'Europe/Lisbon')::date + $6::int end,
+         $7::public.package_status, $8, $9::timestamptz, $9::timestamptz
+       ) returning id`,
+      [
+        org,
+        ana.id,
+        teacher.id,
+        `${packageOrderingPrefix}${statusIndex}-${itemIndex}`,
+        startsOffset,
+        expiresOffset,
+        initialStatus,
+        TEACHER_UID,
+        createdAt,
+      ],
+    );
+
+    const creditsAvailable = status === "depleted" ? 0 : itemIndex <= 1 ? 2 : 3;
+    const creditsUsed = 3 - creditsAvailable;
+    await db.query(
+      `update public.student_packages
+          set status=$2::public.package_status,
+              credits_available=$3,
+              credits_used=$4
+        where id=$1`,
+      [fixture.id, status, creditsAvailable, creditsUsed],
+    );
+  }
+}
+
+async function packageOrderingPages(role, uid, view, pageSize) {
+  const pages = [];
+  for (let offset = 0; offset < 36; offset += pageSize) {
+    const fetched = await asDatabaseRole(role, uid, () =>
+      rows(
+        `select id, name, status, operational_sort_rank, expires_on, created_at
+           from public.${view}
+          where name like $1
+          order by operational_sort_rank asc,
+                   expires_on asc nulls last,
+                   created_at desc,
+                   id desc
+          limit $2 offset $3`,
+        [`${packageOrderingPrefix}%`, pageSize + 1, offset],
+      ),
+    );
+    pages.push(fetched.slice(0, pageSize));
+  }
+  return pages;
+}
+
+function packageRowsAreGloballyOrdered(pages) {
+  const records = pages.flat();
+  const timeValue = (value) =>
+    value instanceof Date ? value.getTime() : Date.parse(String(value));
+  const pairIsOrdered = (left, right) => {
+    if (left.operational_sort_rank !== right.operational_sort_rank) {
+      return left.operational_sort_rank < right.operational_sort_rank;
+    }
+    const leftExpiry = left.expires_on === null ? null : timeValue(left.expires_on);
+    const rightExpiry = right.expires_on === null ? null : timeValue(right.expires_on);
+    if (leftExpiry !== rightExpiry) {
+      if (left.expires_on === null) return false;
+      if (right.expires_on === null) return true;
+      return leftExpiry < rightExpiry;
+    }
+    const leftCreatedAt = timeValue(left.created_at);
+    const rightCreatedAt = timeValue(right.created_at);
+    if (leftCreatedAt !== rightCreatedAt) return leftCreatedAt > rightCreatedAt;
+    return left.id > right.id;
+  };
+
+  return (
+    records.length === 36 &&
+    new Set(records.map((record) => record.id)).size === 36 &&
+    records.every(
+      (record) => record.operational_sort_rank === packageOrderingRank[record.status],
+    ) &&
+    records.slice(1).every((record, index) => pairIsOrdered(records[index], record)) &&
+    JSON.stringify([...new Set(records.map((record) => record.status))]) ===
+      JSON.stringify(packageOrderingStatuses)
+  );
+}
+
+const studentOrderingPages = await packageOrderingPages(
+  "authenticated",
+  ANA_UID,
+  "student_package_records",
+  12,
+);
+check(
+  packageRowsAreGloballyOrdered(studentOrderingPages),
+  "paginação do aluno preserva prioridade operacional, validade, criação e ID entre páginas",
+);
+
+const teacherOrderingPages = await packageOrderingPages(
+  "authenticated",
+  TEACHER_UID,
+  "teacher_package_records",
+  25,
+);
+check(
+  packageRowsAreGloballyOrdered(teacherOrderingPages),
+  "paginação do professor preserva prioridade operacional, validade, criação e ID entre páginas",
+);
+
+const fullFilteredPackageSummary = await asDatabaseRole("authenticated", TEACHER_UID, () =>
+  one(
+    `select
+       count(*) as total,
+       count(*) filter (where status='active') as active,
+       count(*) filter (where credits_available between 1 and 2) as low,
+       count(*) filter (where credits_available=0) as empty,
+       count(*) filter (
+         where expires_on between (now() at time zone 'Europe/Lisbon')::date
+           and ((now() at time zone 'Europe/Lisbon')::date + 7)
+       ) as expiring,
+       count(*) filter (
+         where expires_on < (now() at time zone 'Europe/Lisbon')::date
+       ) as expired
+     from public.teacher_package_records
+     where name like $1`,
+    [`${packageOrderingPrefix}%`],
+  ),
+);
+check(
+  Number(fullFilteredPackageSummary.total) === 36 &&
+    Number(fullFilteredPackageSummary.total) > 25 &&
+    Number(fullFilteredPackageSummary.active) === 6 &&
+    Number(fullFilteredPackageSummary.low) === 10 &&
+    Number(fullFilteredPackageSummary.empty) === 6 &&
+    Number(fullFilteredPackageSummary.expiring) === 5 &&
+    Number(fullFilteredPackageSummary.expired) === 6,
+  "resumo filtrado conta o conjunto completo e não apenas a página de 25 pacotes",
+  `resumo inesperado: ${JSON.stringify(fullFilteredPackageSummary)}`,
+);
+}
+
 const teacherPackageRows = await asDatabaseRole("authenticated", TEACHER_UID, () =>
   rows(
     `select id, student_id, student_name, name, sport_name, credits_available,
@@ -14911,6 +15088,8 @@ check(
   ).prosrc.match(/re_[A-Za-z0-9]{8,}|Bearer [A-Za-z0-9]/),
   "nenhum segredo literal ficou escrito na função de despacho",
 );
+
+await verifyPackagePaginationSemantics();
 
 // ── Resultado ────────────────────────────────────────────────────────────────
 

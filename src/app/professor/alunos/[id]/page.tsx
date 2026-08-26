@@ -142,7 +142,7 @@ export default async function StudentDetailPage({
       .from("teacher_package_records")
       .select(STUDENT_PACKAGE_COLUMNS)
       .eq("student_id", student.id)
-      .order("status", { ascending: true })
+      .order("operational_sort_rank", { ascending: true })
       .order("expires_on", { ascending: true, nullsFirst: false })
       .order("created_at", { ascending: false })
       .order("id", { ascending: false })

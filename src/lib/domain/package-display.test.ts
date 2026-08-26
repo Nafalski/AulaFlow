@@ -4,6 +4,7 @@ import {
   balanceAttention,
   daysBetweenDateOnly,
   expiryAttention,
+  packageOperationalRank,
   packageStatusLabel,
   sortPackageSnapshots,
   usagePercentage,
@@ -77,9 +78,44 @@ describe("package display", () => {
     ]);
   });
 
+  it("mantém a prioridade operacional completa e o desempate final por ID", () => {
+    const statuses: PackageStatus[] = [
+      "active",
+      "not_started",
+      "suspended",
+      "depleted",
+      "expired",
+      "cancelled",
+    ];
+    expect(statuses.map(packageOperationalRank)).toEqual([0, 1, 2, 3, 4, 5]);
+
+    const sorted = sortPackageSnapshots([
+      ...statuses.toReversed().map((status) => ({
+        ...pack({ status }),
+        id: `status-${status}`,
+      })),
+      { ...pack({ expiresOn: null }), id: "active-null" },
+      { ...pack({ createdAt: "2026-08-06T10:00:00.000Z" }), id: "active-newer" },
+      { ...pack(), id: "active-z" },
+      { ...pack(), id: "active-a" },
+    ]);
+
+    expect(sorted.map((item) => item.id)).toEqual([
+      "active-newer",
+      "status-active",
+      "active-z",
+      "active-a",
+      "active-null",
+      "status-not_started",
+      "status-suspended",
+      "status-depleted",
+      "status-expired",
+      "status-cancelled",
+    ]);
+  });
+
   it("calcula percentagem simples de utilização", () => {
     expect(usagePercentage(pack({ creditsUsed: 3, initialCredits: 10 }))).toBe(30);
     expect(usagePercentage(pack({ creditsUsed: 0, initialCredits: 0 }))).toBe(0);
   });
 });
-

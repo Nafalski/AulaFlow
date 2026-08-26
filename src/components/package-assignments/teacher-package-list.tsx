@@ -89,6 +89,7 @@ export function TeacherPackageList({
         {packages.map((pack) => (
           <Link
             key={pack.id}
+            data-teacher-package-id={pack.id}
             href={`/professor/pacotes/atribuicoes/${pack.id}`}
             className="min-h-11 rounded-[var(--radius-card)] border border-line bg-surface p-4 shadow-card transition-colors hover:border-brand/40"
           >
@@ -137,7 +138,7 @@ export function TeacherPackageList({
           </thead>
           <tbody className="divide-y divide-line">
             {packages.map((pack) => (
-              <tr key={pack.id}>
+              <tr key={pack.id} data-teacher-package-id={pack.id}>
                 <td className="px-4 py-3 font-bold text-ink">{pack.studentName}</td>
                 <td className="px-4 py-3">
                   <p className="font-bold text-ink">{pack.name}</p>

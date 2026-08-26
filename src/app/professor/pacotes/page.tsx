@@ -17,7 +17,9 @@ import { Alert } from "@/components/ui/alert";
 import { buttonClasses } from "@/components/ui/button";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Pagination } from "@/components/ui/pagination";
+import { Badge } from "@/components/ui/status-badge";
 import { PACKAGE_ORIGIN_LABELS } from "@/lib/domain/package-display";
+import { EXPIRY_WARNING_DAYS, LOW_BALANCE_THRESHOLD } from "@/lib/domain/packages";
 import { lisbonDateKey } from "@/lib/datetime";
 import { requireRole } from "@/lib/auth/session";
 import { pageQueryRange, pageSlice, readPageNumber } from "@/lib/pagination";
@@ -34,6 +36,9 @@ export const dynamic = "force-dynamic";
 type SearchParams = Record<string, string | string[] | undefined>;
 type Tab = "templates" | "assigned";
 const ASSIGNED_PAGE_SIZE = 25;
+const ASSIGNED_COLUMNS =
+  "id, student_id, student_name, name, sport_id, sport_name, initial_credits, credits_available, credits_reserved, credits_used, starts_on, expires_on, status, origin, paid_amount_cents, created_at";
+const EXACT_COUNT_OPTIONS = { count: "exact", head: true } as const;
 
 function valueOf(params: SearchParams, key: string): string | undefined {
   const value = params[key];
@@ -169,35 +174,59 @@ export default async function TeacherPackagesPage({
 
   const assignedFilters = readAssignedFilters(rawSearchParams);
   const assignedRange = pageQueryRange(assignedPage, ASSIGNED_PAGE_SIZE);
-  let assignedQuery = supabase
-    .from("teacher_package_records")
-    .select(
-      "id, student_id, student_name, name, sport_id, sport_name, initial_credits, credits_available, credits_reserved, credits_used, starts_on, expires_on, status, origin, paid_amount_cents, created_at",
-    )
-    .order("status", { ascending: true })
+  const expiryWarningDate = addDateDays(today, EXPIRY_WARNING_DAYS);
+
+  const buildAssignedQuery = (countOnly = false) => {
+    let query = supabase
+      .from("teacher_package_records")
+      .select(ASSIGNED_COLUMNS, countOnly ? EXACT_COUNT_OPTIONS : undefined);
+
+    if (assignedFilters.search) {
+      const pattern = `%${escapeLikePattern(assignedFilters.search)}%`;
+      query = query.or(`name.ilike.${pattern},student_name.ilike.${pattern}`);
+    }
+    if (assignedFilters.status !== "all") query = query.eq("status", assignedFilters.status);
+    if (assignedFilters.sportId) query = query.eq("sport_id", assignedFilters.sportId);
+    if (assignedFilters.balance === "low") {
+      query = query
+        .gte("credits_available", 1)
+        .lte("credits_available", LOW_BALANCE_THRESHOLD);
+    } else if (assignedFilters.balance === "empty") {
+      query = query.eq("credits_available", 0);
+    }
+    if (assignedFilters.expiry === "soon") {
+      query = query.gte("expires_on", today).lte("expires_on", expiryWarningDate);
+    } else if (assignedFilters.expiry === "expired") {
+      query = query.lt("expires_on", today);
+    }
+
+    return query;
+  };
+
+  const assignedQuery = buildAssignedQuery()
+    .order("operational_sort_rank", { ascending: true })
     .order("expires_on", { ascending: true, nullsFirst: false })
     .order("created_at", { ascending: false })
     .order("id", { ascending: false })
     .range(assignedRange.from, assignedRange.to);
 
-  if (assignedFilters.search) {
-    const pattern = `%${escapeLikePattern(assignedFilters.search)}%`;
-    assignedQuery = assignedQuery.or(`name.ilike.${pattern},student_name.ilike.${pattern}`);
-  }
-  if (assignedFilters.status !== "all") assignedQuery = assignedQuery.eq("status", assignedFilters.status);
-  if (assignedFilters.sportId) assignedQuery = assignedQuery.eq("sport_id", assignedFilters.sportId);
-  if (assignedFilters.balance === "low") {
-    assignedQuery = assignedQuery.gte("credits_available", 1).lte("credits_available", 2);
-  } else if (assignedFilters.balance === "empty") {
-    assignedQuery = assignedQuery.eq("credits_available", 0);
-  }
-  if (assignedFilters.expiry === "soon") {
-    assignedQuery = assignedQuery.gte("expires_on", today).lte("expires_on", addDateDays(today, 7));
-  } else if (assignedFilters.expiry === "expired") {
-    assignedQuery = assignedQuery.lt("expires_on", today);
-  }
+  const assignedSummaryPromise = tab === "assigned"
+    ? Promise.all([
+        buildAssignedQuery(true).eq("status", "active"),
+        buildAssignedQuery(true)
+          .gte("credits_available", 1)
+          .lte("credits_available", LOW_BALANCE_THRESHOLD),
+        buildAssignedQuery(true).eq("credits_available", 0),
+        buildAssignedQuery(true).gte("expires_on", today).lte("expires_on", expiryWarningDate),
+        buildAssignedQuery(true).lt("expires_on", today),
+      ])
+    : Promise.resolve(null);
 
-  const [templateResult, assignedResult] = await Promise.all([templateQuery, assignedQuery]);
+  const [templateResult, assignedResult, summaryResults] = await Promise.all([
+    templateQuery,
+    assignedQuery,
+    assignedSummaryPromise,
+  ]);
 
   if (templateResult.error) {
     console.error("[AulaFlow] Falha ao carregar modelos de pacotes.", templateResult.error);
@@ -206,6 +235,11 @@ export default async function TeacherPackagesPage({
   if (assignedResult.error) {
     console.error("[AulaFlow] Falha ao carregar pacotes atribuídos.", assignedResult.error);
     throw new Error("Não foi possível carregar os pacotes atribuídos.");
+  }
+  const summaryError = summaryResults?.find((result) => result.error)?.error;
+  if (summaryError) {
+    console.error("[AulaFlow] Falha ao resumir os pacotes atribuídos.", summaryError);
+    throw new Error("Não foi possível calcular o resumo dos pacotes atribuídos.");
   }
 
   const templates: PackageTemplateListEntry[] = (templateResult.data ?? []).map((template) => ({
@@ -220,6 +254,13 @@ export default async function TeacherPackagesPage({
 
   const pagedAssigned = pageSlice(assignedResult.data ?? [], ASSIGNED_PAGE_SIZE);
   const assignedPackages = pagedAssigned.rows.map(toEntry);
+  const assignedSummary = {
+    active: summaryResults?.[0].count ?? 0,
+    low: summaryResults?.[1].count ?? 0,
+    empty: summaryResults?.[2].count ?? 0,
+    expiring: summaryResults?.[3].count ?? 0,
+    expired: summaryResults?.[4].count ?? 0,
+  };
   const hasTemplateFilters =
     templateFilters.search !== "" || templateFilters.status !== "all" || templateFilters.sportId !== null;
   const hasAssignedFilters =
@@ -299,6 +340,13 @@ export default async function TeacherPackagesPage({
         </>
       ) : (
         <>
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+            <SummaryMetric metric="active" label="Ativos" value={assignedSummary.active} />
+            <SummaryMetric metric="low" label="Saldo baixo" value={assignedSummary.low} tone="warning" />
+            <SummaryMetric metric="empty" label="Sem saldo" value={assignedSummary.empty} tone="danger" />
+            <SummaryMetric metric="expiring" label="A expirar" value={assignedSummary.expiring} tone="warning" />
+            <SummaryMetric metric="expired" label="Expirados" value={assignedSummary.expired} tone="danger" />
+          </div>
           <TeacherPackageFiltersForm filters={assignedFilters} sports={sports} />
           {assignedPackages.length === 0 ? (
             <EmptyState
@@ -336,6 +384,29 @@ export default async function TeacherPackagesPage({
           />
         </>
       )}
+    </div>
+  );
+}
+
+function SummaryMetric({
+  metric,
+  label,
+  value,
+  tone = "neutral",
+}: {
+  metric: "active" | "low" | "empty" | "expiring" | "expired";
+  label: string;
+  value: number;
+  tone?: "neutral" | "warning" | "danger";
+}) {
+  return (
+    <div
+      data-package-summary={metric}
+      className="rounded-[var(--radius-card)] border border-line bg-surface p-4"
+    >
+      <p data-summary-value className="text-2xl font-extrabold text-ink">{value}</p>
+      <p className="mt-1 text-sm font-semibold text-muted">{label}</p>
+      {tone !== "neutral" && <Badge tone={tone}>{tone === "danger" ? "Atenção" : "Vigiar"}</Badge>}
     </div>
   );
 }

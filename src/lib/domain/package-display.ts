@@ -115,6 +115,10 @@ export function sortPackageSnapshots<T extends PackageDisplaySnapshot>(packages:
       return a.expiresOn < b.expiresOn ? -1 : 1;
     }
 
-    return a.createdAt > b.createdAt ? -1 : a.createdAt < b.createdAt ? 1 : 0;
+    if (a.createdAt !== b.createdAt) return a.createdAt > b.createdAt ? -1 : 1;
+    if ("id" in a && "id" in b && typeof a.id === "string" && typeof b.id === "string") {
+      return a.id > b.id ? -1 : a.id < b.id ? 1 : 0;
+    }
+    return 0;
   });
 }

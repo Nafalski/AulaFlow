@@ -41,4 +41,20 @@ describe("paginação por URL", () => {
       "/professor/alunos?search=Rita+Silva&status=active&tag=a&tag=b",
     );
   });
+
+  it("preserva todos os filtros dos pacotes atribuídos sem duplicar a página", () => {
+    const params = {
+      tab: "assigned",
+      search: "Pacote escola",
+      status: "active",
+      sportId: "00000000-0000-4000-8000-000000000001",
+      balance: "low",
+      expiry: "soon",
+      pagina: ["7", "8"],
+    };
+
+    expect(buildPageHref("/professor/pacotes", params, 3)).toBe(
+      "/professor/pacotes?tab=assigned&search=Pacote+escola&status=active&sportId=00000000-0000-4000-8000-000000000001&balance=low&expiry=soon&pagina=3",
+    );
+  });
 });
