@@ -11836,12 +11836,23 @@ await mustReject("aula cancelada não é reagendada", () =>
 );
 
 // Presença registada trava o reagendamento, tal como trava o cancelamento.
+//
+// A hora é ancorada, e não herdada de `now()`. Esta fixture precisa de estar
+// no PASSADO — só depois do início se pode marcar presença — mas ancorá-la em
+// `now() - 5 dias` fazia-a herdar a hora do relógio e deslizar por todo o dia.
+// As datas civis fixas da 5C/5D ocupam a faixa das 09:00 às 21:00 UTC, por isso
+// a suite passava de madrugada e falhava a horas de expediente, com
+// "Já tem outra aula nesse horário" contra a fixture "Aula no clube".
+//
+// É o mesmo cuidado que a 6A/6B já documenta em `createOperationalLesson`: o
+// que é de escala diária ancora-se numa hora fixa. As 05:30 ficam longe da
+// faixa civil e longe das 03:00 que as fixtures operacionais usam.
 const attendedForReschedule = await one(
   `insert into public.lessons
      (organization_id, teacher_id, sport_id, title, starts_at, ends_at, credit_cost)
    values ($1,$2,$3,'Com presença 6C.1',
-           now() - '5 days'::interval + '37 minutes'::interval,
-           now() - '5 days'::interval + '97 minutes'::interval, 1)
+           date_trunc('day', now()) - '5 days'::interval + '5 hours 30 minutes'::interval,
+           date_trunc('day', now()) - '5 days'::interval + '6 hours 30 minutes'::interval, 1)
    returning id`,
   [org, teacher.id, sport],
 );
