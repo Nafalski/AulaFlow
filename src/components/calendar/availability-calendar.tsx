@@ -36,7 +36,6 @@ import {
   formatFullDate,
   formatMonthYear,
   formatWeekdayDate,
-  TIMEZONE,
 } from "@/lib/datetime";
 import { calendarHref } from "@/lib/validation/calendar";
 import { cn } from "@/lib/utils";
@@ -375,10 +374,19 @@ function TimelineTimeColumn({ range }: { range: CalendarTimelineRange }) {
         const top = timelinePositionForMinutes(minutes, range);
         if (top === null) return null;
 
+        // AS HORAS DOS EXTREMOS NÃO PODEM FICAR A MEIO DE FORA.
+        //
+        // Cada hora é centrada na sua linha, o que está certo no meio da
+        // grelha. Mas a primeira linha está no topo do contentor: metade do
+        // "06:00" ficava acima da área visível e lia-se como um corte. A última
+        // tinha o mesmo problema em baixo. Nos extremos, a etiqueta encosta em
+        // vez de se centrar.
+        const anchor = top === 0 ? "translate-y-0" : top === 100 ? "-translate-y-full" : "-translate-y-1/2";
+
         return (
           <span
             key={label.startsAt}
-            className="absolute right-2 -translate-y-1/2 tabular-nums"
+            className={cn("absolute right-2 tabular-nums", anchor)}
             style={{ top: `${top}%` }}
           >
             {label.startsAt}
@@ -536,6 +544,16 @@ function WeekAllDayStrip({
 }) {
   const hasItems = days.some((date) => allDayItemsForDate(items, date, audience).length > 0);
 
+  // NA SEMANA SEM BLOQUEIOS DE DIA INTEIRO, A FAIXA NÃO EXISTE.
+  //
+  // Estava lá sempre, com "Sem eventos de dia inteiro" escrito ao lado, a
+  // ocupar uma faixa inteira acima da grelha e a comprimir a primeira hora do
+  // dia. Anunciar a ausência de uma coisa rara custa espaço todos os dias, e o
+  // calendário é o ecrã onde o espaço vale mais.
+  //
+  // Quando existem mesmo, a faixa volta — com a mesma separação de sempre.
+  if (!hasItems) return null;
+
   return (
     <div
       className="grid border-b border-line bg-surface"
@@ -550,9 +568,6 @@ function WeekAllDayStrip({
             {allDayItemsForDate(items, date, audience).map((item, index) => (
               <AllDayPill key={itemKey(item, index)} item={item} audience={audience} />
             ))}
-            {!hasItems && date === days[0] && (
-              <span className="text-xs font-semibold text-muted">Sem eventos de dia inteiro</span>
-            )}
           </div>
         </div>
       ))}
@@ -571,17 +586,16 @@ function DayAllDayStrip({
 }) {
   const allDayItems = allDayItemsForDate(items, date, audience);
 
+  // Sem nada para mostrar, a faixa desaparece e a linha do tempo começa limpa.
+  if (allDayItems.length === 0) return null;
+
   return (
     <div className="border-b border-line bg-surface p-2">
       <p className="mb-1 text-[0.72rem] font-bold text-muted">Dia inteiro</p>
       <div className="flex min-w-0 flex-wrap gap-1.5">
-        {allDayItems.length > 0 ? (
-          allDayItems.map((item, index) => (
-            <AllDayPill key={itemKey(item, index)} item={item} audience={audience} />
-          ))
-        ) : (
-          <span className="text-xs font-semibold text-muted">Sem eventos de dia inteiro</span>
-        )}
+        {allDayItems.map((item, index) => (
+          <AllDayPill key={itemKey(item, index)} item={item} audience={audience} />
+        ))}
       </div>
     </div>
   );
@@ -605,8 +619,11 @@ function WeekHeader({
       className="sticky top-0 z-30 grid border-b border-line bg-surface"
       style={{ gridTemplateColumns: WEEK_GRID_COLUMNS }}
     >
+      {/* Esta célula fica por cima da coluna das horas, e é isso que ela deve
+          dizer. Tinha o identificador `Europe/Lisbon` — informação técnica, no
+          canto mais apertado do ecrã, a nomear uma coisa que não é o fuso. */}
       <div className="flex items-center justify-center border-r border-line px-2 py-3 text-[0.72rem] font-bold text-muted">
-        {TIMEZONE}
+        Horas
       </div>
       {days.map((date) => {
         const isToday = date === today;
@@ -1281,9 +1298,11 @@ export function AvailabilityCalendar({
             <div className="flex flex-wrap items-center gap-2 text-brand">
               <CalendarDays className="size-5" aria-hidden="true" />
               <p className="text-sm font-bold tracking-wide uppercase">{title}</p>
-              <span className="rounded-full border border-brand-soft bg-brand-tint px-2 py-0.5 text-xs font-bold text-brand-deep">
-                {TIMEZONE}
-              </span>
+              {/* O aviso continua a fazer falta — o calendário mostra sempre
+                  hora de Lisboa, mesmo a quem tem a conta nos Açores — mas
+                  `Europe/Lisbon` num crachá colorido ao lado do título é
+                  identificador de sistema a competir com o mês. */}
+              <span className="text-xs font-semibold text-muted">Horas de Lisboa</span>
             </div>
             <h1 className="mt-1 text-2xl font-extrabold tracking-tight text-ink">
               {periodTitle}

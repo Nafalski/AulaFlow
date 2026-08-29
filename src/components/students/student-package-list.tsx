@@ -31,7 +31,6 @@ export function StudentPackageListCard({
     <Card variant="plain">
       <CardHeader
         title="Pacotes do aluno"
-        description="Consulta administrativa dos saldos atribuídos."
       />
       <CardBody>
         {packages.length === 0 ? (

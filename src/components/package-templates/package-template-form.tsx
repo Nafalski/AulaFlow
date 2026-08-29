@@ -47,7 +47,6 @@ export function PackageTemplateForm({
     <Card>
       <CardHeader
         title={mode === "create" ? "Novo modelo de pacote" : "Dados do modelo"}
-        description="A organização e o professor responsável são sempre derivados da sessão."
       />
       <CardBody>
         <form
@@ -104,7 +103,6 @@ export function PackageTemplateForm({
               <option value="">Todas as modalidades</option>
               {sports.map((sport) => (
                 <option key={sport.id} value={sport.id}>
-                  {sport.icon ? `${sport.icon} ` : ""}
                   {sport.name}
                   {sport.isActive === false ? " (inativa)" : ""}
                 </option>

@@ -39,7 +39,7 @@ export function StudentPackageSummary({ summary }: { summary: StudentPackageSumm
         </div>
         <p className="mt-3 text-xs text-muted">
           Disponíveis e reservados contam apenas pacotes utilizáveis; utilizados incluem o
-          histórico total. Atribuições, ajustes e livro-razão chegam na Fase 4.
+          histórico total.
         </p>
       </CardBody>
     </Card>

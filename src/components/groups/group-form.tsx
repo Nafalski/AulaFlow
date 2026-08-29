@@ -39,7 +39,6 @@ export function GroupForm({
     <Card>
       <CardHeader
         title={mode === "create" ? "Dados da nova turma" : "Dados da turma"}
-        description="A organização e o professor responsável são sempre derivados da sessão."
       />
       <CardBody>
         <form
@@ -75,7 +74,6 @@ export function GroupForm({
             <option value="">Sem modalidade definida</option>
             {sports.map((sport) => (
               <option key={sport.id} value={sport.id}>
-                {sport.icon ? `${sport.icon} ` : ""}
                 {sport.name}
                 {sport.isActive === false ? " (inativa)" : ""}
               </option>
@@ -90,7 +88,7 @@ export function GroupForm({
             min={1}
             max={50}
             defaultValue={values.maxParticipants ?? ""}
-            hint="Deixe vazio para não definir um limite nesta fase."
+            hint="Deixe vazio para não definir limite."
             error={state.fieldErrors?.maxParticipants}
           />
 
@@ -110,7 +108,7 @@ export function GroupForm({
             defaultValue={values.administrativeNotes ?? ""}
             maxLength={2_000}
             rows={5}
-            hint="Privadas: nunca são incluídas na projeção visível ao aluno."
+            hint="Só o professor as vê. O aluno nunca."
             error={state.fieldErrors?.administrativeNotes}
           />
 

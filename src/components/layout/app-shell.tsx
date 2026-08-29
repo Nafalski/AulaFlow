@@ -7,10 +7,6 @@ import { unreadNotificationCount } from "@/lib/notifications/unread-count";
 
 import { navItemsForRole } from "./nav-items";
 import { Logo, LogoMark } from "@/components/brand/logo";
-import {
-  WorkspaceSwitcher,
-  type WorkspaceSwitcherOption,
-} from "@/components/workspaces/workspace-switcher";
 import type { SessionUser } from "@/lib/auth/session";
 import { cn, initials } from "@/lib/utils";
 
@@ -58,7 +54,6 @@ export async function AppShell({
   user,
   children,
   headerAction,
-  workspaceOptions,
 }: {
   user: SessionUser;
   children: ReactNode;
@@ -68,7 +63,6 @@ export async function AppShell({
    * primitivas: o shell é um Server Component e o seletor é um Client
    * Component, pelo que só atravessam a fronteira strings e booleanos.
    */
-  workspaceOptions?: readonly WorkspaceSwitcherOption[];
 }) {
   const baseItems = navItemsForRole(user.profile.role);
 
@@ -84,7 +78,6 @@ export async function AppShell({
       )
     : baseItems;
   const roots = ["/professor", "/aluno", "/admin"];
-  const hasWorkspaceSwitcher = Boolean(workspaceOptions && workspaceOptions.length > 0);
 
   return (
     <div className="min-h-dvh md:flex">
@@ -96,12 +89,21 @@ export async function AppShell({
 
         <Sidebar items={items} roots={roots} />
 
+        {/*
+          O rodapé diz três coisas, e só três: quem está aqui, onde se mudam as
+          suas definições, e como sair.
+
+          Tinha antes um seletor de contexto por cima disto, e o nome da pessoa
+          aparecia três vezes — no painel do seletor, no botão do seletor e
+          aqui. Pior: mudar de clube não muda nada em alunos, pacotes, turmas,
+          locais, disponibilidade ou calendário, porque `active_workspace_id` é
+          uma preferência e não uma autorização. Um controlo permanente sem
+          consequência visível ensina a desconfiar da interface.
+
+          O seletor passou para `/professor/clubes`, que é onde a escolha tem
+          significado — e onde já se veem os clubes a que se pertence.
+        */}
         <div className="mt-auto border-t border-line pt-3">
-          {hasWorkspaceSwitcher && workspaceOptions && (
-            <div className="mb-2">
-              <WorkspaceSwitcher options={workspaceOptions} placement="up" />
-            </div>
-          )}
           <UserSummary user={user} />
           <SignOutButton className="mt-2 w-full" />
         </div>
@@ -128,15 +130,6 @@ export async function AppShell({
             </div>
           </div>
         </header>
-
-        {/* No telemóvel não há barra lateral onde pôr o seletor de contexto.
-            Fica aqui, numa faixa própria, em vez de espremido num cabeçalho
-            que já tem logótipo, título e terminar sessão. */}
-        {hasWorkspaceSwitcher && workspaceOptions && (
-          <div className="border-b border-line bg-surface px-4 py-2 md:hidden">
-            <WorkspaceSwitcher options={workspaceOptions} placement="down" />
-          </div>
-        )}
 
         {/* pb-24 no telemóvel: espaço para a barra inferior não tapar o fim
             do conteúdo. */}

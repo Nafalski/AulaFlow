@@ -1,8 +1,9 @@
 "use client";
 
-import { Search, UserMinus, UserPlus } from "lucide-react";
-import { useActionState } from "react";
+import { Search, UserMinus, UserPlus, UserRound } from "lucide-react";
+import { useActionState, useState } from "react";
 
+import { ActionMenu } from "@/components/ui/action-menu";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { CheckboxField, TextField } from "@/components/ui/field";
@@ -30,30 +31,75 @@ function AddMemberForm({ groupId, student }: { groupId: string; student: Person 
   );
 }
 
-function RemoveMemberForm({ groupId, student }: { groupId: string; student: Person }) {
+/**
+ * Um membro da turma.
+ *
+ * Antes, cada cartão trazia permanentemente a caixa "Confirmo a remoção de X
+ * desta turma" e um botão Remover. Numa turma de oito alunos, isso eram oito
+ * pedidos de confirmação para uma operação que quase nunca se faz — e o ecrã
+ * passava a ser sobre remover pessoas em vez de sobre quem está na turma.
+ *
+ * Agora o cartão mostra o aluno. A remoção vive no menu, e a confirmação —
+ * que a Server Action continua a exigir — aparece quando a pessoa a pede.
+ */
+function MemberRow({ groupId, student }: { groupId: string; student: Person }) {
   const [state, formAction, pending] = useActionState(removeGroupMemberAction, FORM_ACTION_IDLE_STATE);
+  const [confirming, setConfirming] = useState(false);
 
   return (
-    <form action={formAction} className="flex flex-col gap-3 rounded-[var(--radius-field)] border border-line p-3">
-      <input type="hidden" name="groupId" value={groupId} />
-      <input type="hidden" name="studentId" value={student.id} />
-      <div className="min-w-0">
-        <p className="font-semibold text-ink">{student.fullName}</p>
-        {student.email && <p className="truncate text-xs text-muted">{student.email}</p>}
+    <div className="flex flex-col gap-3 rounded-[var(--radius-field)] border border-line p-3">
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <p className="font-semibold text-ink">{student.fullName}</p>
+          {student.email && <p className="truncate text-xs text-muted">{student.email}</p>}
+        </div>
+        <ActionMenu
+          label={`Ações de ${student.fullName}`}
+          items={[
+            {
+              label: "Ver aluno",
+              href: `/professor/alunos/${student.id}`,
+              icon: <UserRound className="size-4" aria-hidden="true" />,
+            },
+            {
+              label: "Remover da turma",
+              tone: "danger",
+              onSelect: () => setConfirming(true),
+              icon: <UserMinus className="size-4" aria-hidden="true" />,
+            },
+          ]}
+        />
       </div>
-      <CheckboxField name="confirmed" required label={`Confirmo a remoção de ${student.fullName} desta turma.`} error={state.fieldErrors?.confirmed} />
-      <Button
-        type="submit"
-        variant="ghost"
-        loading={pending}
-        loadingLabel="A remover"
-        icon={<UserMinus className="size-4" aria-hidden="true" />}
-        className="self-start"
-      >
-        Remover
-      </Button>
-      {state.message && <Alert tone={state.status === "success" ? "success" : "danger"}>{state.message}</Alert>}
-    </form>
+
+      {confirming && (
+        <form action={formAction} className="flex flex-col gap-3 border-t border-line pt-3">
+          <input type="hidden" name="groupId" value={groupId} />
+          <input type="hidden" name="studentId" value={student.id} />
+          {/* O histórico é preservado — isto não apaga nada — mas o aluno deixa
+              de contar para as aulas seguintes, e isso vale ser dito. */}
+          <p className="text-sm text-ink-soft">
+            {student.fullName} deixa de fazer parte desta turma. As aulas já realizadas
+            mantêm-se no histórico.
+          </p>
+          <CheckboxField name="confirmed" required label="Confirmo a remoção." error={state.fieldErrors?.confirmed} />
+          <div className="flex flex-wrap gap-2">
+            <Button
+              type="submit"
+              variant="danger"
+              loading={pending}
+              loadingLabel="A remover"
+              icon={<UserMinus className="size-4" aria-hidden="true" />}
+            >
+              Remover da turma
+            </Button>
+            <Button type="button" variant="ghost" onClick={() => setConfirming(false)}>
+              Cancelar
+            </Button>
+          </div>
+          {state.message && <Alert tone={state.status === "success" ? "success" : "danger"}>{state.message}</Alert>}
+        </form>
+      )}
+    </div>
   );
 }
 
@@ -78,7 +124,7 @@ export function GroupMembersManager({
           <p className="rounded-[var(--radius-field)] bg-sand-deep p-4 text-sm text-muted">A turma ainda não tem alunos.</p>
         ) : (
           <div className="grid gap-3 lg:grid-cols-2">
-            {currentMembers.map((member) => <RemoveMemberForm key={member.id} groupId={groupId} student={member} />)}
+            {currentMembers.map((member) => <MemberRow key={member.id} groupId={groupId} student={member} />)}
           </div>
         )}
       </section>

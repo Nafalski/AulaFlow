@@ -3,7 +3,6 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 
-import { StudentForm } from "@/components/students/student-form";
 import {
   StudentGroupsSummary,
   type StudentGroupSummaryItem,
@@ -14,8 +13,8 @@ import {
   type StudentPackageSummaryData,
 } from "@/components/students/student-package-summary";
 import { StudentPackageListCard } from "@/components/students/student-package-list";
+import { StudentAdminActions } from "@/components/students/student-admin-actions";
 import { StudentStatusBadges } from "@/components/students/student-status-badges";
-import { StudentStatusForm } from "@/components/students/student-status-form";
 import { buttonClasses } from "@/components/ui/button";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { Pagination } from "@/components/ui/pagination";
@@ -209,12 +208,19 @@ export default async function StudentDetailPage({
               </p>
             </div>
           </div>
-          <StudentStatusBadges student={student} />
+          <div className="flex items-start gap-3 sm:flex-col sm:items-end">
+            <StudentStatusBadges student={student} />
+            <StudentAdminActions
+              studentId={student.id}
+              fullName={student.full_name}
+              isActive={student.is_active}
+            />
+          </div>
         </div>
       </header>
 
       <Card variant="plain">
-        <CardHeader title="Resumo da ficha" description="Dados de consulta rápida." />
+        <CardHeader title="Resumo da ficha" />
         <CardBody>
           <dl className="grid gap-5 sm:grid-cols-2 lg:grid-cols-4">
             <div>
@@ -251,41 +257,7 @@ export default async function StudentDetailPage({
       </Card>
 
       <div className="grid items-start gap-6 xl:grid-cols-[minmax(0,1.35fr)_minmax(20rem,0.65fr)]">
-        <StudentForm
-          mode="edit"
-          linkedAccount={Boolean(student.profile_id)}
-          accountEmail={student.account_email}
-          values={{
-            id: student.id,
-            fullName: student.full_name,
-            email: student.email,
-            phone: student.phone,
-            birthDate: student.birth_date,
-            skillLevel: student.skill_level,
-            notes: student.notes,
-          }}
-        />
-
         <div className="flex flex-col gap-6">
-          <Link
-            href={`/professor/pacotes/atribuir?studentId=${student.id}`}
-            className={buttonClasses({ variant: "accent", fullWidth: true })}
-          >
-            <PackageCheck className="size-4.5" aria-hidden="true" />
-            Atribuir pacote
-          </Link>
-          <StudentInvitationCard
-            studentId={student.id}
-            email={student.email}
-            isActive={student.is_active}
-            profileId={student.profile_id}
-            accountStatus={student.account_status}
-            accountEmail={student.account_email}
-            invitationId={student.invitation_id}
-            invitationStatus={student.invitation_status}
-            invitationPreparedAt={student.invitation_prepared_at}
-          />
-          <StudentPackageSummary summary={packageSummary} />
           <StudentPackageListCard packages={packages} today={today} />
           <Pagination
             basePath={`/professor/alunos/${student.id}`}
@@ -302,10 +274,27 @@ export default async function StudentDetailPage({
             hasNext={groups.hasNext}
             pageParam="paginaTurmas"
           />
-          <StudentStatusForm
+        </div>
+
+        <div className="flex flex-col gap-6">
+          <Link
+            href={`/professor/pacotes/atribuir?studentId=${student.id}`}
+            className={buttonClasses({ variant: "accent", fullWidth: true })}
+          >
+            <PackageCheck className="size-4.5" aria-hidden="true" />
+            Atribuir pacote
+          </Link>
+          <StudentPackageSummary summary={packageSummary} />
+          <StudentInvitationCard
             studentId={student.id}
-            fullName={student.full_name}
+            email={student.email}
             isActive={student.is_active}
+            profileId={student.profile_id}
+            accountStatus={student.account_status}
+            accountEmail={student.account_email}
+            invitationId={student.invitation_id}
+            invitationStatus={student.invitation_status}
+            invitationPreparedAt={student.invitation_prepared_at}
           />
         </div>
       </div>

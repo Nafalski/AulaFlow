@@ -92,10 +92,9 @@ export function TeacherPublicProfileForm({
                   value={sport.id}
                   defaultChecked={selectedSportIds.includes(sport.id)}
                   label={
-                    <span className="inline-flex items-center gap-2">
-                      {sport.icon && <span aria-hidden="true">{sport.icon}</span>}
-                      {sport.name}
-                    </span>
+                    /* `sport.icon` é o identificador de um ícone do lucide, não
+                       um emoji: imprimi-lo dava "volleyball Beach Tennis". */
+                    <span className="inline-flex items-center gap-2">{sport.name}</span>
                   }
                 />
               ))}

@@ -3182,7 +3182,7 @@ async function paginatedSurfacesScenario(browser, teacherApiClient) {
   );
   await Promise.all([
     teacherPage.waitForURL((url) => !url.searchParams.has("pagina"), { timeout: 20_000 }),
-    teacherPage.getByRole("button", { name: "Aplicar filtros" }).click(),
+    teacherPage.getByRole("button", { name: "Pesquisar" }).click(),
   ]);
   check(
     !new URL(teacherPage.url()).searchParams.has("pagina"),

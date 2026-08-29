@@ -69,11 +69,6 @@ export function StudentInvitationCard({
         description="A conta será associada apenas depois de o aluno confirmar o mesmo email."
       />
       <CardBody className="flex flex-col gap-4">
-        <Alert tone="info" title="Nenhum email é enviado nesta fase">
-          Preparar a ligação regista apenas o estado seguro. A entrega depende de um projeto
-          Supabase remoto e não é simulada por este botão.
-        </Alert>
-
         {prepareState.message && (
           <Alert tone={prepareState.status === "success" ? "success" : "danger"}>
             {prepareState.message}

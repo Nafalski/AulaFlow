@@ -8,7 +8,9 @@ import { Card, CardBody, CardHeader, SectionTitle } from "@/components/ui/card";
 import { EmptyState } from "@/components/ui/empty-state";
 import { ClubCreateForm } from "@/components/workspaces/club-create-form";
 import { requireRole } from "@/lib/auth/session";
+import { WorkspaceSwitcher } from "@/components/workspaces/workspace-switcher";
 import { countReceivedInvitations, loadWorkspaceContexts } from "@/lib/auth/workspace-context";
+import { toWorkspaceSwitcherEntries } from "@/lib/domain/workspaces";
 import {
   MEMBER_ROLE_LABELS,
   PERSONAL_ONLY_MODULES,
@@ -27,6 +29,7 @@ export default async function TeacherClubsPage() {
     countReceivedInvitations(),
   ]);
 
+  const switcherOptions = toWorkspaceSwitcherEntries(contexts, user.profile.full_name);
   const personal = contexts.find((context) => context.isPersonal);
   const clubs = contexts.filter((context) => !context.isPersonal);
 
@@ -47,6 +50,24 @@ export default async function TeacherClubsPage() {
             {receivedInvitations > 1 ? "s" : ""}
           </Link>
         </Alert>
+      )}
+
+      {/*
+        O seletor de contexto vive aqui, e não no rodapé da barra lateral.
+        Lá era um controlo permanente ao lado da identidade — e mudar de clube
+        não muda alunos, pacotes, turmas, locais nem calendário, porque o
+        contexto ativo é uma preferência e não uma autorização. Aqui, ao lado da
+        lista de clubes, a escolha tem contexto e a consequência é visível.
+      */}
+      {switcherOptions.length > 1 && (
+        <section className="flex flex-col gap-3">
+          <SectionTitle>Contexto ativo</SectionTitle>
+          <Card variant="plain">
+            <CardBody>
+              <WorkspaceSwitcher options={switcherOptions} placement="down" />
+            </CardBody>
+          </Card>
+        </section>
       )}
 
       <section className="flex flex-col gap-3">

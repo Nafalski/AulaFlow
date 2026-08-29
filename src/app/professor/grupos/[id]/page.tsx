@@ -1,12 +1,11 @@
-import { ArrowLeft, ShieldCheck, UsersRound } from "lucide-react";
+import { ArrowLeft, UsersRound } from "lucide-react";
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 
 import { GroupForm } from "@/components/groups/group-form";
 import { GroupMembersManager } from "@/components/groups/group-members-manager";
-import { GroupStatusForm } from "@/components/groups/group-status-form";
-import { Alert } from "@/components/ui/alert";
+import { GroupAdminActions } from "@/components/groups/group-admin-actions";
 import { Badge } from "@/components/ui/status-badge";
 import { buttonClasses } from "@/components/ui/button";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
@@ -123,15 +122,16 @@ export default async function GroupDetailPage({
         <Link href="/professor/grupos" className={buttonClasses({ variant: "ghost", size: "sm", className: "-ml-3 mb-2" })}><ArrowLeft className="size-4" aria-hidden="true" /> Voltar às turmas</Link>
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div><h1 className="text-2xl font-extrabold tracking-tight text-ink">{group.name}</h1><p className="mt-1 text-sm text-muted">{selectedSportName ?? "Sem modalidade associada"}</p></div>
-          <Badge tone={group.is_active ? "success" : "neutral"}>{group.is_active ? "Ativa" : "Inativa"}</Badge>
+          <div className="flex items-start gap-3 sm:flex-col sm:items-end">
+            <Badge tone={group.is_active ? "success" : "neutral"}>{group.is_active ? "Ativa" : "Inativa"}</Badge>
+            <GroupAdminActions groupId={group.id} name={group.name} isActive={group.is_active} />
+          </div>
         </div>
       </div>
 
-      <Alert tone="info"><span className="inline-flex items-center gap-2"><ShieldCheck className="size-4 shrink-0" aria-hidden="true" />As observações administrativas desta página não são expostas aos alunos.</span></Alert>
 
-      <div className="grid items-start gap-6 xl:grid-cols-2">
+      <div className="grid items-start gap-6">
         <GroupForm mode="edit" values={{ id: group.id, name: group.name, sportId: group.sport_id, description: group.description, administrativeNotes: group.administrative_notes, maxParticipants: group.max_participants }} sports={availableSports} />
-        <Card variant="plain"><CardHeader title="Estado da turma" description="Desativar preserva membros e referências." /><CardBody><GroupStatusForm groupId={group.id} groupName={group.name} isActive={group.is_active} /></CardBody></Card>
       </div>
 
       <Card variant="plain">

@@ -337,7 +337,6 @@ export function PackageAssignmentForm({
                 <option value="">Todas as modalidades</option>
                 {sports.map((sport) => (
                   <option key={sport.id} value={sport.id}>
-                    {sport.icon ? `${sport.icon} ` : ""}
                     {sport.name}
                   </option>
                 ))}

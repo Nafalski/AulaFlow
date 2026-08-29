@@ -2,6 +2,7 @@ import Link from "next/link";
 
 import { Button, buttonClasses } from "@/components/ui/button";
 import { SelectField, TextField } from "@/components/ui/field";
+import { MoreFilters } from "@/components/ui/more-filters";
 import type { PackageStatus } from "@/types/database";
 
 export type TeacherPackageFilters = {
@@ -32,57 +33,82 @@ export function TeacherPackageFiltersForm({
       action="/professor/pacotes"
       method="get"
       aria-label="Filtrar pacotes atribuídos"
-      className="grid gap-4 rounded-[var(--radius-card)] border border-line bg-surface p-4 xl:grid-cols-[minmax(0,1fr)_minmax(0,11rem)_minmax(0,12rem)_minmax(0,11rem)_minmax(0,12rem)_auto] xl:items-end"
+      className="flex flex-col gap-4 rounded-[var(--radius-card)] border border-line bg-surface p-4"
     >
       <input type="hidden" name="tab" value={filters.tab} />
-      <TextField
-        name="search"
-        label="Pesquisar"
-        type="search"
-        defaultValue={filters.search}
-        maxLength={120}
-        placeholder="Aluno ou pacote"
-        autoComplete="off"
-      />
-      <SelectField name="status" label="Estado" defaultValue={filters.status}>
-        <option value="all">Todos</option>
-        <option value="active">Ativos</option>
-        <option value="not_started">Por iniciar</option>
-        <option value="depleted">Esgotados</option>
-        <option value="expired">Expirados</option>
-        <option value="suspended">Suspensos</option>
-        <option value="cancelled">Cancelados</option>
-      </SelectField>
-      <SelectField name="sportId" label="Modalidade" defaultValue={filters.sportId ?? ""}>
-        <option value="">Todas</option>
-        {sports.map((sport) => (
-          <option key={sport.id} value={sport.id}>
-            {sport.name}
-          </option>
-        ))}
-      </SelectField>
-      <SelectField name="balance" label="Saldo" defaultValue={filters.balance}>
-        <option value="all">Todos</option>
-        <option value="low">Saldo baixo</option>
-        <option value="empty">Sem saldo</option>
-      </SelectField>
-      <SelectField name="expiry" label="Validade" defaultValue={filters.expiry}>
-        <option value="all">Todas</option>
-        <option value="soon">Próxima</option>
-        <option value="expired">Expirada</option>
-      </SelectField>
-      <div className="flex flex-wrap gap-2">
-        <Button type="submit">Aplicar filtros</Button>
-        {hasFilters && (
-          <Link
-            href={`/professor/pacotes?tab=${filters.tab}`}
-            className={buttonClasses({ variant: "ghost" })}
-          >
-            Limpar
-          </Link>
-        )}
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
+        <div className="flex-1">
+          <TextField
+            name="search"
+            label="Pesquisar"
+            type="search"
+            defaultValue={filters.search}
+            maxLength={120}
+            placeholder="Aluno ou pacote"
+            autoComplete="off"
+          />
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <Button type="submit">Pesquisar</Button>
+          {hasFilters && (
+            <Link
+              href={`/professor/pacotes?tab=${filters.tab}`}
+              className={buttonClasses({ variant: "ghost" })}
+            >
+              Limpar
+            </Link>
+          )}
+        </div>
       </div>
+
+      <MoreFilters
+        defaultOpen={
+          filters.status !== "all" ||
+          filters.sportId !== null ||
+          filters.balance !== "all" ||
+          filters.expiry !== "all"
+        }
+      >
+        <SelectField name="status" label="Estado" defaultValue={filters.status}>
+          <option value="all">Todos</option>
+          <option value="active">Ativos</option>
+          <option value="not_started">Por iniciar</option>
+          <option value="depleted">Esgotados</option>
+          <option value="expired">Expirados</option>
+          <option value="suspended">Suspensos</option>
+          <option value="cancelled">Cancelados</option>
+        </SelectField>
+        <SelectField
+          name="sportId"
+          label="Modalidade"
+          defaultValue={filters.sportId ?? ""}
+        >
+          <option value="">Todas</option>
+          {sports.map((sport) => (
+            <option key={sport.id} value={sport.id}>
+              {sport.name}
+            </option>
+          ))}
+        </SelectField>
+        <SelectField
+          name="balance"
+          label="Saldo"
+          defaultValue={filters.balance}
+        >
+          <option value="all">Todos</option>
+          <option value="low">Saldo baixo</option>
+          <option value="empty">Sem saldo</option>
+        </SelectField>
+        <SelectField
+          name="expiry"
+          label="Validade"
+          defaultValue={filters.expiry}
+        >
+          <option value="all">Todas</option>
+          <option value="soon">Próxima</option>
+          <option value="expired">Expirada</option>
+        </SelectField>
+      </MoreFilters>
     </form>
   );
 }
-
